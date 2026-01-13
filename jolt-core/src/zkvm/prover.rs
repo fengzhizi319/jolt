@@ -155,7 +155,7 @@ pub struct JoltCpuProver<
     pub rw_config: ReadWriteConfig,
 }
 impl<'a, F: JoltField, PCS: StreamingCommitmentScheme<Field = F>, ProofTranscript: Transcript>
-    JoltCpuProver<'a, F, PCS, ProofTranscript>
+JoltCpuProver<'a, F, PCS, ProofTranscript>
 {
     pub fn gen_from_elf(
         preprocessing: &'a JoltProverPreprocessing<F, PCS>,
@@ -166,6 +166,9 @@ impl<'a, F: JoltField, PCS: StreamingCommitmentScheme<Field = F>, ProofTranscrip
         trusted_advice_commitment: Option<PCS::Commitment>,
         trusted_advice_hint: Option<PCS::OpeningProofHint>,
     ) -> Self {
+        // 1. 配置内存参数：
+        // 从预处理数据（preprocessing.shared）中提取内存布局信息（如堆栈大小、输入输出区域大小等）。
+        // 这些配置必须与电路定义保持一致，以确保追踪器（Tracer）产生的内存访问地址在电路允许的范围内。
         let memory_config = MemoryConfig {
             max_untrusted_advice_size: preprocessing.shared.memory_layout.max_untrusted_advice_size,
             max_trusted_advice_size: preprocessing.shared.memory_layout.max_trusted_advice_size,
@@ -176,11 +179,19 @@ impl<'a, F: JoltField, PCS: StreamingCommitmentScheme<Field = F>, ProofTranscrip
             program_size: Some(preprocessing.shared.memory_layout.program_size),
         };
 
+        // 2. 执行程序生成 Trace（执行轨迹）：
+        // 使用 guest 模拟器运行 ELF 二进制文件。这一步是“真实”的执行过程。
+        // 输入包括标准输入、不可信 Advice（witness）和可信 Advice。
+        // 返回：
+        // - lazy_trace: 惰性加载的 Trace 迭代器（用于后续流式处理，节省内存）。
+        // - trace: 完整的 Cycle 向量（包含每个时钟周期的详细状态，如寄存器值）。
+        // - final_memory_state: 执行结束后的内存状态（用于构建 RAM 的初始/最终一致性检查）。
+        // - program_io: 捕获的 IO 设备状态（记录了实际读取了哪些输入，写入了哪些输出）。
         let (lazy_trace, trace, final_memory_state, program_io) = {
             let _pprof_trace = pprof_scope!("trace");
             guest::program::trace(
                 elf_contents,
-                None,
+                None, // 这里的 None 表示不使用缓存的 Image，而是从 ELF 重新加载
                 inputs,
                 untrusted_advice,
                 trusted_advice,
@@ -188,12 +199,15 @@ impl<'a, F: JoltField, PCS: StreamingCommitmentScheme<Field = F>, ProofTranscrip
             )
         };
 
+        // 3. 统计指令周期信息（用于日志和调试）：
+        // 区分原始 RISC-V 指令和 Jolt 虚拟指令。
+        // Jolt 为了支持复杂的 RISC-V 指令，可能会将其拆分为多个“虚拟微指令序列”（Virtual Sequence）。
+        // 这里通过检查 `virtual_sequence_remaining` 字段来统计实际对应的高层 RISC-V 指令数量。
         let num_riscv_cycles: usize = trace
             .par_iter()
             .map(|cycle| {
-                // Count the cycle if the instruction is not part of a inline sequence
-                // (`virtual_sequence_remaining` is `None`) or if it's the first instruction
-                // in a inline sequence (`virtual_sequence_remaining` is `Some(0)`)
+                // 如果指令不是虚拟序列的一部分（None），或者是序列的第一条指令（Some(0)），则计数为 1。
+                // 这样可以过滤掉虚拟序列中的后续微指令，只统计逻辑指令数。
                 if let Some(virtual_sequence_remaining) =
                     cycle.instruction().normalize().virtual_sequence_remaining
                 {
@@ -209,7 +223,13 @@ impl<'a, F: JoltField, PCS: StreamingCommitmentScheme<Field = F>, ProofTranscrip
             trace.len() - num_riscv_cycles,
             trace.len(),
         );
+        println!("{num_riscv_cycles} raw RISC-V instructions + {} virtual instructions = {} total cycles",
+                 trace.len() - num_riscv_cycles,
+                 trace.len());
 
+        // 4. 从 Trace 构建 Prover 实例：
+        // 将生成的 Trace 数据和相关上下文传递给 gen_from_trace 方法，
+        // 该方法会负责计算填充长度（Padding）、初始化多项式状态等后续步骤。
         Self::gen_from_trace(
             preprocessing,
             lazy_trace,
@@ -298,21 +318,25 @@ impl<'a, F: JoltField, PCS: StreamingCommitmentScheme<Field = F>, ProofTranscrip
         padded_trace_len
     }
 
+    ///gen_from_trace 方法是 JoltCpuProver 的核心构造函数。它接收由模拟器生成的原始执行记录（Trace），
+    ///对其进行必要的填充（Padding）和配置，并初始化证明生成所需的所有状态（如内存快照、Spartan 密钥、Dory 参数等）。
     pub fn gen_from_trace(
         preprocessing: &'a JoltProverPreprocessing<F, PCS>,
         lazy_trace: LazyTraceIterator,
-        mut trace: Vec<Cycle>,
-        mut program_io: JoltDevice,
-        trusted_advice_commitment: Option<PCS::Commitment>,
-        trusted_advice_hint: Option<PCS::OpeningProofHint>,
-        final_memory_state: Memory,
+        mut trace: Vec<Cycle>,       // 原始执行轨迹（未填充）
+        mut program_io: JoltDevice,  // 包含输入、输出和 Advice 数据
+        trusted_advice_commitment: Option<PCS::Commitment>, // 如果有可信 Advice，这里是其预先计算好的承诺
+        trusted_advice_hint: Option<PCS::OpeningProofHint>, // 可信 Advice 的打开证明提示
+        final_memory_state: Memory, // 程序执行结束时的内存快照
     ) -> Self {
-        // Dory globals are process-wide (OnceCell). In tests we run many end-to-end proofs with
-        // different trace lengths in a single process, so reset before each prover construction.
+        // [测试专用] Dory 全局变量是进程级单例。在测试中，通常会在同一个进程中运行多个不同 Trace 长度的
+        // 端到端证明。为了避免状态污染，每次构建新 Prover 前重置 Dory 全局状态。
         #[cfg(test)]
         crate::poly::commitment::dory::DoryGlobals::reset();
 
-        // truncate trailing zeros on device outputs
+        // 1. 规范化输出数据：
+        // 移除 outputs 向量末尾的所有零字节（truncate trailing zeros）。
+        // 这样可以确保输出数据紧凑，去除缓冲区中未使用的部分。
         program_io.outputs.truncate(
             program_io
                 .outputs
@@ -321,18 +345,24 @@ impl<'a, F: JoltField, PCS: StreamingCommitmentScheme<Field = F>, ProofTranscrip
                 .map_or(0, |pos| pos + 1),
         );
 
-        // Setup trace length and padding
+        // 2. 设置 Trace 长度和填充（Padding）：
         let unpadded_trace_len = trace.len();
+        // 初始填充逻辑：
+        // - 至少填充到 256。这是为了满足 Dory 承诺方案中 T >= k^{1/D} 的数学约束。
+        // - 否则，取下一个 2 的幂次（Next Power of Two），便于构建二叉树结构的证明。
         let padded_trace_len = if unpadded_trace_len < 256 {
-            256 // ensures that T >= k^{1/D}
+            256
         } else {
             (trace.len() + 1).next_power_of_two()
         };
-        // We may need extra padding so the main Dory matrix has enough (row, col) variables
-        // to embed advice commitments committed in their own preprocessing-only contexts.
+
+        // 检查是否存在 Advice（辅助输入）数据。
         let has_trusted_advice = !program_io.trusted_advice.is_empty();
         let has_untrusted_advice = !program_io.untrusted_advice.is_empty();
 
+        // 调整 Trace 长度以适配 Advice：
+        // 如果 Advice 数据很大，Dory 承诺的主矩阵（维度由 Trace 长度决定）可能不够大，无法将 Advice 嵌入其中。
+        // 此函数会根据 Advice 的大小，必要时增加 Trace 的长度（例如翻倍），直到矩阵足以容纳 Advice。
         let padded_trace_len = Self::adjust_trace_length_for_advice(
             padded_trace_len,
             preprocessing.shared.max_padded_trace_length,
@@ -342,12 +372,16 @@ impl<'a, F: JoltField, PCS: StreamingCommitmentScheme<Field = F>, ProofTranscrip
             has_untrusted_advice,
         );
 
+        // 将 Trace 实际 resize 到计算出的填充长度，填充部分使用 NoOp（空指令）。
         trace.resize(padded_trace_len, Cycle::NoOp);
 
-        // Calculate K for DoryGlobals initialization
+        // 3. 计算 RAM 大小 K (用于 DoryGlobals 初始化和内存检查)：
+        // 遍历整个 Trace，找出所有被访问过的内存地址，并结合字节码区域，
+        // 计算出一个足以覆盖所有访问地址的最小 2 的幂次大小（ram_K）。
         let ram_K = trace
-            .par_iter()
+            .par_iter() // 并行迭代加速处理
             .filter_map(|cycle| {
+                // 将物理/虚拟地址重映射到 Jolt 的内部现行 RAM 地址空间
                 crate::zkvm::ram::remap_address(
                     cycle.ram_access().address() as u64,
                     &preprocessing.shared.memory_layout,
@@ -356,21 +390,29 @@ impl<'a, F: JoltField, PCS: StreamingCommitmentScheme<Field = F>, ProofTranscrip
             .max()
             .unwrap_or(0)
             .max(
+                // 确保 RAM 大小至少能包含所有的字节码（Bytecode）
                 crate::zkvm::ram::remap_address(
                     preprocessing.shared.ram.min_bytecode_address,
                     &preprocessing.shared.memory_layout,
                 )
-                .unwrap_or(0)
+                    .unwrap_or(0)
                     + preprocessing.shared.ram.bytecode_words.len() as u64
                     + 1,
             )
             .next_power_of_two() as usize;
 
+        // 4. 初始化证明相关的核心组件：
+        // 初始化 Transcript，用于 Fiat-Shamir 变换，生成伪随机挑战。
         let transcript = ProofTranscript::new(b"Jolt");
+        // 初始化打开累加器（Opening Accumulator），用于在 Stage 8 聚合所有多项式的批处理打开验证。
         let opening_accumulator = ProverOpeningAccumulator::new(trace.len().log_2());
 
+        // 初始化 Spartan Key（基于 Trace 长度构建）。
         let spartan_key = UniformSpartanKey::new(trace.len());
 
+        // 5. 生成 RAM 状态快照：
+        // 构建 RAM 的初始状态（包含加载的程序、输入数据）和最终状态。
+        // 这对于 RAM 一致性检查（Memory Consistency Check）是必需的。
         let (initial_ram_state, final_ram_state) = gen_ram_memory_states::<F>(
             ram_K,
             &preprocessing.shared.ram,
@@ -378,19 +420,23 @@ impl<'a, F: JoltField, PCS: StreamingCommitmentScheme<Field = F>, ProofTranscrip
             &final_memory_state,
         );
 
+        // 6. 生成配置参数：
         let log_T = trace.len().log_2();
         let ram_log_K = ram_K.log_2();
+        // 读写配置：基于时间维度（log_T）和空间维度（ram_log_K）。
         let rw_config = ReadWriteConfig::new(log_T, ram_log_K);
+        // One-Hot 参数：用于将指令执行和内存访问转换为电路约束。
         let one_hot_params =
             OneHotParams::new(log_T, preprocessing.shared.bytecode.code_size, ram_K);
 
+        // 7. 构造并返回 Prover 实例
         Self {
             preprocessing,
             program_io,
             lazy_trace,
-            trace: trace.into(),
+            trace: trace.into(), // 转换为 Arc 以便共享所有权
             advice: JoltAdvice {
-                untrusted_advice_polynomial: None,
+                untrusted_advice_polynomial: None, // 将在 prove() 过程中计算生成
                 trusted_advice_commitment,
                 trusted_advice_polynomial: None,
                 untrusted_advice_hint: None,
@@ -421,6 +467,8 @@ impl<'a, F: JoltField, PCS: StreamingCommitmentScheme<Field = F>, ProofTranscrip
         let _pprof_prove = pprof_scope!("prove");
 
         let start = Instant::now();
+        // 初始化 Fiat-Shamir 预处理：将公共输入（程序IO、内存配置、Trace长度等）吸收到 Transcript 中，
+        // 以确保后续生成的随机数 challenge 依赖于这些公共参数。
         fiat_shamir_preamble(
             &self.program_io,
             self.one_hot_params.ram_k,
@@ -429,15 +477,21 @@ impl<'a, F: JoltField, PCS: StreamingCommitmentScheme<Field = F>, ProofTranscrip
         );
 
         tracing::info!(
-            "bytecode size: {}",
-            self.preprocessing.shared.bytecode.code_size
-        );
+               "bytecode size: {}",
+               self.preprocessing.shared.bytecode.code_size
+           );
 
+        // 1. 生成并提交 Witness 多项式：
+        // 计算执行轨迹（Trace）相关的多项式，进行承诺（Commit），并生成打开证明的提示（Hints）。
         let (commitments, mut opening_proof_hints) = self.generate_and_commit_witness_polynomials();
+
+        // 2. 处理 Advice（辅助输入）：
+        // 生成并提交不可信 Advice 的承诺。
         let untrusted_advice_commitment = self.generate_and_commit_untrusted_advice();
+        // 准备可信 Advice 的多项式（通常不需要运行时提交，因为是在预处理阶段定义的或可信的）。
         self.generate_and_commit_trusted_advice();
 
-        // Add advice hints for batched Stage 8 opening
+        // 将 Advice 相关的打开提示（Hints）加入集合，以便在 Stage 8 的批量打开中使用。
         if let Some(hint) = self.advice.trusted_advice_hint.take() {
             opening_proof_hints.insert(CommittedPolynomial::TrustedAdvice, hint);
         }
@@ -445,16 +499,34 @@ impl<'a, F: JoltField, PCS: StreamingCommitmentScheme<Field = F>, ProofTranscrip
             opening_proof_hints.insert(CommittedPolynomial::UntrustedAdvice, hint);
         }
 
+        // --- 执行各个阶段的 Sumcheck 证明协议 ---
+
+        // Stage 1: 主要处理指令查找（Instruction Lookups）相关的一元跳跃（UniSkip）证明。
         let (stage1_uni_skip_first_round_proof, stage1_sumcheck_proof) = self.prove_stage1();
+
+        // Stage 2: 处理剩余的指令查找及相关的一元跳跃证明。
         let (stage2_uni_skip_first_round_proof, stage2_sumcheck_proof) = self.prove_stage2();
+
+        // Stage 3: Spartan 协议相关的 Sumcheck，包括 trace 的移位（Shift）、指令输入一致性、寄存器 Claim 归约。
         let stage3_sumcheck_proof = self.prove_stage3();
+
+        // Stage 4: 内存（RAM）和寄存器的读写一致性检查（Read/Write Checking），以及值评估（Val Evaluation）。
         let stage4_sumcheck_proof = self.prove_stage4();
+
+        // Stage 5: 寄存器值评估、RAM Read-Access (RA) Claim 归约、指令 Read-RAF 检查。
         let stage5_sumcheck_proof = self.prove_stage5();
+
+        // Stage 6: 字节码读取检查、布尔性校验（Booleanity）、RAM RA 虚拟化检查以及 Advice Claim 归约的第一阶段。
         let stage6_sumcheck_proof = self.prove_stage6();
+
+        // Stage 7: 汉明权重（Hamming Weight）检查以及 Advice Claim 归约的第二阶段。
         let stage7_sumcheck_proof = self.prove_stage7();
 
+        // Stage 8: 联合打开证明 (Joint Opening Proof)。
+        // 使用 Dory 协议对之前所有阶段产生的多项式承诺点进行批量验证。
         let joint_opening_proof = self.prove_stage8(opening_proof_hints);
 
+        // 测试环境下，断言所有虚拟打开（Virtual Openings）都已被证明，防止逻辑遗漏。
         #[cfg(test)]
         assert!(
             self.opening_accumulator
@@ -465,6 +537,7 @@ impl<'a, F: JoltField, PCS: StreamingCommitmentScheme<Field = F>, ProofTranscrip
             self.opening_accumulator.appended_virtual_openings.borrow()
         );
 
+        // 测试环境下收集调试信息。
         #[cfg(test)]
         let debug_info = Some(ProverDebugInfo {
             transcript: self.transcript.clone(),
@@ -474,6 +547,7 @@ impl<'a, F: JoltField, PCS: StreamingCommitmentScheme<Field = F>, ProofTranscrip
         #[cfg(not(test))]
         let debug_info = None;
 
+        // 构建最终的 Jolt 证明结构体，包含所有阶段的 Sumcheck 证明、承诺和公共参数。
         let proof = JoltProof {
             opening_claims: Claims(self.opening_accumulator.openings.clone()),
             commitments,
@@ -498,11 +572,11 @@ impl<'a, F: JoltField, PCS: StreamingCommitmentScheme<Field = F>, ProofTranscrip
         let prove_duration = start.elapsed();
 
         tracing::info!(
-            "Proved in {:.1}s ({:.1} kHz / padded {:.1} kHz)",
-            prove_duration.as_secs_f64(),
-            self.unpadded_trace_len as f64 / prove_duration.as_secs_f64() / 1000.0,
-            self.padded_trace_len as f64 / prove_duration.as_secs_f64() / 1000.0,
-        );
+               "Proved in {:.1}s ({:.1} kHz / padded {:.1} kHz)",
+               prove_duration.as_secs_f64(),
+               self.unpadded_trace_len as f64 / prove_duration.as_secs_f64() / 1000.0,
+               self.padded_trace_len as f64 / prove_duration.as_secs_f64() / 1000.0,
+           );
 
         (proof, debug_info)
     }
@@ -1469,16 +1543,35 @@ where
         shared: JoltSharedPreprocessing,
         // max_trace_length: usize,
     ) -> JoltProverPreprocessing<F, PCS> {
+        // 定义了一个阈值，用于决定 One-Hot 编码的分块大小。
+        // 如果 trace 长度的对数小于此阈值，则使用较小的块大小。
         use common::constants::ONEHOT_CHUNK_THRESHOLD_LOG_T;
+
+        // 1. 确定最大 Trace 长度和对数：
+        // 从共享预处理数据中获取最大填充后的 Trace 长度，并确保它是 2 的幂。
         let max_T: usize = shared.max_padded_trace_length.next_power_of_two();
         let max_log_T = max_T.log_2();
-        // Use the maximum possible log_k_chunk for generator setup
+
+        // 2. 确定生成器设置需要的最大 log_k_chunk：
+        // log_k_chunk 决定了 commitments 时的分块维度。
+        // 为了确保生成的证明者参数（generators）足够大以覆盖可能的运行情况，这里根据 max_log_T 选择最大的可能的 log_k_chunk。
+        // - 如果 max_log_T 较小（< 阈值），则 log_k_chunk 设为 4。
+        // - 否则，设为 8。这通常对应于 Jolt 默认配置中的最大分块大小。
         let max_log_k_chunk = if max_log_T < ONEHOT_CHUNK_THRESHOLD_LOG_T {
             4
         } else {
             8
         };
+
+        // 3. 初始化 Prover 生成器（Generators）：
+        // 调用承诺方案（如 Hyrax/Dory）的 setup_prover 方法。
+        // 参数是总的变量数，大致等于 `log(矩阵行数) + log(矩阵列数)`。
+        // 这里 max_log_k_chunk 对应矩阵的一维（行或列的块大小），max_log_T 对应总大小的对数。
+        // 这样可以确保生成的公共参数（SRS/Generators）足够大，能够支持最大 Trace 长度下的证明生成。
         let generators = PCS::setup_prover(max_log_k_chunk + max_log_T);
+
+        // 4. 返回预处理结构体：
+        // 包含生成的 public parameters (generators) 和共享的预处理信息 (shared)。
         JoltProverPreprocessing { generators, shared }
     }
 
@@ -1501,7 +1594,7 @@ where
 }
 
 impl<F: JoltField, PCS: CommitmentScheme<Field = F>> Serializable
-    for JoltProverPreprocessing<F, PCS>
+for JoltProverPreprocessing<F, PCS>
 {
 }
 
@@ -1559,44 +1652,80 @@ mod tests {
     #[test]
     #[serial]
     fn fib_e2e_dory() {
+        // tracing_subscriber::fmt::init();
+        let _ = tracing_subscriber::fmt().try_init();
+        // 1. 初始化宿主程序：加载 "fibonacci-guest" 二进制文件。
         let mut program = host::Program::new("fibonacci-guest");
+
+        // 2. 准备输入：将输入参数 (100u32) 序列化为字节向量。
         let inputs = postcard::to_stdvec(&100u32).unwrap();
+
+        // 3. 解码程序：获取字节码、初始内存状态等信息。
         let (bytecode, init_memory_state, _) = program.decode();
-        let (_, _, _, io_device) = program.trace(&inputs, &[], &[]);
+
+        // 4. 生成 Execution Trace（模拟执行）：
+        // 这一步在不生成证明的情况下运行程序，获取 IO 设备信息（如内存布局）用于后续的预处理配置。
+        // trace() 返回 (trace, lazy_trace, memory_state, io_device)。
+        let (_trace, _lazy_trace, _memory_state, io_device) = program.trace(&inputs, &[], &[]);
+        println!("output:{:?}", io_device.outputs);
+        // 5. 共享预处理（Shared Preprocessing）：
+        // 创建 Prover 和 Verifier 之间共享的静态数据。
+        // 包括字节码、内存布局、初始内存状态以及预设的最大 Trace 长度 (1 << 16)。
         let shared_preprocessing = JoltSharedPreprocessing::new(
             bytecode.clone(),
             io_device.memory_layout.clone(),
             init_memory_state,
-            1 << 16,
+            1 << 16, // 最大 padded trace 长度
         );
 
+        // 6. Prover 预处理：
+        // 基于共享预处理生成 Prover 专用的数据（主要是承诺方案的生成元 Generators）。
         let prover_preprocessing = JoltProverPreprocessing::new(shared_preprocessing.clone());
+
+        // 7. 获取 ELF 内容：
+        // 从程序对象中提取 ELF 二进制内容，Prover 初始化需要用到它来重新模拟执行。
         let elf_contents_opt = program.get_elf_contents();
         let elf_contents = elf_contents_opt.as_deref().expect("elf contents is None");
+
+        // 8. 初始化 Prover：
+        // 使用预处理数据、ELF 内容和输入来构建证明者实例。
+        // 这里也会再次执行 trace 生成（gen_from_elf 内部会调用 trace）。
         let prover = RV64IMACProver::gen_from_elf(
             &prover_preprocessing,
             elf_contents,
             &inputs,
-            &[],
-            &[],
-            None,
-            None,
+            &[],   // untrusted advice
+            &[],   // trusted advice
+            None,  // trusted advice commitment
+            None,  // trusted advice hint
         );
+
+        // 克隆 IO 设备信息，供 Verifier 使用（Verifier 需要知道程序的输出和公共 IO 状态）。
         let io_device = prover.program_io.clone();
+
+        // 9. 生成证明（Prove）：
+        // 执行完整的证明流程，返回生成的 JoltProof 和调试信息。
         let (jolt_proof, debug_info) = prover.prove();
 
+        // 10. Verifier 预处理：
+        // 从共享预处理和 Prover 的生成元中提取 Verifier 需要的设置参数。
         let verifier_preprocessing = JoltVerifierPreprocessing::new(
             shared_preprocessing,
             prover_preprocessing.generators.to_verifier_setup(),
         );
+
+        // 11. 初始化并运行 Verifier：
+        // 使用预处理参数、生成的证明、IO 状态和调试信息来验证证明的正确性。
         let verifier = RV64IMACVerifier::new(
             &verifier_preprocessing,
             jolt_proof,
             io_device,
-            None,
+            None, // proof transcript (通常如果是新开始验证则为 None)
             debug_info,
         )
-        .expect("Failed to create verifier");
+            .expect("Failed to create verifier");
+
+        // 12. 执行验证：如果验证失败则 panic。
         verifier.verify().expect("Failed to verify proof");
     }
 
@@ -1650,7 +1779,7 @@ mod tests {
             None,
             debug_info,
         )
-        .expect("Failed to create verifier");
+            .expect("Failed to create verifier");
         verifier.verify().expect("Failed to verify proof");
     }
 
@@ -1662,7 +1791,7 @@ mod tests {
         use jolt_inlines_keccak256 as _;
         // SHA3 inlines are automatically registered via #[ctor::ctor]
         // when the jolt-inlines-keccak256 crate is linked (see lib.rs)
-
+        let _ = tracing_subscriber::fmt().try_init();
         let mut program = host::Program::new("sha3-guest");
         let (bytecode, init_memory_state, _) = program.decode();
         let inputs = postcard::to_stdvec(&[5u8; 32]).unwrap();
@@ -1701,7 +1830,7 @@ mod tests {
             None,
             debug_info,
         )
-        .expect("Failed to create verifier");
+            .expect("Failed to create verifier");
         verifier.verify().expect("Failed to verify proof");
         assert_eq!(
             io_device.inputs, inputs,
@@ -1762,7 +1891,7 @@ mod tests {
             None,
             debug_info,
         )
-        .expect("Failed to create verifier");
+            .expect("Failed to create verifier");
         verifier.verify().expect("Failed to verify proof");
         let expected_output = &[
             0x28, 0x9b, 0xdf, 0x82, 0x9b, 0x4a, 0x30, 0x26, 0x7, 0x9a, 0x3e, 0xa0, 0x89, 0x73,
@@ -1823,9 +1952,9 @@ mod tests {
             Some(trusted_commitment),
             debug_info,
         )
-        .expect("Failed to create verifier")
-        .verify()
-        .expect("Failed to verify proof");
+            .expect("Failed to create verifier")
+            .verify()
+            .expect("Failed to verify proof");
 
         // Verify output is correct (advice should not affect sha2 output)
         let expected_output = &[
@@ -1891,14 +2020,15 @@ mod tests {
             Some(trusted_commitment),
             debug_info,
         )
-        .expect("Failed to create verifier")
-        .verify()
-        .expect("Verification failed");
+            .expect("Failed to create verifier")
+            .verify()
+            .expect("Verification failed");
     }
 
     #[test]
     #[serial]
     fn advice_e2e_dory() {
+        let _ = tracing_subscriber::fmt().try_init();
         // Tests a guest (merkle-tree) that actually consumes both trusted and untrusted advice.
         let mut program = host::Program::new("merkle-tree-guest");
         let (bytecode, init_memory_state, _) = program.decode();
@@ -1942,9 +2072,9 @@ mod tests {
             Some(trusted_commitment),
             debug_info,
         )
-        .expect("Failed to create verifier")
-        .verify()
-        .expect("Verification failed");
+            .expect("Failed to create verifier")
+            .verify()
+            .expect("Verification failed");
 
         // Expected merkle root for leaves [5;32], [6;32], [7;32], [8;32]
         let expected_output = &[
@@ -2048,9 +2178,9 @@ mod tests {
             Some(trusted_commitment),
             Some(debug_info),
         )
-        .expect("Failed to create verifier")
-        .verify()
-        .expect("Verification failed");
+            .expect("Failed to create verifier")
+            .verify()
+            .expect("Verification failed");
     }
 
     #[test]
@@ -2093,7 +2223,7 @@ mod tests {
             None,
             debug_info,
         )
-        .expect("Failed to create verifier");
+            .expect("Failed to create verifier");
         verifier.verify().expect("Failed to verify proof");
     }
 
@@ -2138,7 +2268,7 @@ mod tests {
             None,
             debug_info,
         )
-        .expect("Failed to create verifier");
+            .expect("Failed to create verifier");
         verifier.verify().expect("Failed to verify proof");
     }
 
@@ -2183,7 +2313,7 @@ mod tests {
             None,
             debug_info,
         )
-        .expect("Failed to create verifier");
+            .expect("Failed to create verifier");
         verifier.verify().expect("Failed to verify proof");
     }
 

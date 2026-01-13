@@ -35,43 +35,29 @@ use crate::{
     instruction::uncompress_instruction,
 };
 
-/// Executes a RISC-V program and generates its execution trace along with emulator state checkpoints.
+/// 执行 RISC-V 程序并生成其执行轨迹（Trace）以及模拟器状态检查点。
 ///
-/// # Details
-/// The function performs these steps:
-/// 1. Sets up an emulator with the provided program and configuration
-/// 2. Runs the program to completion while:
-///    - Collecting execution traces of each instruction
-///    - Optionally saving periodic checkpoints of the emulator state
+/// # 详细说明
+/// 该函数执行以下步骤：
+/// 1. 使用提供的程序和配置设置模拟器。
+/// 2. 运行程序直到完成，同时：
+///    - 收集每条指令的执行轨迹。
+///    - （可选）保存模拟器状态的周期性检查点。
 ///
-/// # Arguments
+/// # 参数
 ///
-/// * `elf_contents`
-/// * `inputs`
-/// * `memory_config`
-/// * `checkpoint_interval` - Number of Cycle at which to save emulator checkpoints
-///                          If None, no checkpoints will be saved
+/// * `elf_contents` - ELF 文件的二进制内容
+/// * `inputs` - 程序的公共输入
+/// * `memory_config` - 内存配置（大小、IO限制等）
+/// * `checkpoint_interval` - 保存模拟器检查点的周期数（Cycle）。如果为 None，则不保存检查点。
 ///
-/// # Returns
+/// # 返回值
 ///
-/// Returns a tuple containing:
-/// * `Vec<Cycle>` - Complete execution trace
-/// * `JoltDevice`
-/// * `Option<Vec<LazyTraceIterator>>` - If checkpoint_interval is not None, contains emulator
-///                                      checkpoints every n Cycle. Otherwise None.
-///
-/// # Example Usage
-///
-/// let (execution_trace, checkpoints) = trace(elf_contents, inputs, memory_config, Some(5));
-///
-/// let full_execution_trace = checkpoints.as_ref().unwrap()[0].clone().collect::Vec<Cycle>();
-/// assert!(execution_trace == full_execution_trace);
-///
-/// let trace_from_checkpoint_1 = checkpoints.as_ref().unwrap()[1].clone().collect::Vec<Cycle>();
-/// assert!(trace_from_checkpoint_1 == execution_trace[n..])
-///
-/// let trace_from_checkpoint_2 = checkpoints.as_ref().unwrap()[2].clone().collect::Vec<Cycle>();
-/// assert!(trace_from_checkpoint_2 == execution_trace[2*n..])
+/// 返回一个包含以下内容的元组：
+/// * `LazyTraceIterator` - 惰性轨迹迭代器的拷贝
+/// * `Vec<Cycle>` - 完整的执行轨迹
+/// * `Memory` - 最终的内存状态
+/// * `JoltDevice` - 包含 IO 状态的设备对象
 ///
 #[tracing::instrument(skip_all)]
 pub fn trace(
@@ -90,6 +76,7 @@ pub fn trace(
         trusted_advice,
         memory_config,
     );
+    // 克隆一份迭代器用于返回，原始迭代器被消费用于生成完整的 trace Vec
     let lazy_trace_iter_ = lazy_trace_iter.clone();
     let trace: Vec<Cycle> = lazy_trace_iter.by_ref().collect();
     let final_memory_state =
@@ -104,6 +91,8 @@ pub fn trace(
 
 use crate::utils::trace_writer::{TraceBatchCollector, TraceWriter, TraceWriterConfig};
 
+/// 将程序执行轨迹直接写入文件，而不是全部保存在内存中。
+/// 适用于非常大的 Trace，避免内存溢出。
 pub fn trace_to_file(
     elf_contents: &[u8],
     elf_path: Option<&std::path::PathBuf>,
@@ -141,7 +130,26 @@ pub fn trace_to_file(
     (final_mem, lazy.lazy_tracer.get_jolt_device())
 }
 
+/// 提取 ELF 文件中的静态程序信息，这些信息通常用于生成 Image ID (Preprocessing Digest)。
+///
+/// Image ID（在 Jolt 中通常对应于 `JoltSharedPreprocessing` 的摘要）由程序的指令序列（Bytecode）、
+/// 内存布局（MemoryLayout）以及初始内存状态（Memory Init）决定。
+/// 该函数返回计算 Image ID 所需的 `instructions` 和 `data`。
+///
+/// # 参数
+/// * `elf_contents` - ELF 文件的二进制内容
+///
+/// # 返回值
+/// * `Vec<Instruction>` - 解码后的指令序列
+/// * `Vec<(u64, u8)>` - 初始内存数据 (地址, 字节值)
+pub fn extract_program_info(elf_contents: &[u8]) -> (Vec<Instruction>, Vec<(u64, u8)>) {
+    let (instructions, data, _, _) = decode(elf_contents);
+    (instructions, data)
+}
+
 #[tracing::instrument(skip_all)]
+/// 创建一个惰性执行轨迹迭代器。
+/// 不会立即执行程序，而是在迭代时逐步执行模拟器并生成 Trace。
 pub fn trace_lazy(
     elf_contents: &[u8],
     elf_path: Option<&std::path::PathBuf>,
@@ -161,6 +169,8 @@ pub fn trace_lazy(
 }
 
 #[tracing::instrument(skip_all)]
+/// 生成带检查点的执行轨迹。
+/// 这允许在长 Trace 中进行快速跳转或并行验证。
 pub fn trace_checkpoints(
     elf_contents: &[u8],
     inputs: &[u8],
@@ -181,6 +191,7 @@ pub fn trace_checkpoints(
     let mut checkpoints = Vec::new();
 
     loop {
+        // 跳过 checkpoint_interval 个周期，生成下一个检查点
         emulator_trace_iter = emulator_trace_iter.dropping(checkpoint_interval);
         let chkpt = emulator_trace_iter.lazy_tracer.save_checkpoint();
         checkpoints.push(chkpt);
@@ -194,11 +205,13 @@ pub fn trace_checkpoints(
     )
 }
 
+/// 执行模拟器的一步（tick）。
+/// 这个函数会更新 PC，并检测是否存在无限循环（通过简单的 PC 相等性启发式）。
 fn step_emulator(emulator: &mut Emulator, prev_pc: &mut u64, trace: Option<&mut Vec<Cycle>>) {
     let pc = emulator.get_cpu().read_pc();
-    // This is a trick to see if the program has terminated by throwing itself
-    // into an infinite loop. It seems to be a good heuristic for now but we
-    // should eventually migrate to an explicit shutdown signal.
+    // 这是一个简单的无限循环检测技巧：
+    // 如果 PC 没有改变，认为程序已通过进入无限循环而终止。
+    // TODO: 未来应迁移到显式的关机信号。
     if *prev_pc == pc {
         return;
     }
@@ -207,6 +220,7 @@ fn step_emulator(emulator: &mut Emulator, prev_pc: &mut u64, trace: Option<&mut 
 }
 
 #[tracing::instrument(skip_all)]
+/// 初始化模拟器，不带 ELF 路径（不加载调试符号）。
 fn setup_emulator(
     elf_contents: &[u8],
     inputs: &[u8],
@@ -225,7 +239,7 @@ fn setup_emulator(
 }
 
 #[tracing::instrument(skip_all)]
-/// Sets up an emulator instance with access to the elf-path for symbol loading and de-mangling.
+/// 设置一个模拟器实例，并可选择加载 ELF 路径以便于符号加载和名称解构（Backtrace 用）。
 fn setup_emulator_with_backtraces(
     elf_contents: &[u8],
     elf_path: Option<&std::path::PathBuf>,
@@ -263,37 +277,35 @@ fn setup_emulator_with_backtraces(
     emulator
 }
 
-/// A type that can be used to lazily generate a trace, one [`Cycle`] at a time.
+/// 一个用于懒惰生成 Trace 的 Trait，每次生成一个 [`Cycle`]。
 pub trait LazyTracer {
-    /// Check if the program execution has terminated.
+    /// 检查程序执行是否已终止。
     fn has_terminated(&self) -> bool;
 
-    /// Check if the program execution has panicked.
+    /// 检查程序执行是否发生了 Panic。
     fn has_panicked(&self) -> bool;
 
-    /// Returns whether the next execution of [`LazyTracer::lazy_step_cycle`] will emulate a new
-    /// instruction or return the next [`Cycle`] in the last executed instruction.
+    /// 返回下一次执行 [`LazyTracer::lazy_step_cycle`] 是否会模拟一条新指令，
+    /// 或者是返回上一条执行指令中的下一个 [`Cycle`]。
     fn at_tick_boundary(&self) -> bool;
 
-    /// Print a backtrace, assuming the program has panicked.
+    /// 打印 panic 回溯日志（假设程序已 panic）。
     fn print_panic_log(&self);
 
-    /// Get the next [`Cycle`] in the program execution. If the program is at a tick boundary, this
-    /// emulates the next instruction. Otherwise, it returns the next cycle within the last
-    /// executed instruction.
+    /// 获取程序执行的下一个 [`Cycle`]。
+    /// 如果程序处于指令边界（tick boundary），这将模拟执行下一条指令。
+    /// 否则，它返回上一条执行指令内的下一个 cycle（针对多周期指令）。
     fn lazy_step_cycle(&mut self) -> Option<Cycle>;
 
-    /// Take the [`JoltDevice`] from this tracer, consuming the tracer.
+    /// 从此 Tracer 中提取并消费 [`JoltDevice`]。
     fn get_jolt_device(self) -> JoltDevice;
 }
 
-/// An iterator that lazily generates execution traces from a RISC-V emulator checkpoint.
+/// 一个从 RISC-V 模拟器检查点懒惰生成执行轨迹的迭代器。
 ///
-/// This iterator produces instruction traces one at a time, executing the emulator
-/// as needed rather than generating the entire trace upfront. It buffers traces
-/// in `current_traces` since some instructions generate multiple trace entries.
-/// When the `current_traces` buffer is exhausted, it executes another emulator tick
-/// to generate more.
+/// 该迭代器每次产生一个 Trace，根据需要执行模拟器，而不是预先生成整个 Trace。
+/// 它在 `current_traces` 中缓冲 Trace，因为某些指令（如乘除法）会生成多个 Trace 条目。
+/// 当 `current_traces` 缓冲区耗尽时，它执行另一个模拟器 tick 来生成更多 Trace。
 #[derive(Clone, Debug)]
 pub struct GeneralizedLazyTraceIter<T> {
     pub lazy_tracer: T,
@@ -306,22 +318,21 @@ unsafe impl<T: Send> Send for GeneralizedLazyTraceIter<T> {}
 impl<T: LazyTracer> Iterator for GeneralizedLazyTraceIter<T> {
     type Item = Cycle;
 
-    /// Advances the iterator and returns the next trace entry.
+    /// 推进迭代器并返回下一个 Trace 条目。
     ///
-    /// # Returns
+    /// # 返回值
     ///
-    /// * `Some(Cycle)` - The next instruction trace in the execution sequence
-    /// * `None` - If program execution has completed.
+    /// * `Some(Cycle)` - 执行序列中的下一条指令 Trace
+    /// * `None` - 如果程序执行已完成
     ///
-    /// # Details
+    /// # 详情
     ///
-    /// The function follows this sequence:
-    /// 1. Returns any remaining traces from the previous emulator tick
-    /// 2. If buffer `current_traces` is empty, and the number of ticks
-    ///    is not reached, executes another emulator tick``
-    /// 3. Checks for program termination using the heuristic of PC not changing
-    /// 4. Buffers new traces in FIFO order
-    /// 5. Returns the next trace or None if execution is complete
+    /// 函数遵循此顺序：
+    /// 1. 返回上一条模拟器 tick 中剩余的 trace（如果有多周期指令）。
+    /// 2. 如果缓冲区 `current_traces` 为空，执行下一个模拟器 tick。
+    /// 3. 使用 PC 是否改变的启发式方法检查程序终止。
+    /// 4. 将新 Trace 缓冲为 FIFO 顺序。
+    /// 5. 返回下一个 Trace 或 None（如果执行完成）。
     fn next(&mut self) -> Option<Self::Item> {
         if self.lazy_tracer.has_terminated() {
             return None;
@@ -348,13 +359,13 @@ pub struct Checkpoint {
     emulator_state: Emulator,
     prev_pc: u64,
     current_traces: Vec<Cycle>,
-    /// The remaining number of cycles that can be replayed for this checkpoint
+    /// 该检查点剩余可重放的周期数
     trace_steps_remaining: usize,
-    /// The total number of cycles executed so far, including the ones prior to this checkpoint
+    /// 迄今为止执行的总周期数，包括此检查点之前的周期
     cycle_count: usize,
 }
 
-// SAFETY: Checkpoint contains only owned data and can be safely sent between threads
+// 安全性：Checkpoint 仅包含拥有的数据，可以在线程间安全发送
 unsafe impl Send for Checkpoint {}
 
 impl Checkpoint {
@@ -443,16 +454,21 @@ impl LazyTracer for Checkpoint {
     }
 }
 
-/// A tracer that uses a `Vec<u64>` memory backend but additionally stores the initial value of
-/// each memory access to a [`Checkpoint`], which can be saved and replayed from.
+/// 一个使用 `Vec<u64>` 内存后端的 Tracer，但额外存储每次内存访问的初始值
+/// 到一个 [`Checkpoint`] 中，可以从中保存和重放。
 #[derive(Clone, Debug)]
 pub struct CheckpointingTracer {
     emulator_state: Emulator,
     prev_pc: u64,
+    /// 当前正在处理的指令产生的 Traces（多周期指令可能产生多个）
     current_traces: Vec<Cycle>,
+    /// 自上一个检查点以来的步数
     trace_steps_since_last_checkpoint: usize,
+    /// 总周期计数
     cycle_count: usize,
+    /// 标记是否完成
     finished: bool,
+    /// 保存的处理器状态快照
     saved_processor_state: Option<Checkpoint>,
     pub(crate) final_memory_state: Option<Memory>,
 }
@@ -493,6 +509,7 @@ impl CheckpointingTracer {
 
     /// Start recording memory accesses so that checkpoints can be saved using
     /// [`CheckpointingTracer::save_checkpoint`].
+    /// 开始记录内存访问，以便可以使用 [`CheckpointingTracer::save_checkpoint`] 保存检查点。
     pub fn start_saving_checkpoints(&mut self) {
         self.saved_processor_state = Some(Checkpoint::new_with_empty_memory(
             &self.emulator_state,
@@ -509,11 +526,9 @@ impl CheckpointingTracer {
             .start_saving_checkpoints();
     }
 
-    /// Save the recorded memory traces to a new [`Checkpoint`] and reset the hashmap to which
-    /// they're recorded. The chunk of the trace that has been executed since the last call to
-    /// [`CheckpointingTracer::save_checkpoint`] or
-    /// [`CheckpointingTracer::start_saving_checkpoints`] can be replayed from the resulting
-    /// [`Checkpoint`].
+    /// 将记录的内存 Trace 保存到一个新的 [`Checkpoint`] 并重置记录的哈希表。
+    /// 从上次调用 `save_checkpoint` 或 `start_saving_checkpoints` 以来的执行片段
+    /// 可以从生成的 [`Checkpoint`] 重放。
     pub fn save_checkpoint(&mut self) -> Checkpoint {
         assert!(self
             .emulator_state
@@ -524,7 +539,7 @@ impl CheckpointingTracer {
             .data
             .is_saving_checkpoints());
 
-        // Save the processor state at the start of the current chunk
+        // 保存当前块开始时的处理器状态
         let mut new_processor_state = Checkpoint::new_with_empty_memory(
             &self.emulator_state,
             self.prev_pc,
@@ -536,7 +551,7 @@ impl CheckpointingTracer {
             &mut new_processor_state,
         );
 
-        // Store the hashmap of memory assignments since the last chunk
+        // 存储自上一个块以来的内存赋值哈希表
         let data = self
             .emulator_state
             .get_mut_cpu()
@@ -616,8 +631,20 @@ impl LazyTracer for CheckpointingTracer {
 }
 
 #[tracing::instrument(skip_all)]
+/// 解析 ELF 文件并将指令解码为 Jolt 内部指令格式。
+/// 返回：(指令列表, 数据段初始化数据, 程序结束地址, 架构位宽)
 pub fn decode(elf: &[u8]) -> (Vec<Instruction>, Vec<(u64, u8)>, u64, Xlen) {
-    let obj = object::File::parse(elf).unwrap();
+    // Ensure 64-bit alignment for object crate which requires aligned buffer for zero-copy parsing.
+    // Static byte arrays in tests might not be aligned to 8 bytes.
+    let aligned_elf_vec: Vec<u8>;
+    let elf_data = if elf.as_ptr() as usize % 8 != 0 {
+        aligned_elf_vec = elf.to_vec();
+        &aligned_elf_vec
+    } else {
+        elf
+    };
+
+    let obj = object::File::parse(elf_data).expect("Invalid ELF header size or alignment");
     let mut xlen = Xlen::Bit64;
     if let object::File::Elf32(_) = &obj {
         xlen = Xlen::Bit32;
@@ -631,7 +658,7 @@ pub fn decode(elf: &[u8]) -> (Vec<Instruction>, Vec<(u64, u8)>, u64, Xlen) {
     let mut instructions = Vec::new();
     let mut data = Vec::new();
 
-    // keeps track of the highest address used in the program as the end address
+    // 记录程序中使用的最高地址作为结束地址
     let mut program_end = RAM_START_ADDRESS;
     for section in sections {
         let start = section.address();
@@ -646,15 +673,16 @@ pub fn decode(elf: &[u8]) -> (Vec<Instruction>, Vec<(u64, u8)>, u64, Xlen) {
             while offset < raw_data.len() {
                 let address = section.address() + offset as u64;
 
-                // Check if we have at least 2 bytes
+                // 检查是否至少有 2 个字节
                 if offset + 1 >= raw_data.len() {
                     break;
                 }
 
-                // Read first 2 bytes to determine instruction length
+                // 读取前两个字节以确定指令长度（压缩指令检测）
                 let first_halfword = u16::from_le_bytes([raw_data[offset], raw_data[offset + 1]]);
 
-                // Check if it's a compressed instruction (lowest 2 bits != 11)
+                // 检查是否为压缩指令（最低 2 位 != 11）
+                // RISC-V 规范中，低两位非 11 表示 16 位压缩指令
                 if (first_halfword & 0b11) != 0b11 {
                     // Compressed 16-bit instruction
                     let compressed_inst = first_halfword;
@@ -1092,5 +1120,162 @@ mod tests {
             prev_trace_len = trace.len();
         }
         assert_eq!(execution_trace, trace);
+    }
+
+    #[test]
+    fn test_minimal_elf_decode() {
+        let elf = minimal_elf();
+        let (instructions, data, program_end, xlen) = decode(&elf);
+
+        // 最小 ELF 应该不包含有效的 text 段，所以指令集为空
+        assert!(instructions.is_empty());
+        // 数据段可能也为空
+        assert!(data.is_empty());
+        // 程序结束地址应该是 RAM_START_ADDRESS
+        assert_eq!(program_end, RAM_START_ADDRESS);
+        // 它是 64 位 ELF (0x02在第4字节)
+        assert!(matches!(xlen, Xlen::Bit64));
+    }
+
+    #[test]
+    fn test_chunks_iterator() {
+        let data = vec![1, 2, 3, 4, 5, 6, 7];
+        let chunks: Vec<Vec<i32>> = data.into_iter().iter_chunks(3).collect();
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0], vec![1, 2, 3]);
+        assert_eq!(chunks[1], vec![4, 5, 6]);
+        assert_eq!(chunks[2], vec![7]);
+    }
+
+    #[test]
+    #[should_panic(expected = "chunk size must be non-zero")]
+    fn test_chunks_iterator_panic() {
+        let data = vec![1, 2, 3];
+        let _chunks: Vec<Vec<i32>> = data.into_iter().iter_chunks(0).collect();
+    }
+
+    #[test]
+    fn test_decode_valid_elf() {
+        // 使用内置的 ELF_CONTENTS (一个真实的 RISC-V 程序) 来验证解码逻辑
+        let (instructions, data, program_end, xlen) = decode(ELF_CONTENTS);
+
+        // 1. 验证必须解码出指令
+        assert!(!instructions.is_empty(), "Should decode at least one instruction from valid ELF");
+
+        // 2. 验证程序结束地址合理 (必须在 RAM 起始地址之后)
+        assert!(program_end > RAM_START_ADDRESS, "Program end should be after RAM start");
+
+        // 3. 验证架构位宽 (ELF_CONTENTS 是 64 位的)
+        assert!(matches!(xlen, Xlen::Bit64), "Should detect 64-bit architecture");
+
+        // 4. 验证指令有效性
+        // 统计解码成功的指令数量 (非 UNIMPL)
+        let valid_count = instructions.iter()
+            .filter(|inst| !matches!(inst, Instruction::UNIMPL))
+            .count();
+
+        // 作为一个真实的程序，绝大多数指令都应该是可以被识别的
+        // 如果 valid_count 为 0 或者很低，说明解码逻辑可能有问题
+        assert!(valid_count > 0, "No valid instructions decoded");
+
+        // 5. 验证数据段
+        // 即使是个小程��，可能也有一些 .data 或 .rodata
+        // 这里主要验证 decode 函数没有 panic 并且返回了数据结构
+        println!("Decoded {} instructions and {} data bytes", instructions.len(), data.len());
+    }
+
+    #[test]
+    fn test_trace_structure_example() {
+        use crate::instruction::add::ADD;
+        use crate::instruction::format::format_r::RegisterStateFormatR;
+        use crate::instruction::RISCVCycle;
+        use crate::instruction::RISCVInstruction;
+        // 演示 Trace 数据结构的手动构建
+        // 模拟指令: add x1, x2, x3 (x1 = x2 + x3)
+        // 假设 x2=10, x3=20
+
+        let instruction = ADD::new(
+            0x003100b3, // 机器码: add x1, x2, x3
+            0x1000,     // PC 地址
+            false,      // validate
+            false       // compressed
+        );
+
+        let register_state = RegisterStateFormatR {
+            rs1: 10,
+            rs2: 20,
+            rd: (0, 30), // (old_value, new_value)
+        };
+
+        let riscv_cycle = RISCVCycle {
+            instruction,
+            register_state,
+            ram_access: (), // ADD 不访问内存, 对应的 RAMAccess 类型为 ()
+        };
+
+        let cycle = crate::instruction::Cycle::ADD(riscv_cycle);
+
+        // 验证结构内容
+        if let crate::instruction::Cycle::ADD(c) = cycle {
+            println!("Trace Instruction: {:?}", c.instruction);
+            println!("Register Mutation: {:?} -> {:?}", c.register_state.rd.0, c.register_state.rd.1);
+            assert_eq!(c.register_state.rs1, 10);
+            assert_eq!(c.register_state.rs2, 20);
+            assert_eq!(c.register_state.rd.1, 30);
+        } else {
+            panic!("Wrong cycle type");
+        }
+    }
+
+    #[test]
+    fn test_generate_image_id() {
+        // This test demonstrates how to generate a unique "Image ID" (Preprocessing Digest)
+        // for a program from its binary (ELF). The Image ID statically identifies the program
+        // and is used for verifying that a proof corresponds to the correct program.
+
+        let elf = ELF_CONTENTS;
+
+        // 1. Extract Static Program Information
+        // We use the `decode` function (via `extract_program_info`) to parse the ELF.
+        // This gives us two critical components:
+        // - `instructions`: The list of decoded RISC-V instructions (the program logic).
+        // - `memory_init`: The initial state of the RAM (global variables, static data).
+        // These components (plus MemoryLayout) fully define the initial state of the VM.
+        let (instructions, memory_init) = extract_program_info(elf);
+
+        assert!(!instructions.is_empty(), "Image ID relies on bytecode instructions");
+        println!("Extracted Program Info: {} instructions, {} init memory bytes",
+                 instructions.len(), memory_init.len());
+
+        // 2. Serialize the Components
+        // To generate a cryptographic digest, we must deterministically serialize the components.
+        // In the full Jolt system (jolt-core), `ark_serialize::CanonicalSerialize` is used.
+        // Here, we use `serde_json` to demonstrate the serialization step as `Instruction`
+        // implements `Serialize`.
+        let instructions_bytes = serde_json::to_vec(&instructions)
+            .expect("Failed to serialize instructions");
+        let memory_bytes = serde_json::to_vec(&memory_init)
+            .expect("Failed to serialize memory init data");
+
+        // 3. Compute the Digest (Image ID)
+        // We hash the serialized data. The result is the Image ID.
+        // Note: Real Jolt uses a specific cryptographic hash (like Blake2b or Keccak).
+        // We use `DefaultHasher` here for demonstration within `tracer`'s dependencies.
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hasher;
+
+        let mut hasher = DefaultHasher::new();
+        hasher.write(&instructions_bytes);
+        hasher.write(&memory_bytes);
+        let image_id = hasher.finish();
+
+        println!("Generated Image ID: {:016x}", image_id);
+
+        // Ensure the ID is deterministic
+        let mut hasher2 = DefaultHasher::new();
+        hasher2.write(&instructions_bytes);
+        hasher2.write(&memory_bytes);
+        assert_eq!(image_id, hasher2.finish(), "Image ID must be deterministic");
     }
 }

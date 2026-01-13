@@ -18,6 +18,39 @@ use crate::constants::{
 /// all reads from the reserved memory address space for program inputs and all writes
 /// to the reserved memory address space for program outputs.
 /// The inputs and outputs are part of the public inputs to the proof.
+/*
+`JoltDevice` 结构体在 Jolt 的 RISC-V 模拟器中扮演着“外围设备”（Peripheral Device）的角色。它负责处理所有指向特定保留内存
+区域的读写操作，用于管理程序的输入、输出以及辅助输入（Advice）。
+1.  **`inputs: Vec<u8>`**
+    *   **含义**: 存储宿主环境传递给 Guest 程序的标准输入数据。
+    *   **作用**: 当 Guest 程序尝试从内存布局中定义的输入区域（`input_start` 到 `input_end`）读取数据时，实际上是从这个
+     `Vec` 中读取字节。它是零知识证明中的主要公共输入（Public Inputs）之一。
+
+2.  **`trusted_advice: Vec<u8>`**
+    *   **含义**: 存储“可信辅助输入”（Trusted Advice）。
+    *   **作用**: 这通常指在预处理阶段就已知或已被承诺的数据。Guest 程序可以像读取内存一样读取这些数据。在零知识证明系统中，
+    这部分数据通常对应于 Verifier 已知或者在设置阶段固定的信息。
+
+3.  **`untrusted_advice: Vec<u8>`**
+    *   **含义**: 存储“不可信辅助输入”（Untrusted Advice）。
+    *   **作用**: 这是 Prover 在运行时提供的辅助信息（Hint），用于帮助计算或优化证明过程。由于它是不可信的，Verifier 需要
+    通过计算来验证其一致性（例如通过 Commit 机制）。Guest 程序也可以通过内存地址访问它。
+
+4.  **`outputs: Vec<u8>`**
+    *   **含义**: 存储 Guest 程序执行过程中产生的输出数据。
+    *   **作用**: 当 Guest 程序向内存布局中定义的输出区域（`output_start` 到 `output_end`）写入数据时，数据会被
+    追加或更新到这个 `Vec` 中。证明生成后，Verifier 会检查这些输出是否与 Prover 声称的一致。
+
+5.  **`panic: bool`**
+    *   **含义**: 一个布尔标志，指示 Guest 程序是否发生了恐慌（Panic）或异常终止。
+    *   **作用**: 对应于内存布局中的 `panic` 地址位。如果 Guest 程序在执行期间写入了该特定地址，这个标志会被置为 `true`。
+    Verifier 可以检查此标志来确认程序是否正常结束。
+
+6.  **`memory_layout: MemoryLayout`**
+    *   **含义**: 定义了上述所有数据（输入、输出、Advice、Panic 等）在 RISC-V 虚拟内存空间中的地址范围映射。
+    *   **作用**: 它充当路由表。例如，当 CPU 访问地址 `0x1000` 时，`load` 方法会查阅 `memory_layout`，
+    判断 `0x1000` 是属于 `inputs` 还是 `outputs`，然后从对应的 `Vec` 中读取数据。它还定义了栈（Stack）和堆（Heap）的边界。
+ */
 #[derive(
     Allocative,
     Default,
