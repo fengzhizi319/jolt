@@ -181,6 +181,9 @@ pub type Openings<F> = BTreeMap<OpeningId, Opening<F>>;
 
 /// Accumulates openings computed by the prover over the course of Jolt,
 /// so that they can all be reduced to a single opening proof using sumcheck.
+/// 收集和管理多项式的“打开”（openings）信息。
+/// 累积所有的打开点和值 (Accumulation): 在 Jolt 证明生成的过程中，
+/// 会产生很多在不同点对不同多项式进行“打开”（即求值）的需求。ProverOpeningAccumulator 将这些零散的打开请求收集起来。
 #[derive(Clone, Allocative)]
 pub struct ProverOpeningAccumulator<F>
 where
