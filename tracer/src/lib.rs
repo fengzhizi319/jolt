@@ -77,10 +77,29 @@ pub fn trace(
         memory_config,
     );
     // 克隆一份迭代器用于返回，原始迭代器被消费用于生成完整的 trace Vec
+    // 1. 克隆迭代器：我们需要返回一个未消费的迭代器给调用者（lazy_trace_iter_），
+    //    以便调用者可以按需遍历或用于其他目的（例如证明生成）。
+    //    原始的 `lazy_trace_iter` 将在下一步被完全消费。
     let lazy_trace_iter_ = lazy_trace_iter.clone();
+
+    // 2. 执行并收集 Trace：通过调用 `collect()` 驱动模拟器运行直到程序结束。
+    //    这将执行每一条指令，生成完整的执行轨迹（Vec<Cycle>）。
+    //    注意：`by_ref()` 借用迭代器，虽然这里最终还是消费了它，但语法上允许我们在后面继续访问它的字段。
     let trace: Vec<Cycle> = lazy_trace_iter.by_ref().collect();
+    // println!("trace 0: {:#?}", trace[0]);
+    // println!("trace 1: {:#?}", trace[1]);
+    // println!("trace 2: {:#?}", trace[2]);
+    // println!("trace 3: {:#?}", trace[3]);
+    // println!("trace 4: {:#?}", trace[4]);
+    // println!("trace 5: {:#?}", trace[5]);
+
+    // 3. 提取最终内存状态：当迭代器执行完成后，最终的内存状态存储在 `lazy_tracer` 内部字段中。
+    //    使用 `std::mem::take` 将其从结构体中“偷”出来（获取所有权），同时留下一个默认值（Option::None）。
+    //    这里 unwrap 是安全的，因为程序执行完成后该状态必然已被设置。
     let final_memory_state =
         std::mem::take(&mut lazy_trace_iter.lazy_tracer.final_memory_state).unwrap();
+
+    // 4. 返回结果元组：包含未消费的迭代器、完整的 Trace 列表、最终内存状态以及设备 IO 状态。
     (
         lazy_trace_iter_,
         trace,

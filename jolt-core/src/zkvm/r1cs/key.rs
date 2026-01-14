@@ -173,3 +173,35 @@ impl<F: JoltField> UniformSpartanKey<F> {
         map_to_field(&hasher.finalize())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ark_bn254::Fr;
+
+    #[test]
+    fn test_digest_consistency() {
+        let num_steps = 1024;
+        let digest1 = UniformSpartanKey::<Fr>::digest(num_steps);
+        let digest2 = UniformSpartanKey::<Fr>::digest(num_steps);
+        assert_eq!(digest1, digest2, "Digest should be deterministic");
+    }
+
+    #[test]
+    fn test_digest_different_steps() {
+        let digest1 = UniformSpartanKey::<Fr>::digest(1024);
+        let digest2 = UniformSpartanKey::<Fr>::digest(2048);
+        assert_ne!(
+            digest1, digest2,
+            "Digest should differ for different num_steps"
+        );
+    }
+
+    #[test]
+    fn test_key_creation_sets_digest() {
+        let num_steps = 1024;
+        let key = UniformSpartanKey::<Fr>::new(num_steps);
+        let expected_digest = UniformSpartanKey::<Fr>::digest(num_steps);
+        assert_eq!(key.vk_digest, expected_digest);
+    }
+}

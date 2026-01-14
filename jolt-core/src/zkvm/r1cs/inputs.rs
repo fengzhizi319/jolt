@@ -266,6 +266,10 @@ pub struct R1CSCycleInputs {
 impl R1CSCycleInputs {
     /// Build directly from the execution trace and preprocessing,
     /// mirroring the optimized semantics used in `compute_claimed_r1cs_input_evals`.
+    /// 直接从执行轨迹（Trace）和预处理数据中构建单步的 R1CS 输入数据。
+    ///
+    /// 尽管这个函数在宿主机的运行时(Runtime)执行，但它生成的结构体必须严格对应
+    /// 电路中的 Witness (见证数据)。这里的每一个字段稍后都会变成多项式的一部分。
     pub fn from_trace<F>(
         bytecode_preprocessing: &BytecodePreprocessing,
         trace: &[Cycle],
@@ -275,55 +279,85 @@ impl R1CSCycleInputs {
         F: JoltField,
     {
         let len = trace.len();
+        // 获取当前时钟周期 t 的完整状态（指令、寄存器、RAM等）
         let cycle = &trace[t];
+        // 获取当前解码后的指令信息
         let instr = cycle.instruction();
+        // 获取电路标志位视图 (如 IsAdd, IsLoad 等)
         let flags_view = instr.circuit_flags();
+        // 获取指令通用属性 (如 IsBranch, IsNoop 等)
         let instruction_flags = instr.instruction_flags();
+        // 获取标准化后的指令信息 (包含操作码、操作数等)
         let norm = instr.normalize();
 
-        // Next-cycle context
+        // 获取下一个 Cycle 的引用，用于计算状态转移约束 (如 NextPC)
+        // 如果当前是最后一个 Cycle，则 next_cycle 为 None
         let next_cycle = if t + 1 < len {
             Some(&trace[t + 1])
         } else {
             None
         };
 
-        // Instruction inputs and product
+        // --- 1. 指令输入与算术验证 ---
+
+        // 根据指令类型提取左/右操作数。
+        // 例如：对于 ADD, left=rs1, right=rs2；对于 ADDI, left=rs1, right=imm
         let (left_input, right_i128) = LookupQuery::<XLEN>::to_instruction_inputs(cycle);
+
+        // 将输入转换为电路使用的有符号 64 位整数格式 (S64)
         let left_s64: S64 = S64::from_u64(left_input);
+
+        // 检查右操作数范围并转换
         let right_mag = right_i128.unsigned_abs();
         debug_assert!(
             right_mag <= u64::MAX as u128,
             "RightInstructionInput overflow at row {t}: |{right_i128}| > 2^64-1"
         );
         let right_input = S64::from_u64_with_sign(right_mag as u64, right_i128 >= 0);
+
+        // 计算乘积 witness (Product)。
+        // 即使当前指令不是乘法，我们也会计算这个值，以保持电路结构的统一性 (Uniformity)。
+        // 如果当前是 ADD 指令，R1CS 约束会忽略这个 product 字段；但如果是 MUL 指令，则会验证它是否正确。
         let right_s128: S128 = S128::from_i128(right_i128);
         let product: S128 = left_s64.mul_trunc::<2, 2>(&right_s128);
 
-        // Lookup operands and output
+        // --- 2. 查找表 (Lookup) ---
+
+        // 提取用于查表的操作数。对于位运算等复杂操作，Jolt 使用查表法。
         let (left_lookup, right_lookup) = LookupQuery::<XLEN>::to_lookup_operands(cycle);
+        // 提取查表的结果（即运算结果）
         let lookup_output = LookupQuery::<XLEN>::to_lookup_output(cycle);
 
-        // Registers
+        // --- 3. 寄存器状态 ---
+
+        // 获取读写的寄存器值。unwrap_or_default 处理那些不访问寄存器的指令情况。
         let rs1_read_value = cycle.rs1_read().unwrap_or_default().1;
         let rs2_read_value = cycle.rs2_read().unwrap_or_default().1;
         let rd_write_value = cycle.rd_write().unwrap_or_default().2;
 
-        // RAM
+        // --- 4. 内存 (RAM) 状态 ---
+
         let ram_addr = cycle.ram_access().address() as u64;
+        // 分别提取内存读写前后的值：
+        // - Read: 读取到的值既是 read_value 也是 write_value (状态不变)
+        // - Write: pre_value 是旧值 (read), post_value 是新值 (write)
         let (ram_read_value, ram_write_value) = match cycle.ram_access() {
             tracer::instruction::RAMAccess::Read(r) => (r.value, r.value),
             tracer::instruction::RAMAccess::Write(w) => (w.pre_value, w.post_value),
             tracer::instruction::RAMAccess::NoOp => (0u64, 0u64),
         };
 
-        // PCs
+        // --- 5. 程序计数器 (PC) ---
+
+        // 从预处理数据中获取当前指令的真实 PC
         let pc = bytecode_preprocessing.get_pc(cycle) as u64;
+        // 确定 NextPC：如果有下一条指令则取之，否则为 0
         let next_pc = if let Some(nc) = next_cycle {
             bytecode_preprocessing.get_pc(nc) as u64
         } else {
             0u64
         };
+        // UnexpandedPC 是未展开的原始指令地址
         let unexpanded_pc = norm.address as u64;
         let next_unexpanded_pc = if let Some(nc) = next_cycle {
             nc.instruction().normalize().address as u64
@@ -331,7 +365,8 @@ impl R1CSCycleInputs {
             0u64
         };
 
-        // Immediate
+        // --- 6. 立即数 (Immediate) ---
+
         let imm_i128 = norm.operands.imm;
         let imm_mag = imm_i128.unsigned_abs();
         debug_assert!(
@@ -340,25 +375,42 @@ impl R1CSCycleInputs {
         );
         let imm = S64::from_u64_with_sign(imm_mag as u64, imm_i128 >= 0);
 
-        // Flags and derived booleans
+        // --- 7. 标志位与逻辑计算 ---
+
+        // 将 Enum Map 形式的标志位展平为布尔数组。这是 R1CS 矩阵中 "One-Hot" 编码的基础。
         let mut flags = [false; NUM_CIRCUIT_FLAGS];
         for flag in CircuitFlags::iter() {
             flags[flag] = flags_view[flag];
         }
+
+        // 判断下一条指令是否是 NoOp
         let next_is_noop = if let Some(nc) = next_cycle {
             nc.instruction().instruction_flags()[InstructionFlags::IsNoop]
         } else {
-            false // There is no next cycle, so cannot be a noop
+            false // 没有下一条指令，自然不是 NoOp
         };
+
+        // 派生字段：ShouldJump
+        // 逻辑：当前是 Jump 指令 且 下一条指令是有效的（非 NoOp）
         let should_jump = flags_view[CircuitFlags::Jump] && !next_is_noop;
+
+        // 派生字段：ShouldBranch
+        // 逻辑：当前是 Branch 指令 且 查表结果为 1 (条件成立)
         let should_branch = instruction_flags[InstructionFlags::Branch] && (lookup_output == 1);
 
-        // Write-to-Rd selectors (masked by flags)
+        // 派生字段：写回 RD 的控制位
+        // 只有当目标寄存器 RD 不是 x0 (零寄存器) 时，才允许写入。
+
+        // 情况 A: 将 Lookup 结果写回 RD (用于普通算术指令)
         let write_lookup_output_to_rd_addr = flags_view[CircuitFlags::WriteLookupOutputToRD]
             && instruction_flags[InstructionFlags::IsRdNotZero];
+
+        // 情况 B: 将 PC 写回 RD (用于 JAL/JALR 跳转链接)
         let write_pc_to_rd_addr =
             flags_view[CircuitFlags::Jump] && instruction_flags[InstructionFlags::IsRdNotZero];
 
+        // 检查下一条指令是否属于虚拟指令序列 (Virtual Instruction Sequence)
+        // Jolt 会把某些复杂指令拆解为多个 Micro-ops
         let (next_is_virtual, next_is_first_in_sequence) = if let Some(nc) = next_cycle {
             let flags = nc.instruction().circuit_flags();
             (
@@ -397,6 +449,7 @@ impl R1CSCycleInputs {
             next_is_first_in_sequence,
         }
     }
+
 
     #[cfg(test)]
     pub fn get_input_value(&self, input: JoltR1CSInputs) -> i128 {
