@@ -581,6 +581,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         (proof, debug_info)
     }
 
+
     #[tracing::instrument(skip_all, name = "generate_and_commit_witness_polynomials")]
     fn generate_and_commit_witness_polynomials(
         &mut self,
@@ -588,38 +589,64 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         Vec<PCS::Commitment>,
         HashMap<CommittedPolynomial, PCS::OpeningProofHint>,
     ) {
+        // 1. 初始化 Dory 上下文：配置全局状态，用于后续的并行 MSM 计算。
+        // chunk_k 决定了矩阵的宽度（即一行有多少个元素），padded_trace_len 是矩阵的总大小。
+        /*one_hot_params：
+         log_k_chunk: 4,
+         lookups_ra_virtual_log_k_chunk: 16,
+         k_chunk: 16,
+         bytecode_k: 2048,
+         ram_k: 8192,
+         instruction_d: 32,
+         bytecode_d: 3,
+         ram_d: 4,
+         */
         let _guard = DoryGlobals::initialize_context(
             1 << self.one_hot_params.log_k_chunk,
             self.padded_trace_len,
             DoryContext::Main,
         );
-        // Generate and commit to all witness polynomials using streaming tier1/tier2 pattern
-        let T = DoryGlobals::get_T();
-        let polys = all_committed_polynomials(&self.one_hot_params);
-        let row_len = DoryGlobals::get_num_columns();
-        let num_rows = T / DoryGlobals::get_max_num_rows();
+
+        // 2. 准备基本参数
+        let T = DoryGlobals::get_T(); // 填充后的 Trace 总长度2048
+        // 获取所有需要在这一步提交的多项式定义（Schema）
+        let polys = all_committed_polynomials(&self.one_hot_params);//41
+        let row_len = DoryGlobals::get_num_columns(); // Dory 矩阵的列数（宽度）256
+        let num_rows = T / DoryGlobals::get_max_num_rows(); // Dory 矩阵的行数。16
 
         tracing::debug!(
-            "Generating and committing {} witness polynomials with T={}, row_len={}, num_rows={}",
-            polys.len(),
-            T,
-            row_len,
-            num_rows
-        );
+           "Generating and committing {} witness polynomials with T={}, row_len={}, num_rows={}",
+           polys.len(),
+           T,
+           row_len,
+           num_rows
+       );
 
-        // Tier 1: Compute row commitments for each polynomial
+        // ==========================================
+        // Tier 1: 流式计算行承诺 (Row Commitments)
+        // ==========================================
+        // 预分配内存用于存储每一行的中间承诺状态
         let mut row_commitments: Vec<Vec<PCS::ChunkState>> = vec![vec![]; num_rows];
 
+        // 并行流式处理 Trace：
+        // self.lazy_trace 是一个懒加载迭代器，不会一次性把所有数据读入内存。
+        /*
         self.lazy_trace
             .clone()
-            .pad_using(T, |_| Cycle::NoOp)
-            .iter_chunks(row_len)
+            .pad_using(T, |_| Cycle::NoOp) // 如果 Trace 不足 T，用 NoOp 填充
+            .iter_chunks(row_len)          // 按照 Dory 的矩阵行宽进行切分
             .zip(row_commitments.iter_mut())
-            .par_bridge()
+            .par_bridge()                  // 开启并行处理（Rayon）
             .for_each(|(chunk, row_tier1_commitments)| {
+                tracing::debug!("polys： {:?}", polys);
+                // 在当前线程中，处理这一块 Trace 数据 (Chunk)
                 let res: Vec<_> = polys
-                    .par_iter()
+                    .par_iter() // 对每一种多项式并行处理
                     .map(|poly| {
+                        // 核心逻辑：
+                        // 1. 根据 chunk 里的 Trace 数据，计算该多项式的具体的点值 (Witness Generation)。
+                        // 2. 立即对这些点值进行 MSM 计算，得到一个小的 ChunkState (Commitment)。
+                        // 3. 原始的点值数据在这里就被释放了，极大节省内存。
                         poly.stream_witness_and_commit_rows::<_, PCS>(
                             &self.preprocessing.generators,
                             &self.preprocessing.shared,
@@ -628,10 +655,69 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
                         )
                     })
                     .collect();
+                // 保存当前这一行所有多项式的中间承诺
                 *row_tier1_commitments = res;
             });
 
-        // Transpose: row_commitments[row][poly] -> tier1_per_poly[poly][row]
+         */
+        // --------------------------------------------------------------------------
+        // [调试修改] 拆分代码与单线程化
+        // --------------------------------------------------------------------------
+
+        // 1. 构造迭代器链，但不立即消费
+        // 如果 Trace 不足 T，用 NoOp 填充，并按行宽切分
+        let trace_stream = self
+            .lazy_trace
+            .clone()
+            .pad_using(T, |_| Cycle::NoOp)
+            .iter_chunks(row_len);
+
+        // 2. 将数据流与结果存储(row_commitments)打包，并添加索引方便调试
+        let zipped_iter = trace_stream
+            .zip(row_commitments.iter_mut())
+            .enumerate();
+
+        tracing::info!("=== 开始 witness 多项式生成与 Commit (单线程调试模式) ===");
+        tracing::info!("Trace 长度 T: {}, Dory 行宽: {}, 总行数: {}", T, row_len, num_rows);
+
+        // 3. 外层循环：遍历每一“行”（Trace 的一个 Chunk）
+        for (row_idx, (chunk, row_tier1_commitments)) in zipped_iter {
+            tracing::info!(">>> 正在处理第 {} 行 (Row Index)", row_idx);
+            tracing::info!("    当前 Chunk 大小: {}", chunk.len());
+            // tracing::debug!("polys： {:?}", polys); // 保留原有的 log
+
+            // 4. 内层循环：遍历每一个多项式
+            // 此时已移除 par_iter，改为串行处理
+            let mut row_results = Vec::with_capacity(polys.len());
+
+            for (poly_idx, poly) in polys.iter().enumerate() {
+                // 打印多项式信息
+                tracing::info!("    -> 处理第 {} 个多项式: {:?}", poly_idx, poly);
+
+                // 核心逻辑：计算点值并 Commit
+                // 注意：这里没有 par_iter，会在当前线程阻塞执行
+                let commitment = poly.stream_witness_and_commit_rows::<_, PCS>(
+                    &self.preprocessing.generators,
+                    &self.preprocessing.shared,
+                    &chunk,
+                    &self.one_hot_params,
+                );
+
+                row_results.push(commitment);
+            }
+
+            // 保存当前这一行所有多项式的中间承诺
+            *row_tier1_commitments = row_results;
+
+            tracing::info!("<<< 第 {} 行处理完毕\n", row_idx);
+        }
+        tracing::info!("=== Witness Commit 结束 ===");
+
+        // ==========================================
+        // 数据转置 (Transpose)
+        // ==========================================
+        // 目前数据格式是：row_commitments[row_idx][poly_idx]
+        // 我们需要按多项式聚合，所以转换为：tier1_per_poly[poly_idx][row_idx]
         let tier1_per_poly: Vec<Vec<PCS::ChunkState>> = (0..polys.len())
             .into_par_iter()
             .map(|poly_idx| {
@@ -642,19 +728,29 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             })
             .collect();
 
-        // Tier 2: Compute final commitments from tier1 commitments
+        // ==========================================
+        // Tier 2: 最终聚合 (Aggregation)
+        // ==========================================
+        // 并行地为每个多项式计算最终承诺
         let (commitments, hints): (Vec<_>, Vec<_>) = tier1_per_poly
             .into_par_iter()
             .zip(&polys)
             .map(|(tier1_commitments, poly)| {
+                // 获取该多项式的大小参数（One-Hot 编码相关）
                 let onehot_k = poly.get_onehot_k(&self.one_hot_params);
+                // aggregate_chunks 会将所有行的中间承诺（ChunkState）合并
+                // 生成最终的 Commitment 和用于打开证明的 Hint
                 PCS::aggregate_chunks(&self.preprocessing.generators, onehot_k, &tier1_commitments)
             })
             .unzip();
 
+        // 将 Hint 放入 HashMap 以便后续检索
         let hint_map = HashMap::from_iter(zip_eq(polys, hints));
 
-        // Append commitments to transcript
+        // ==========================================
+        // Fiat-Shamir: 写入 Transcript
+        // ==========================================
+        // 将计算出的承诺吸收到随机预言机中，以冻结当前的计算状态
         for commitment in &commitments {
             self.transcript.append_serializable(commitment);
         }

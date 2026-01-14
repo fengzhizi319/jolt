@@ -204,19 +204,53 @@ impl OneHotConfig {
 /// and verifier from `OneHotConfig` plus the proof parameters (bytecode_K, ram_K).
 #[derive(Allocative, Clone, Debug, Default)]
 pub struct OneHotParams {
+    /// One-Hot 编码块的位宽（对数形式）。
+    /// 例如：如果为 8，则每个块处理 8 bit 数据，对应 256 大小的查找表。
+    /// 这决定了基础承诺多项式的“宽度”。
     pub log_k_chunk: usize,
+
+    /// 指令查找中虚拟 RA（Read-Access）多项式的位宽。
+    /// Jolt 为了优化性能，将多个基础块（log_k_chunk）在逻辑上组合成一个更大的虚拟块。
+    /// 这个值必须是 log_k_chunk 的倍数。
     pub lookups_ra_virtual_log_k_chunk: usize,
+
+    /// One-Hot 编码块的实际大小，即 2^log_k_chunk。
+    /// 用于位掩码（bitmask）计算，例如 `val & (k_chunk - 1)`。
     pub k_chunk: usize,
 
+    /// 字节码（Bytecode）地址空间的大小。
+    /// 通常是程序长度向上取整到 2 的幂次。
     pub bytecode_k: usize,
+
+    /// RAM 读写内存地址空间的大小。
+    /// 包含所有被访问过的内存地址的最大范围，向上取整到 2 的幂次。
     pub ram_k: usize,
 
+    // --- 分解深度 (Decomposition Depth / Dimension) ---
+    // 表示将一个大整数拆分为多少个小块 (Chunks)
+
+    /// 指令查找键（通常 128 位）被拆分的块数。
+    /// 计算方式：ceil(128 / log_k_chunk)。
     pub instruction_d: usize,
+
+    /// 程序计数器（PC）地址被拆分的块数。
+    /// 计算方式：ceil(log2(bytecode_k) / log_k_chunk)。
     pub bytecode_d: usize,
+
+    /// RAM 地址被拆分的块数。
+    /// 计算方式：ceil(log2(ram_k) / log_k_chunk)。
     pub ram_d: usize,
 
+    // --- 预计算位移量 (Pre-computed Shifts) ---
+    // 用于快速提取第 i 个 chunk 的值： (val >> shifts[i]) & mask
+
+    /// 用于提取指令查找键各个 chunk 的右移位数列表。
     instruction_shifts: Vec<usize>,
+
+    /// 用于提取 RAM 地址各个 chunk 的右移位数列表。
     ram_shifts: Vec<usize>,
+
+    /// 用于提取 Bytecode PC 各个 chunk 的右移位数列表。
     bytecode_shifts: Vec<usize>,
 }
 
