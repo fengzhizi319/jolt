@@ -61,13 +61,22 @@ impl<const XLEN: usize> LookupQuery<XLEN> for RISCVCycle<ADD> {
 
     fn to_lookup_output(&self) -> u64 {
         let (x, y) = LookupQuery::<XLEN>::to_instruction_inputs(self);
-        match XLEN {
+        // 先计算结果
+        let result = match XLEN {
             #[cfg(test)]
             8 => (x as u8).overflowing_add(y as u8).0.into(),
             32 => (x as u32).overflowing_add(y as u32).0.into(),
             64 => x.overflowing_add(y as u64).0,
             _ => panic!("{XLEN}-bit word size is unsupported"),
-        }
+        };
+
+        // 打印详细日志：包含 XLEN 位宽，输入 x, y 和输出 result (同时显示十进制和十六进制)
+        tracing::info!(
+               "ADD[XLEN={}]: x={}({:#x}) + y={}({:#x}) = result={}({:#x})",
+               XLEN, x, x, y, y, result, result
+           );
+
+        result
     }
 }
 
@@ -87,6 +96,7 @@ mod test {
 
     #[test]
     fn lookup_output_matches_trace() {
+        let _ = tracing_subscriber::fmt().try_init();
         lookup_output_matches_trace_test::<ADD>();
     }
 }

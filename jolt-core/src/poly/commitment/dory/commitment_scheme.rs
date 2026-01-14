@@ -79,7 +79,7 @@ impl CommitmentScheme for DoryCommitmentScheme {
         >>::commit::<BN254, JoltG1Routines>(
             poly, nu, sigma, setup
         )
-        .expect("commitment should succeed");
+            .expect("commitment should succeed");
 
         (tier_2, row_commitments)
     }
@@ -139,7 +139,7 @@ impl CommitmentScheme for DoryCommitmentScheme {
             setup,
             &mut dory_transcript,
         )
-        .expect("proof generation should succeed")
+            .expect("proof generation should succeed")
     }
 
     fn verify<ProofTranscript: Transcript>(
@@ -173,7 +173,7 @@ impl CommitmentScheme for DoryCommitmentScheme {
             setup.clone().into_inner(),
             &mut dory_transcript,
         )
-        .map_err(|_| ProofVerifyError::InternalError)?;
+            .map_err(|_| ProofVerifyError::InternalError)?;
 
         Ok(())
     }
@@ -265,7 +265,20 @@ impl StreamingCommitmentScheme for DoryCommitmentScheme {
             ArkG1(T::msm(&g1_bases[..chunk.len()], chunk).expect("MSM calculation failed."));
         vec![row_commitment]
     }
-
+    /// 处理 One-Hot 编码数据的单个块（Chunk），计算第一层（Tier 1）承诺。
+    ///
+    /// 在 Jolt/Lasso 证明系统中，经常需要对 One-Hot 形式的数据进行承诺。
+    /// 如果将 One-Hot 逻辑展开成巨大的稀疏矩阵计算非常低效，此函数利用其特性进行了优化。
+    ///
+    /// # 参数
+    /// * `setup`: 证明者的公共参数（包含 G1 基点）。
+    /// * `onehot_k`: One-Hot 向量的维度（即值的取值范围大小，例如 256）。
+    ///   这表示我们实际上是在并行计算 `K` 个多项式的承诺。
+    /// * `chunk`: 紧凑表示的输入数据。`chunk[i] = Some(v)` 表示第 `i` 列的值为 `v`。
+    ///   这意味着在展开的 One-Hot 矩阵中，第 `v` 行在第 `i` 列为 1，其余行为 0。
+    ///
+    /// # 优化原理
+    /// 将 MSM（系数 * 基点）简化为特定的基点子集求和（Sum of Bases），因为系数非 0 即 1。
     #[tracing::instrument(
         skip_all,
         name = "DoryCommitmentScheme::compute_tier1_commitment_onehot"
@@ -275,17 +288,23 @@ impl StreamingCommitmentScheme for DoryCommitmentScheme {
         onehot_k: usize,
         chunk: &[Option<usize>],
     ) -> Self::ChunkState {
-        let K = onehot_k;
+        let K = onehot_k; // One-Hot 的大小（并行处理的多项式数量）
 
         let row_len = DoryGlobals::get_num_columns();
+        // 获取 G1 基点切片，用于后续的线性组合
         let g1_slice =
             unsafe { std::slice::from_raw_parts(setup.g1_vec.as_ptr(), setup.g1_vec.len()) };
 
+        // 将基点转换为仿射坐标（Affine），通常在此类批量加法运算中性能更好
         let g1_bases: Vec<G1Affine> = g1_slice[..row_len]
             .iter()
             .map(|g| g.0.into_affine())
             .collect();
 
+        // 1. 索引分组 (Bucket Sort style)
+        // 遍历输入块，将每个列索引（col_index）分配给它对应的数值（k）。
+        // indices_per_k[k] 存储了所有值为 k 的列位置。
+        // 这意味着第 k 个多项式的承诺由这些位置对应的基点组成。
         let mut indices_per_k: Vec<Vec<usize>> = vec![Vec::new(); K];
         for (col_index, k) in chunk.iter().enumerate() {
             if let Some(k) = k {
@@ -293,10 +312,16 @@ impl StreamingCommitmentScheme for DoryCommitmentScheme {
             }
         }
 
+        // 2. 批量基点加法优化
+        // 计算每个 k 对应的基点之和。相当于 coefficient=1 的 MSM。
+        // 调用底层优化库进行并行计算。
         let results = jolt_optimizations::batch_g1_additions_multi(&g1_bases, &indices_per_k);
 
+        // 3. 封装结果
+        // 将计算得到的 Projective 点转换回 ArkG1 封装类型。
         let mut row_commitments = vec![ArkG1(G1Projective::zero()); K];
         for (k, result) in results.into_iter().enumerate() {
+            // 只有当该数值 k 在 chunk 中出现过，才会有非零承诺，否则为零点
             if !indices_per_k[k].is_empty() {
                 row_commitments[k] = ArkG1(G1Projective::from(result));
             }

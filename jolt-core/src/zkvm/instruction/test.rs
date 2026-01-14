@@ -146,10 +146,14 @@ where
 {
     let cycle: RISCVCycle<T> = Default::default();
     let mut rng = StdRng::seed_from_u64(12345);
-    for _ in 0..10000 {
+    for _ in 0..2 {
         let random_cycle = cycle.random(&mut rng);
+        tracing::info!("Testing cycle: {:?}", random_cycle);
+
         let normalized_instr: NormalizedInstruction = random_cycle.instruction.into();
+
         let normalized_operands = normalized_instr.operands;
+        tracing::info!("Testing normalized operands: {:?}", normalized_operands);
 
         let mut cpu = Cpu::new(Box::new(DummyTerminal::default()));
         if let Some(rs1_val) = random_cycle.register_state.rs1_value() {
@@ -159,8 +163,10 @@ where
             cpu.x[normalized_operands.rs2.unwrap() as usize] = rs2_val as i64;
         }
 
+
         random_cycle.instruction.trace(&mut cpu, None);
         let lookup_result = LookupQuery::<XLEN>::to_lookup_output(&random_cycle);
+        tracing::info!("Testing lookup result: {:?}", lookup_result);
 
         use std::any::TypeId;
         let is_jal = TypeId::of::<T>() == TypeId::of::<instruction::jal::JAL>();

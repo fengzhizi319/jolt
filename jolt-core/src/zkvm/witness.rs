@@ -167,14 +167,29 @@ impl CommittedPolynomial {
             // Case 3: 指令查找 One-Hot 多项式
             // 逻辑：Cycle -> LookupIndex (大整数) -> Chunk (切片) -> OneHot 索引。
             // 用于证明指令查找表的正确性。
+
             CommittedPolynomial::InstructionRa(idx) => {
                 let row: Vec<Option<usize>> = row_cycles
-                    .iter()
+                    .iter() // 这里使用标准的 iter() 确保是单线程顺序执行，方便日志阅读
                     .map(|cycle| {
-                        // 将指令周期转换为全局查找索引
+                        // 将输入转换为全局查找索引 (128位大整数，输入x,y交错拼接，方便chunk查表)
                         let lookup_index = LookupQuery::<XLEN>::to_lookup_index(cycle);
-                        // 提取第 idx 个块的值，作为 One-Hot 向量中置 1 的位置
-                        Some(one_hot_params.lookup_index_chunk(lookup_index, *idx) as usize)
+                        // 提取第 idx 个块的值，即获取了查表chunk的输入
+                        let chunk_val = one_hot_params.lookup_index_chunk(lookup_index, *idx) as usize;
+
+                        // 详细打印调试信息：
+                        // idx: 当前正在处理第几个切片（Chunk）
+                        // lookup_index: 原始的完整查找键（以十六进制显示，方便查看位模式）
+                        // chunk_val: 切分出来的单字节值
+                        tracing::info!(
+                                        "InstructionRa(chunk_idx={}): cycle={:?}, lookup_index={:#034x}, chunk_val={}",
+                                        idx,
+                                        cycle,
+                                        lookup_index,
+                                        chunk_val
+                                    );
+
+                        Some(chunk_val)
                     })
                     .collect();
                 // 调用 PCS 处理 One-Hot 稀疏数据块 (性能优化)
@@ -414,7 +429,7 @@ mod tests1 {
         type ChunkState = MockChunkState;
 
         fn process_chunk<T: SmallScalar>(_setup: &Self::ProverSetup, chunk: &[T]) -> Self::ChunkState {
-             MockChunkState {
+            MockChunkState {
                 processed_dense_len: Some(chunk.len()),
                 processed_onehot: None,
             }
@@ -425,7 +440,7 @@ mod tests1 {
             _k: usize,
             row: &[Option<usize>],
         ) -> Self::ChunkState {
-             MockChunkState {
+            MockChunkState {
                 processed_dense_len: None,
                 processed_onehot: Some(row.to_vec()),
             }
@@ -462,7 +477,9 @@ mod tests1 {
 
     #[test]
     fn test_stream_witness_instruction_ra_dispatch() {
+        let _ = tracing_subscriber::fmt().try_init();
         let cycles: Vec<tracer::instruction::Cycle> = vec![tracer::instruction::Cycle::ADD(Default::default())];
+        tracing::info!("Cycles: {:?}", cycles);
         let poly = CommittedPolynomial::InstructionRa(0);
         let setup = ();
         let preprocessing_ptr = std::ptr::NonNull::<JoltSharedPreprocessing>::dangling().as_ptr();

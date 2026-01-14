@@ -22,13 +22,27 @@ pub trait LookupQuery<const XLEN: usize> {
     /// Returns a tuple of the instruction's lookup operands. By default, these are the
     /// same as the instruction inputs returned by `to_instruction_inputs`, but in some cases
     /// (e.g. ADD, MUL) the instruction inputs are combined to form a single lookup operand.
+
+    /// 返回指令用于查表的操作数元组。
+    ///
+    /// 默认情况下，这与 `to_instruction_inputs` 返回的指令输入相同，
+    /// 只是进行了类型转换以便于生成索引。
+    /// 但在某些特殊情况下（例如乘法 MUL），可能会重写此逻辑以组合输入。
     fn to_lookup_operands(&self) -> (u64, u128) {
         let (x, y) = self.to_instruction_inputs();
+        // 将 y 转换为 u64 再转 u128，通常 y 是第二个寄存器值或立即数
         (x, (y as u64) as u128)
     }
 
-    /// Converts this instruction's operands into a lookup index (as used in sparse-dense Shout).
-    /// By default, interleaves the two bits of the two operands together.
+    /// 将指令的操作数转换为查表索引（用于 sparse-dense Shout/Lasso 协议）。
+    ///
+    /// # 逻辑
+    /// 默认实现使用 **位交错 (Interleaving)** 技术将两个操作数的比特位穿插在一起。
+    /// 例如：如果 x=...01, y=...11，交错后 index=...1011。
+    ///
+    /// # 为什么这么做？
+    /// 这种交错结构使得大表查找（128位键宽）可以被高效地分解（Decomposable）为
+    /// 多个小表查找（例如查 16 次 8位宽的表），这是 Jolt 证明系统效率的关键。
     fn to_lookup_index(&self) -> u128 {
         let (x, y) = LookupQuery::<XLEN>::to_lookup_operands(self);
         interleave_bits(x, y as u64)
@@ -269,7 +283,17 @@ macro_rules! define_rv32im_trait_impls {
         }
     };
 }
+/*
+`instructions` 列表中目前包含了 **64** 个指令条目。
+这些指令涵盖了 RV32IM 基础指令集以及 Jolt 特有的虚拟指令（Virtual Instructions）。
 
+具体统计如下：
+1.  **基础 RISC-V 指令 (30 个)**:
+    `ADD`, `ADDI`, `AND`, `ANDI`, `ANDN`, `AUIPC`, `BEQ`,
+2.  **虚拟指令 (Virtual Instructions) (34 个)**:
+    `VirtualAdvice`, `VirtualAssertEQ`, `VirtualAssertHalfwordAlignment`,
+总计：30 + 34 = **64**。
+ */
 define_rv32im_trait_impls! {
     instructions: [
         ADD, ADDI, AND, ANDI, ANDN, AUIPC, BEQ, BGE, BGEU, BLT, BLTU, BNE,
