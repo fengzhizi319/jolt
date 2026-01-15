@@ -196,14 +196,15 @@ impl CommittedPolynomial {
                         // idx: 当前正在处理第几个切片（Chunk）
                         // lookup_index: 原始的完整查找键（以十六进制显示，方便查看位模式）
                         // chunk_val: 切分出来的单字节值
-                        tracing::info!(
-                                        "InstructionRa(chunk_idx={}): cycle={:?}, lookup_index={:#034x}, chunk_val={}",
-                                        idx,
-                                        cycle,
-                                        lookup_index,
-                                        chunk_val
-                                    );
-
+                        /*
+                                    tracing::info!(
+                                                    "InstructionRa(chunk_idx={}): cycle={:?}, lookup_index={:#034x}, chunk_val={}",
+                                                    idx,
+                                                    cycle,
+                                                    lookup_index,
+                                                    chunk_val
+                                                );
+                                    */
                         // 步骤 4: 记录证明数据 (Witness)
                         // 这里返回的 chunk_val 稍后将通过 One-Hot 编码进行承诺。
                         Some(chunk_val)

@@ -69,13 +69,13 @@ impl<const XLEN: usize> LookupQuery<XLEN> for RISCVCycle<ADD> {
             64 => x.overflowing_add(y as u64).0,
             _ => panic!("{XLEN}-bit word size is unsupported"),
         };
-
-        // 打印详细日志：包含 XLEN 位宽，输入 x, y 和输出 result (同时显示十进制和十六进制)
-        tracing::info!(
-               "ADD[XLEN={}]: x={}({:#x}) + y={}({:#x}) = result={}({:#x})",
-               XLEN, x, x, y, y, result, result
-           );
-
+        /*
+                // 打印详细日志：包含 XLEN 位宽，输入 x, y 和输出 result (同时显示十进制和十六进制)
+                tracing::info!(
+                       "ADD[XLEN={}]: x={}({:#x}) + y={}({:#x}) = result={}({:#x})",
+                       XLEN, x, x, y, y, result, result
+                   );
+        */
         result
     }
 }

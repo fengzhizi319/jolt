@@ -329,6 +329,15 @@ impl StreamingCommitmentScheme for DoryCommitmentScheme {
         row_commitments
     }
 
+    /// 计算第二层（Tier 2）的全局承诺。
+    ///
+    /// 在 Jolt 的流式计算中，Tier 1 阶段已经计算出了每一小块（Chunk）的中间承诺。
+    /// 此函数负责将这些分散的 Tier 1 承诺（`chunks`）聚合在一起，形成最终的多项式承诺。
+    /// - P1 的中间承诺: [Result_Chunk1_P1, Result_Chunk2_P1],需要聚合
+    /// - P2 的中间承诺: [Result_Chunk1_P2, Result_Chunk2_P2]，需要聚合
+    /// 核心任务是：
+    /// 1. 整理数据布局：如果是 One-Hot 多项式，需要进行矩阵转置；如果是普通多项式，则直接平铺。
+    /// 2. 密码学聚合：使用双线性配对（Pairing）将整理后的行承诺与 SRS 中的 G2 元素结合。
     #[tracing::instrument(skip_all, name = "DoryCommitmentScheme::compute_tier2_commitment")]
     fn aggregate_chunks(
         setup: &Self::ProverSetup,
@@ -336,13 +345,45 @@ impl StreamingCommitmentScheme for DoryCommitmentScheme {
         chunks: &[Self::ChunkState],
     ) -> (Self::Commitment, Self::OpeningProofHint) {
         if let Some(K) = onehot_k {
-            let row_len = DoryGlobals::get_num_columns();
-            let T = DoryGlobals::get_T();
+            // === 分支 1: 处理 One-Hot (Lasso) 多项式 ===
+            // 这种情况下，虽然我们在逻辑上是并行处理 K 个多项式，
+            // 但输入 `chunks` 是按时间顺序（Time-ordered）流式产生的。
+            // chunks[t] 包含第 t 个时间片内所有 K 个多项式的承诺：[C(P0, t), C(P1, t), ..., C(PK, t)]。
+            // Dory 协议要求数据按多项式顺序（Poly-ordered）排列：
+            // [C(P0, all_t), C(P1, all_t), ..., C(PK, all_t)]。
+            // 因此，我们需要执行数据转置（Transpose）。
+
+            let row_len = DoryGlobals::get_num_columns(); // 每个 Chunk 的列数
+            let T = DoryGlobals::get_T(); // Trace 总长度
+            // 计算每个多项式被分成了多少个 Chunk (即行数)。
+            // 例如 trace 长度 1024，每块长度 16，则每个多项式有 64 行。
             let rows_per_k = T / row_len;
+            // 计算总共涉及的行承诺数量 (K 个多项式 * 每个多项式的行数)
             let num_rows = K * T / row_len;
 
+            // 初始化结果向量，准备存放重排后的行承诺。
+            // 这是一个巨大的扁平化向量，逻辑上分为 K 段，每段长度为 rows_per_k。
             let mut row_commitments = vec![ArkG1(G1Projective::zero()); num_rows];
+
+            // 遍历每个时间切片 chunk_index (t)，模拟流式数据到达的过程
             for (chunk_index, commitments) in chunks.iter().enumerate() {
+                // commitments 是当前时间片 t 内所有 K 个多项式的承诺向量：
+                // [C(P0, t), C(P1, t), ..., C(PK, t)]
+
+                // 使用 Rayon 并行迭代器将数据分散写入到 row_commitments 的正确位置。
+                // 逻辑解释：
+                // 我们要把 commitments[k] (第 k 个多项式在时间 t 的值) 放入 row_commitments。
+                // 目标位置应该是在第 k 个多项式的区域内的第 t 个偏移处。
+                // 即 index = (k * rows_per_k) + chunk_index。
+                //
+                // 代码实现技巧：
+                // 1. skip(chunk_index): 从偏移量 t 开始。
+                // 2. step_by(rows_per_k): 每次跳跃一个多项式的长度。
+                // 这样迭代产生的索引序列正是：
+                // dest[0]: 0*rows_per_k + t  (属于 Poly 0 的第 t 行)
+                // dest[1]: 1*rows_per_k + t  (属于 Poly 1 的第 t 行)
+                // ...
+                // 正好对应 commitments 中的 P0, P1... 的顺序。
                 row_commitments
                     .par_iter_mut()
                     .skip(chunk_index)
@@ -351,15 +392,25 @@ impl StreamingCommitmentScheme for DoryCommitmentScheme {
                     .for_each(|(dest, src)| *dest = *src);
             }
 
+            // 获取所需的 G2 基点（数量等于行承诺总数）
             let g2_bases = &setup.g2_vec[..row_commitments.len()];
+            // 计算最终承诺：Product of Pairings e(RowCommitment_i, G2_i)
+            // 这一步将巨大的行承诺向量压缩为一个恒定大小的 GT 元素。
             let tier_2 = <BN254 as PairingCurve>::multi_pair_g2_setup(&row_commitments, g2_bases);
 
+            // 返回最终承诺和整理好的中间行承诺（作为 Hint，用于后续 Open 证明）
             (tier_2, row_commitments)
         } else {
+            // === 分支 2: 处理普通（密集）多项式 ===
+            // 对于非 One-Hot 的普通多项式（如寄存器读写），数据已经是顺序排列的。
+            // chunks 直接包含了 [Chunk0, Chunk1, Chunk2 ...]，不需要转置。
+
+            // 将 `chunks` (Vec<Vec<G1>>) 扁平化为一维向量 `Vec<G1>`。
             let row_commitments: Vec<ArkG1> =
                 chunks.iter().flat_map(|chunk| chunk.clone()).collect();
 
             let g2_bases = &setup.g2_vec[..row_commitments.len()];
+            // 同样进行双线性配对计算
             let tier_2 = <BN254 as PairingCurve>::multi_pair_g2_setup(&row_commitments, g2_bases);
 
             (tier_2, row_commitments)

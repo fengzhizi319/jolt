@@ -682,8 +682,8 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
 
         // 3. 外层循环：遍历每一“行”（Trace 的一个 Chunk，每个chunk有很多个trace）
         for (row_idx, (chunk, row_tier1_commitments)) in zipped_iter {
-            tracing::info!(">>> 正在处理第 {} 行 (Row Index)", row_idx);
-            tracing::info!("    当前 Chunk 大小: {}", chunk.len());
+            //tracing::info!(">>> 正在处理第 {} 行 (Row Index)", row_idx);
+            //tracing::info!("    当前 Chunk 大小: {}", chunk.len());
             // tracing::debug!("polys： {:?}", polys); // 保留原有的 log
 
 
@@ -692,7 +692,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             // 4. 内层循环：遍历每承诺一个多项式，即把多个trace的对应列提出出来，计算commitment
             for (poly_idx, poly) in polys.iter().enumerate() {
                 // 打印多项式信息
-                tracing::info!("    -> 处理第 {} 个多项式: {:?}", poly_idx, poly);
+                //tracing::info!("    -> 处理第 {} 个多项式: {:?}", poly_idx, poly);
 
                 // 核心逻辑：计算点值并 Commit
                 // 注意：这里没有 par_iter，会在当前线程阻塞执行
@@ -709,7 +709,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             // 保存当前这一行所有多项式的中间承诺
             *row_tier1_commitments = row_results;
 
-            tracing::info!("<<< 第 {} 行处理完毕\n", row_idx);
+            //tracing::info!("<<< 第 {} 行处理完毕\n", row_idx);
         }
         tracing::info!("=== Witness Commit 结束 ===");
 
@@ -758,58 +758,123 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         (commitments, hint_map)
     }
 
+    /// 生成并提交不可信 Advice（辅助输入）的多项式承诺。
+    ///
+    /// "不可信 Advice" 指的是 Prover 在运行时提供的私有输入（例如 witness），
+    /// Verifier 无法提前获知其内容，因此需要 Prover 对其进行密码学承诺。
     fn generate_and_commit_untrusted_advice(&mut self) -> Option<PCS::Commitment> {
+        // 1. 检查是否存在不可信 Advice。如果为空，则无需处理，直接返回 None。
         if self.program_io.untrusted_advice.is_empty() {
             return None;
         }
 
-        // Commit untrusted advice in its dedicated Dory context, using a preprocessing-only
-        // matrix shape derived deterministically from the advice length (balanced dims).
-
+        // 2. 准备数据容器。
+        // 根据内存布局中定义的 `max_untrusted_advice_size`（以位为单位，所以除以 8 转为字节）
+        // 分配一个全零向量 `untrusted_advice_vec`。
+        // 这里的逻辑是：即便实际提供的 advice 数据较少，也会按照最大允许大小进行填充（Padding），
+        // 以保证多项式结构的一致性。
         let mut untrusted_advice_vec =
             vec![0; self.program_io.memory_layout.max_untrusted_advice_size as usize / 8];
 
+        // 3. 填充数据。
+        // 将实际的 advice 数据 (`program_io.untrusted_advice`) 复制到刚才创建的向量中。
+        // `populate_memory_states` 负责将字节数据按正确的端序（Little-Endian）打包成 u64 格式，
+        // 以便后续转换为 Field 元素。
         populate_memory_states(
-            0,
+            0, // 起始偏移量
             &self.program_io.untrusted_advice,
-            Some(&mut untrusted_advice_vec),
+            Some(&mut untrusted_advice_vec), // 目标缓冲区
             None,
         );
 
+        // 4. 转换为多项式。
+        // 将填充好的 u64 向量转换为一个多线性多项式（MultilinearPolynomial）。
+        // 这一步在数学上将离散的数据点映射为了代数对象。
         let poly = MultilinearPolynomial::from(untrusted_advice_vec);
+
+        // 计算多项式的长度，确保是 2 的幂次（这是 FFT/NTT 或构建承诺所需的结构）。
         let advice_len = poly.len().next_power_of_two().max(1);
 
+        // 5. 初始化 Dory 上下文。
+        // Dory 是一种批量多项式承诺方案。这里初始化一个专门针对 "UntrustedAdvice" 的上下文。
+        // `1` 表示 num_vars_chunk（或者说矩阵的行数维度参数，advice 通常被视为扁平向量）。
+        // `advice_len` 是总长度。
+        // `_guard` 利用 RAII 机制，在作用域结束时自动清理上下文全局状念。
         let _guard = DoryGlobals::initialize_context(1, advice_len, DoryContext::UntrustedAdvice);
+        // 切换当前线程到 UntrustedAdvice 上下文 (影响后续的点积/MSM 计算参数)。
         let _ctx = DoryGlobals::with_context(DoryContext::UntrustedAdvice);
+
+        // 6. 计算承诺 (Commit)。
+        // 使用 PCS (Polynomial Commitment Scheme) 对多项式进行承诺。
+        // `commitment`: 这是一个短小的密码学值（椭圆曲线点），相当于数据的指纹。
+        // `hint`: 生成 Opening Proof 时需要的辅助信息（通常包含中间计算结果）。
         let (commitment, hint) = PCS::commit(&poly, &self.preprocessing.generators);
+
+        // 7. 更新 Transcript。
+        // 将承诺值写入 Fiat-Shamir Transcript。
+        // 这至关重要：它将 Advice 的内容“绑定”到当前的证明会话中，
+        // 使得后续生成的随机 Challenge 都会依赖于这个承诺值。
         self.transcript.append_serializable(&commitment);
 
+        // 8. 保存状态。
+        // 将多项式本体和 hint 保存到 `self.advice` 结构中，
+        // 供后续步骤（如 Sumcheck 或生成 Opening Proof）使用。
         self.advice.untrusted_advice_polynomial = Some(poly);
         self.advice.untrusted_advice_hint = Some(hint);
 
+        // 返回承诺值。
         Some(commitment)
     }
 
+    /// 生成可信 Advice（辅助输入）的多项式数据，并不直接计算承诺（Commitment）。
+    ///
+    /// "可信 Advice" 通常是在预处理阶段已经确定或者由 Verifier 已知的辅助输入。
+    /// 与 "不可信 Advice" 不同，它的承诺值通常在 `gen_from_elf` 之前就已经存在，
+    /// 或者由预处理步骤提供。这里的主要任务是将原始数据转换为多项式格式，
+    /// 并将已有的承诺值吸收到 Transcript 中。
     fn generate_and_commit_trusted_advice(&mut self) {
+        // 1. 检查数据是否存在：如果没有可信 Advice 数据，直接返回，不做任何操作。
         if self.program_io.trusted_advice.is_empty() {
             return;
         }
 
+        // 2. 预分配内存缓冲区：
+        // 根据内存布局中定义的 `max_trusted_advice_size`（最大允许的可信 Advice 大小，单位是位）
+        // 分配一个字节向量。
+        // 除以 8 是为了从位（bits）转换为字节（bytes）。初始化为全 0。
+        // 即使实际数据很少，也必须填充到最大固定大小，以满足电路的固定结构要求。
         let mut trusted_advice_vec =
             vec![0; self.program_io.memory_layout.max_trusted_advice_size as usize / 8];
 
+        // 3. 填充数据：
+        // 使用 `populate_memory_states` 将实际的 `program_io.trusted_advice` 数据
+        // 写入到刚才分配的缓冲区 `trusted_advice_vec` 中。
+        // 该函数通常处理端序（Endianness）转换，将字节流正确打包成适合字段元素（Field Element）的格式（如 u64）。
         populate_memory_states(
-            0,
-            &self.program_io.trusted_advice,
-            Some(&mut trusted_advice_vec),
+            0, // 起始偏移量
+            &self.program_io.trusted_advice, // 源数据
+            Some(&mut trusted_advice_vec),   // 目标缓冲区
             None,
         );
 
+        // 4. 转换为多线性多项式：
+        // 将填充好的 u64 向量转换为多线性多项式（Multilinear Polynomial）。
+        // 在 ZK 证明系统中，数据通常表示为多项式的系数或评估值。
         let poly = MultilinearPolynomial::from(trusted_advice_vec);
+
+        // 5. 保存多项式：
+        // 将生成的多项式保存到 Prover 的 `advice` 结构中，用于后续的 Sumcheck 协议证明生成。
         self.advice.trusted_advice_polynomial = Some(poly);
+
+        // 6. 更新 Transcript（Fiat-Shamir）：
+        // 将 **已有的** 承诺值（commitment）写入 Transcript。
+        // 注意：这里并不像 untrusted advice 那样现场计算 commit，而是取出 `self.advice` 中
+        // 预先存在的 `trusted_advice_commitment`（通常在 Prover 初始化时传入）。
+        // 这步操作将其绑定到当前的证明会话中。
         self.transcript
             .append_serializable(self.advice.trusted_advice_commitment.as_ref().unwrap());
     }
+
 
     #[tracing::instrument(skip_all)]
     fn prove_stage1(
@@ -822,39 +887,69 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         print_current_memory_usage("Stage 1 baseline");
 
         tracing::info!("Stage 1 proving");
+
+        // 1. 初始化 UniSkip 参数：
+        // 从 Transcript 中获取随机挑战（challenge），这通常对应 Spartan 协议中 "Outer Sumcheck" 的初始随机数。
+        // 这些参数决定了 Sumcheck 验证的具体多项式形式。
         let uni_skip_params = OuterUniSkipParams::new(&self.spartan_key, &mut self.transcript);
+
+        // 2. 初始化 UniSkip Prover：
+        // 使用执行轨迹（Trace）和程序的字节码来初始化 Prove 过程。
+        // "OuterUniSkip" 旨在处理 Spartan 协议中的最外层约束检查。
+        // 它专门优化了某些特定变量（通常是指令选择器或查找相关的变量）的处理。
         let mut uni_skip = OuterUniSkipProver::initialize(
             uni_skip_params.clone(),
             &self.trace,
             &self.preprocessing.shared.bytecode,
         );
+
+        // 3. 执行单变量跳跃（UniSkip）的第一轮证明：
+        // 这是一个特殊的步骤，用于证明 Sumcheck 的第一部分。
+        // 它通常处理高特定度或不需要完整 sumcheck 迭代的变量。
+        // 结果 `first_round_proof` 包含了提交给 Verifier 的第一轮多项式或评估值。
+        // 同时更新 `opening_accumulator` 和 `transcript`。
         let first_round_proof = prove_uniskip_round(
             &mut uni_skip,
             &mut self.opening_accumulator,
             &mut self.transcript,
         );
 
-        // Every sum-check with num_rounds > 1 requires a schedule
-        // which dictates the compute_message and bind methods.
-        // Using LinearOnlySchedule to benchmark linear-only mode (no streaming).
-        // Outer remaining sumcheck has degree 3 (multiquadratic)
-        // Number of rounds = tau.len() - 1 (cycle variables only)
+        // 4. 配置 Sumcheck 调度器（Schedule）：
+        // 当 sumcheck 轮数 > 1 时，需要一个调度器来决定计算顺序和内存访问模式。
+        // 这里使用了 `LinearOnlySchedule`，表示非流式、线性的计算模式（通常用于 Benchmark 或简单模式）。
+        // 轮数 = tau.len() - 1，通常对应于 "Cycle Variables"（时间步长变量）。
+        // 意味着第一轮（UniSkip）已经处理了某些变量，剩下的轮次主要处理时间维度。
         let schedule = LinearOnlySchedule::new(uni_skip_params.tau.len() - 1);
+
+        // 5. 创建共享状态：
+        // 这些状态将在剩余的 Sumcheck 轮次中共享，包括 Trace 数据、字节码和参数。
+        // 使用 Arc<Trace> 避免数据复制。
         let shared = OuterSharedState::new(
             Arc::clone(&self.trace),
             &self.preprocessing.shared.bytecode,
             &uni_skip_params,
             &self.opening_accumulator,
         );
+
+        // 6. 初始化剩余部分的 Streaming Sumcheck Prover：
+        // `OuterRemainingStreamingSumcheck` 负责证明 Spartan Outer 约束中剩余的变量（通常是执行周期）。
+        // 注释提到度数为 3（multiquadratic），这是 Spartan 约束多项式的典型特征。
         let mut spartan_outer_remaining: OuterRemainingStreamingSumcheck<_, _> =
             OuterRemainingStreamingSumcheck::new(shared, schedule);
 
+        // 7. 执行批量 Sumcheck：
+        // 运行标准的 Sumcheck 协议来处理剩余的所有轮次。
+        // `sumcheck_proof` 包含这些轮次的证明数据（每一轮的一元多项式系数）。
+        // 这一步会不断地：计算当前轮的多项式 -> 提交 -> 获取 Verifier 的随机数 r -> 绑定变量 -> 进入下一轮。
+        // `opening_accumulator` 会收集最后归约得到的评估点，供 Stage 8 统一验证。
         let (sumcheck_proof, _r_stage1) = BatchedSumcheck::prove(
             vec![&mut spartan_outer_remaining],
             &mut self.opening_accumulator,
             &mut self.transcript,
         );
 
+        // 8. 返回结果：
+        // 返回 UniSkip 的第一轮特殊证明和后续常规 Sumcheck 的证明。
         (first_round_proof, sumcheck_proof)
     }
 
@@ -868,28 +963,49 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         #[cfg(not(target_arch = "wasm32"))]
         print_current_memory_usage("Stage 2 baseline");
 
-        // Stage 2a: Prove univariate-skip first round for product virtualization
+        // Use Case: 启动 Spartan 协议中的 "Grand Product Argument"（乘积论证）证明。
+        // 这通常用于证明内存一致性（Memory Consistency）或查找表一致性（Lookup Consistency）。
+        // 乘积论证的核心是证明两个集合的元素在某种变换下的乘积相等。
+
+        // 1. Product Virtualization UniSkip (Stage 2a):
+        // 类似于 Stage 1，这里处理乘积论证中的第一轮 Sumcheck。
+        // 由于 Jolt 使用 One-Hot 编码表示指令，该轮次主要涉及稀疏的指令标志位（Instruction Flags）。
+        // 使用 `UniSkip` 优化可以跳过对大量 0 值的计算，快速归约指令维度的变量。
         let uni_skip_params =
             ProductVirtualUniSkipParams::new(&self.opening_accumulator, &mut self.transcript);
         let mut uni_skip =
             ProductVirtualUniSkipProver::initialize(uni_skip_params.clone(), &self.trace);
+
+        // 生成第一轮证明，Verifier 对此给出挑战，将问题归约到剩下的轮次（主要是时间/周期维度）。
         let first_round_proof = prove_uniskip_round(
             &mut uni_skip,
             &mut self.opening_accumulator,
             &mut self.transcript,
         );
 
-        // Initialization params
+        // 2. 初始化各子任务参数 (Initialization params)：
+        // Stage 2 是一个批量处理阶段，它并行运行多个不同的 Sumcheck 协议：
+
+        // a. 乘积论证剩余部分 (Product Remainder)：
+        // 处理 Grand Product 论证中剩下的所有轮次（即时间/周期维度）。
+        // "Virtual" 意味着 Prover 不会显式构造巨大的乘积多项式，而是动态计算，节省内存。
         let spartan_product_virtual_remainder_params = ProductVirtualRemainderParams::new(
             self.trace.len(),
             uni_skip_params,
             &self.opening_accumulator,
         );
+
+        // b. RAM 访问标志评估 (Raf Evaluation)：
+        // 验证内存操作的元数据（如：这是一个读操作还是写操作？）。
         let ram_raf_evaluation_params = RafEvaluationSumcheckParams::new(
             &self.program_io.memory_layout,
             &self.one_hot_params,
             &self.opening_accumulator,
         );
+
+        // c. RAM 读写一致性检查 (Read/Write Checking)：
+        // 核心内存检查：证明每次“读取”得到的值等于上一次“写入”该地址的值。
+        // 这通常涉及排序后的地址元组检查。
         let ram_read_write_checking_params = RamReadWriteCheckingParams::new(
             &self.opening_accumulator,
             &mut self.transcript,
@@ -897,11 +1013,18 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             self.trace.len(),
             &self.rw_config,
         );
+
+        // d. 输出检查 (Output Check)：
+        // 证明程序的输出（Standard Output）与其最终内存状态中的相关部分一致。
         let ram_output_check_params = OutputSumcheckParams::new(
             self.one_hot_params.ram_k,
             &self.program_io,
             &mut self.transcript,
         );
+
+        // e. 指令查找 Claim 归约 (Instruction Lookups Claim Reduction)：
+        // 将 Stage 1 中产生的关于指令执行的 Claim，连接到具体的查找表证明上。
+        // 确保“执行了 ADD 指令”这件事正确关联到了“ADD 查找表”。
         let instruction_claim_reduction_params =
             InstructionLookupsClaimReductionSumcheckParams::new(
                 self.trace.len(),
@@ -909,7 +1032,8 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
                 &mut self.transcript,
             );
 
-        // Initialization
+        // 3. 初始化具体的 Prover 实例 (Initialization)：
+        // 根据上述参数和 Trace 数据创建实际的计算对象。
         let spartan_product_virtual_remainder = ProductVirtualRemainderProver::initialize(
             spartan_product_virtual_remainder_params,
             Arc::clone(&self.trace),
@@ -938,6 +1062,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
                 Arc::clone(&self.trace),
             );
 
+        // 调试用的内存统计（Allocative Feature）
         #[cfg(feature = "allocative")]
         {
             print_data_structure_heap_usage(
@@ -953,6 +1078,11 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             );
         }
 
+        // 4. 打包实例进行批量证明 (Batch Proof)：
+        // 将上述 5 个不同的 Prover 放入一个列表。
+        // 尽管它们验证逻辑不同，但它们都是基于多变量多项式的 Sumcheck 协议。
+        // `BatchedSumcheck` 允许它们共享 Verifier 的随机挑战（Random Challenges），
+        // 从而显著减小证明大小和验证成本。
         let mut instances: Vec<Box<dyn SumcheckInstanceProver<_, _>>> = vec![
             Box::new(spartan_product_virtual_remainder),
             Box::new(ram_raf_evaluation),
@@ -961,18 +1091,22 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             Box::new(instruction_claim_reduction),
         ];
 
-        #[cfg(feature = "allocative")]
-        write_instance_flamegraph_svg(&instances, "stage2_start_flamechart.svg");
         tracing::info!("Stage 2 proving");
+
+        // 5. 执行 Batched Sumcheck：
+        // 迭代执行所有剩余轮次。每一轮，所有 Prover 计算各自的多项式，
+        // 聚合后发送给 Verifier，Verifier 返回个随机数，进入下一轮。
+        // 最终的评估值会累积到 provided `opening_accumulator` 中。
         let (sumcheck_proof, _r_stage2) = BatchedSumcheck::prove(
             instances.iter_mut().map(|v| &mut **v as _).collect(),
             &mut self.opening_accumulator,
             &mut self.transcript,
         );
-        #[cfg(feature = "allocative")]
-        write_instance_flamegraph_svg(&instances, "stage2_end_flamechart.svg");
+
+        // 后台释放资源，避免阻塞主线程
         drop_in_background_thread(instances);
 
+        // 返回 UniSkip 第一轮证明结果（特殊处理）和其余轮次的批量证明结果。
         (first_round_proof, sumcheck_proof)
     }
 
@@ -981,36 +1115,59 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         #[cfg(not(target_arch = "wasm32"))]
         print_current_memory_usage("Stage 3 baseline");
 
-        // Initialization params
+        // 1. 初始化各子任务参数 (Initialization params)：
+        // Stage 3 聚焦于 "Spartan Internal Consistency"（内部一致性），
+        // 确保指令的输入被正确解码，且指令间状态转移正确。
+
+        // a. 移位检查参数 (Shift Check Params):
+        // "Shift" 通常涉及并在执行轨迹中检查跨周期（Cycle）的约束，
+        // 比如验证 PC（Program Counter）是否正確增加，或者某些状态是否正确传递到下一行。
         let spartan_shift_params = ShiftSumcheckParams::new(
             self.trace.len().log_2(),
             &self.opening_accumulator,
             &mut self.transcript,
         );
+
+        // b. 指令输入构造参数 (Instruction Input Params):
+        // 验证 ALU 或查找表的输入是否由寄存器值和立即数正确组合而成。
+        // 例如：验证 Ops = Mux(Format, RS1, RS2, Imm)。
         let spartan_instruction_input_params =
             InstructionInputParams::new(&self.opening_accumulator, &mut self.transcript);
+
+        // c. 寄存器使用声明归约 (Registers Claim Reduction):
+        // 类似于 Stage 2 的指令查找归约。
+        // 这里负责将“当前指令使用了寄存器 R1”这个事实，转换为一个数学声明，
+        // 以便后续阶段（Stage 4）的寄存器读写检查（Register R/W Check）能够验证读取值的正确性。
         let spartan_registers_claim_reduction_params = RegistersClaimReductionSumcheckParams::new(
             self.trace.len(),
             &self.opening_accumulator,
             &mut self.transcript,
         );
 
-        // Initialize
+        // 2. 初始化具体的 Prover 实例 (Initialize):
+        // 创建负责计算和多项式生成的实体。
+
+        // 需要 Trace 和字节码来验证状态转移逻辑。
         let spartan_shift = ShiftSumcheckProver::initialize(
             spartan_shift_params,
             Arc::clone(&self.trace),
             &self.preprocessing.shared.bytecode,
         );
+
+        // 需要 Trace 来获取每一行的操作数源数据。
         let spartan_instruction_input = InstructionInputSumcheckProver::initialize(
             spartan_instruction_input_params,
             &self.trace,
             &self.opening_accumulator,
         );
+
+        // 需要 Trace 来确定每一行访问了哪些寄存器索引。
         let spartan_registers_claim_reduction = RegistersClaimReductionSumcheckProver::initialize(
             spartan_registers_claim_reduction_params,
             Arc::clone(&self.trace),
         );
 
+        // 内存分析工具（可选特性）
         #[cfg(feature = "allocative")]
         {
             print_data_structure_heap_usage("ShiftSumcheckProver", &spartan_shift);
@@ -1024,6 +1181,8 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             );
         }
 
+        // 3. 打包实例 (Batching):
+        // 将三个独立的检查打包，以便共享 Sumcheck 协议的随机挑战。
         let mut instances: Vec<Box<dyn SumcheckInstanceProver<_, _>>> = vec![
             Box::new(spartan_shift),
             Box::new(spartan_instruction_input),
@@ -1032,14 +1191,22 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
 
         #[cfg(feature = "allocative")]
         write_instance_flamegraph_svg(&instances, "stage3_start_flamechart.svg");
+
         tracing::info!("Stage 3 proving");
+
+        // 4. 执行批量 Sumcheck (Prove):
+        // 运行 Sumcheck 协议，将上述三个关于“CPU 内部逻辑”的多变量多项式，
+        // 归约为单个点的评估值。
         let (sumcheck_proof, _r_stage3) = BatchedSumcheck::prove(
             instances.iter_mut().map(|v| &mut **v as _).collect(),
             &mut self.opening_accumulator,
             &mut self.transcript,
         );
+
         #[cfg(feature = "allocative")]
         write_instance_flamegraph_svg(&instances, "stage3_end_flamechart.svg");
+
+        // 后台释放，优化主线程性能
         drop_in_background_thread(instances);
 
         sumcheck_proof
@@ -1050,15 +1217,23 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         #[cfg(not(target_arch = "wasm32"))]
         print_current_memory_usage("Stage 4 baseline");
 
+        // 1. 初始化寄存器读写检查参数 (Registers R/W Checking Params)：
+        // 这是 Stage 4 的核心任务之一。它旨在证明寄存器文件的状态一致性。
+        // 即：证明在任意周期读取某寄存器（如 x1）获得的值，等于上一次写入该寄存器的值。
         let registers_read_write_checking_params = RegistersReadWriteCheckingParams::new(
             self.trace.len(),
             &self.opening_accumulator,
             &mut self.transcript,
             &self.rw_config,
         );
+
+        // 2. 累积 Advice（辅助输入）：
+        // 处理程序中的 "Advice"（即非确定性输入，如私有见证信息或 Verifier 不知道的辅助数据）。
+        // 这一步将 Advice 多项式的评估值 folding (折叠) 进 `opening_accumulator`。
+        // `needs_single_advice_opening` 判断是否需要对 advice 进行单独的 opening，或者它已包含在其他检查中。
         prover_accumulate_advice(
-            &self.advice.untrusted_advice_polynomial,
-            &self.advice.trusted_advice_polynomial,
+            &self.advice.untrusted_advice_polynomial, // Prover 提供的私有输入
+            &self.advice.trusted_advice_polynomial,   // 预处理或公开的辅助输入
             &self.program_io.memory_layout,
             &self.one_hot_params,
             &mut self.opening_accumulator,
@@ -1066,27 +1241,42 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             self.rw_config
                 .needs_single_advice_opening(self.trace.len().log_2()),
         );
+
+        // 3. 初始化 RAM 值评估参数 (RAM Val Evaluation Params)：
+        // 注意：Stage 2 已经通过 Grand Product 证明了内存访问的“地址和时间顺序”的一致性。
+        // Stage 4 的 `ValEvaluation` 侧重于内存操作中的“数据值 (Value)”部分。
+        // 它负责证明 Trace 中记录的内存值与内存布局、初始状态一致。
         let ram_val_evaluation_params = ValEvaluationSumcheckParams::new_from_prover(
             &self.one_hot_params,
             &self.opening_accumulator,
             &self.initial_ram_state,
             self.trace.len(),
         );
+
+        // 4. 初始化 RAM 最终状态检查参数 (RAM Final Value Params)：
+        // 验证程序执行结束后的内存状态（Final RAM State）。
+        // 这对于证明程序的副作用（Side Effects）或输出结果是正确的至关重要。
         let ram_val_final_params =
             ValFinalSumcheckParams::new_from_prover(self.trace.len(), &self.opening_accumulator);
 
+        // 5. 初始化具体的 Prover 实例：
+        // 创建负责多项式计算的对象。
+
+        // 寄存器一致性证明器：构造读写记录表（Access Log），并进行排序检查。
         let registers_read_write_checking = RegistersReadWriteCheckingProver::initialize(
             registers_read_write_checking_params,
             self.trace.clone(),
             &self.preprocessing.shared.bytecode,
             &self.program_io.memory_layout,
         );
+        // RAM 值证明器：验证加载/存储指令的数据载荷。
         let ram_val_evaluation = RamValEvaluationSumcheckProver::initialize(
             ram_val_evaluation_params,
             &self.trace,
             &self.preprocessing.shared.bytecode,
             &self.program_io.memory_layout,
         );
+        // RAM 最终状态证明器。
         let ram_val_final = ValFinalSumcheckProver::initialize(
             ram_val_final_params,
             &self.trace,
@@ -1094,6 +1284,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             &self.program_io.memory_layout,
         );
 
+        // 调试统计信息
         #[cfg(feature = "allocative")]
         {
             print_data_structure_heap_usage(
@@ -1104,6 +1295,8 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             print_data_structure_heap_usage("ValFinalSumcheckProver", &ram_val_final);
         }
 
+        // 6. 打包实例进行批量证明 (Batching)：
+        // 将寄存器检查、RAM 值检查和 RAM 最终状态检查合并。
         let mut instances: Vec<Box<dyn SumcheckInstanceProver<_, _>>> = vec![
             Box::new(registers_read_write_checking),
             Box::new(ram_val_evaluation),
@@ -1112,14 +1305,22 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
 
         #[cfg(feature = "allocative")]
         write_instance_flamegraph_svg(&instances, "stage4_start_flamechart.svg");
+
         tracing::info!("Stage 4 proving");
+
+        // 7. 执行批量 Sumcheck (Prove)：
+        // Verifier 发送随机挑战，Prover 逐步归约多项式，最终将所有关于寄存器和内存值的复杂声明
+        // 压缩为一个简单的评估点验证，存入 `opening_accumulator`。
         let (sumcheck_proof, _r_stage4) = BatchedSumcheck::prove(
             instances.iter_mut().map(|v| &mut **v as _).collect(),
             &mut self.opening_accumulator,
             &mut self.transcript,
         );
+
         #[cfg(feature = "allocative")]
         write_instance_flamegraph_svg(&instances, "stage4_end_flamechart.svg");
+
+        // 后台释放资源
         drop_in_background_thread(instances);
 
         sumcheck_proof
@@ -1129,14 +1330,32 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
     fn prove_stage5(&mut self) -> SumcheckInstanceProof<F, ProofTranscript> {
         #[cfg(not(target_arch = "wasm32"))]
         print_current_memory_usage("Stage 5 baseline");
+
+        // 1. 初始化各子任务参数 (Initialization params)：
+        // Stage 5 继续处理数据值的验证，并开始深入 Jolt/Lasso 的查找表（Lookup）核心逻辑。
+
+        // a. 寄存器值评估参数 (Registers Value Evaluation Params):
+        // Stage 4 验证了寄存器读写的时间一致性（Consistency），即“读出的等于上次写入的”。
+        // Stage 5 这里的 `ValEvaluation` 负责验证寄存器中的数据“载荷”（Payload）。
+        // 也就是证明寄存器里存储的实际数值（Value）与多项式承诺中的数据相符。
         let registers_val_evaluation_params =
             RegistersValEvaluationSumcheckParams::new(&self.opening_accumulator);
+
+        // b. RAM 地址归约参数 (RAM Read Address Reduction Parts):
+        // 将关于内存地址的高层 Claim（例如“在地址 0x1000 处读取”）归约到底层的 One-Hot 编码或比特位上。
+        // 这是为了衔接 Stage 2/4 中的内存一致性检查与底层的电路约束。
+        // "RA" 可能指 "Read Address" 或 "Read Access"。
         let ram_ra_reduction_params = RaReductionParams::new(
             self.trace.len(),
             &self.one_hot_params,
             &self.opening_accumulator,
             &mut self.transcript,
         );
+
+        // c. 指令查找表读取标记参数 (Instruction Lookups Read RAF):
+        // Jolt 使用查找表（Lookups）来执行大部分指令（如 ADD, SUB, AND）。
+        // 这一步验证指令执行时的“读取访问标记”（Read Access Flags, RAF）。
+        // 它证明：如果当前指令是 ADD，那么我们确实在“读取” ADD 查找表，而不是 MUL 查找表。
         let lookups_read_raf_params = InstructionReadRafSumcheckParams::new(
             self.trace.len().log_2(),
             &self.one_hot_params,
@@ -1144,18 +1363,27 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             &mut self.transcript,
         );
 
+        // 2. 初始化具体的 Prover 实例 (Initialize):
+
+        // 初始化寄存器值证明器。
         let registers_val_evaluation = RegistersValEvaluationSumcheckProver::initialize(
             registers_val_evaluation_params,
             &self.trace,
-            &self.preprocessing.shared.bytecode,
+            &self.preprocessing.shared.bytecode, // 需要字节码信息辅助判断（如涉及 PC 的隐式读写）
             &self.program_io.memory_layout,
         );
+
+        // 初始化 RAM 地址归约证明器。
+        // 需要内存布局和 One-Hot 参数来使得地址 Claim 与电路结构匹配。
         let ram_ra_reduction = RamRaClaimReductionSumcheckProver::initialize(
             ram_ra_reduction_params,
             &self.trace,
             &self.program_io.memory_layout,
             &self.one_hot_params,
         );
+
+        // 初始化指令查找表 RAF 证明器。
+        // 只需要 Trace 数据即可知道每一行是什么指令。
         let lookups_read_raf = InstructionReadRafSumcheckProver::initialize(
             lookups_read_raf_params,
             Arc::clone(&self.trace),
@@ -1171,6 +1399,8 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             print_data_structure_heap_usage("InstructionReadRafSumcheckProver", &lookups_read_raf);
         }
 
+        // 3. 打包实例 (Batching):
+        // 将寄存器值检查、RAM 地址归约、Lookup 访问控制检查打包。
         let mut instances: Vec<Box<dyn SumcheckInstanceProver<_, _>>> = vec![
             Box::new(registers_val_evaluation),
             Box::new(ram_ra_reduction),
@@ -1179,14 +1409,21 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
 
         #[cfg(feature = "allocative")]
         write_instance_flamegraph_svg(&instances, "stage5_start_flamechart.svg");
+
         tracing::info!("Stage 5 proving");
+
+        // 4. 执行批量 Sumcheck (Prove):
+        // 运行 Sumcheck 协议，将三个子协议归约为 `opening_accumulator` 中的评估点。
         let (sumcheck_proof, _r_stage5) = BatchedSumcheck::prove(
             instances.iter_mut().map(|v| &mut **v as _).collect(),
             &mut self.opening_accumulator,
             &mut self.transcript,
         );
+
         #[cfg(feature = "allocative")]
         write_instance_flamegraph_svg(&instances, "stage5_end_flamechart.svg");
+
+        // 后台释放资源
         drop_in_background_thread(instances);
 
         sumcheck_proof
@@ -1197,6 +1434,15 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         #[cfg(not(target_arch = "wasm32"))]
         print_current_memory_usage("Stage 6 baseline");
 
+        // =========================================================
+        // 1. 初始化各子任务参数 (Initialization params)
+        // Stage 6 进入了更底层的约束检查，主要关注“位有效性”(Booleanity)
+        // 和“访问标记”(Access Flags) 以及 Advice 的初步归约。
+        // =========================================================
+
+        // a. 字节码读取标记 (Bytecode Read RAF):
+        // 验证程序计数器 (PC) 指向的指令是否被正确从只读代码段 (ROM) 中读取。
+        // RAF (Read Access Flag) 确保我们在执行指令时，确实对 Bytecode 对应的地址发起了读操作。
         let bytecode_read_raf_params = BytecodeReadRafSumcheckParams::gen(
             &self.preprocessing.shared.bytecode,
             self.trace.len().log_2(),
@@ -1205,9 +1451,15 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             &mut self.transcript,
         );
 
+        // b. RAM 汉明重量布尔性 (RAM Hamming Booleanity):
+        // 用于优化内存检查。它验证与 RAM 访问相关的某些辅助标志位是否为布尔值 (0 或 1)。
         let ram_hamming_booleanity_params =
             HammingBooleanitySumcheckParams::new(&self.opening_accumulator);
 
+        // c. 通用布尔性检查 (Booleanity):
+        // Jolt 依赖将数值分解为比特位来进行范围检查或查找表索引。
+        // 此步骤对于整个系统的安全性至关重要：它证明那些声称是“比特”的变量，
+        // 其值确实严格等于 0 或 1 (即验证 x * (x - 1) = 0)。
         let booleanity_params = BooleanitySumcheckParams::new(
             self.trace.len().log_2(),
             &self.one_hot_params,
@@ -1215,6 +1467,9 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             &mut self.transcript,
         );
 
+        // d. RAM 和 Lookup 的虚拟地址读取 (Virtual Read Addresses):
+        // "Virtual" 在这里通常指代 Jolt 内部为了 Lasso 查找参数所构建的查询结构。
+        // 这些参数用于验证 RAM 操作和指令查找表的地址构建逻辑是否正确。
         let ram_ra_virtual_params = RamRaVirtualParams::new(
             self.trace.len(),
             &self.one_hot_params,
@@ -1225,13 +1480,19 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             &self.opening_accumulator,
             &mut self.transcript,
         );
+
+        // e. 增量声明归约 (Instruction Counter / Increment Reduction):
+        // 通常用于处理指令计数或某些累加器的正确性，确保步骤之间的连续性。
         let inc_reduction_params = IncClaimReductionSumcheckParams::new(
             self.trace.len(),
             &self.opening_accumulator,
             &mut self.transcript,
         );
 
-        // Advice claim reduction (Phase 1 in Stage 6): trusted and untrusted are separate instances.
+        // f. Advice (辅助输入) 归约 - 第一阶段 (Phase 1):
+        // Advice 验证是一个两阶段过程。Stage 6 执行第一阶段。
+        // 目标是将 Advice 查找声明 (Cycle, Address, P_val) 归约为只剩 (Address) 的形式。
+        // 这一步主要处理“时间/周期 (Cycle)”维度的绑定。
         let trusted_advice_phase1_params = AdviceClaimReductionPhase1Params::new(
             AdviceKind::Trusted,
             &self.program_io.memory_layout,
@@ -1251,6 +1512,10 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
                 .needs_single_advice_opening(self.trace.len().log_2()),
         );
 
+        // =========================================================
+        // 2. 初始化具体的 Prover 实例
+        // =========================================================
+
         let bytecode_read_raf = BytecodeReadRafSumcheckProver::initialize(
             bytecode_read_raf_params,
             Arc::clone(&self.trace),
@@ -1262,7 +1527,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         let booleanity = BooleanitySumcheckProver::initialize(
             booleanity_params,
             &self.trace,
-            &self.preprocessing.shared.bytecode,
+            &self.preprocessing.shared.bytecode, // 某些指令隐含了地址位的分解，需要 Bytecode 辅助
             &self.program_io.memory_layout,
         );
 
@@ -1277,12 +1542,12 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         let inc_reduction =
             IncClaimReductionSumcheckProver::initialize(inc_reduction_params, self.trace.clone());
 
-        // Initialize Phase 1 provers (Stage 6) if advice is present.
-        // Note: We clone the advice polynomial here because:
-        // 1. Phase1 (Stage 6) destructively binds cycle variables
-        // 2. Phase2 (Stage 7) needs a fresh copy to bind address variables
-        // 3. Stage 8 RLC needs the original polynomial
-        // A future optimization could use Arc<MultilinearPolynomial> with copy-on-write.
+        // 初始化 Advice Phase 1 Provers。
+        // 注意：这里我们 Clone 了 advice 多项式。原因如下：
+        // 1. Phase 1 (Stage 6) 会破坏性地绑定“周期(Cycle)”变量。
+        // 2. Phase 2 (Stage 7) 将需要一份新的副本来绑定“地址(Address)”变量。
+        // 3. Stage 8 (RLC) 可能还需要原始多项式。
+        // 虽然有性能开销，但为了多阶段 Sumcheck 的独立性是必要的。
         let trusted_advice_phase1 = trusted_advice_phase1_params.map(|params| {
             self.advice_reduction_gamma_trusted = Some(params.gamma);
             let poly = self
@@ -1327,6 +1592,10 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             }
         }
 
+        // =========================================================
+        // 3. 打包实例进行批量证明 (Batching)
+        // 将所有关于位有效性、指令读取、地址构造和 Advice 初步归约的检查合并。
+        // =========================================================
         let mut instances: Vec<Box<dyn SumcheckInstanceProver<_, _>>> = vec![
             Box::new(bytecode_read_raf),
             Box::new(ram_hamming_booleanity),
@@ -1344,14 +1613,21 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
 
         #[cfg(feature = "allocative")]
         write_instance_flamegraph_svg(&instances, "stage6_start_flamechart.svg");
+
         tracing::info!("Stage 6 proving");
+
+        // 4. 执行 Sumcheck
+        // 验证上述所有属性。
         let (sumcheck_proof, _r_stage6) = BatchedSumcheck::prove(
             instances.iter_mut().map(|v| &mut **v as _).collect(),
             &mut self.opening_accumulator,
             &mut self.transcript,
         );
+
         #[cfg(feature = "allocative")]
         write_instance_flamegraph_svg(&instances, "stage6_end_flamechart.svg");
+
+        // 后台释放资源
         drop_in_background_thread(instances);
 
         sumcheck_proof
@@ -1360,13 +1636,22 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
     /// Stage 7: HammingWeight + ClaimReduction sumcheck (only log_k_chunk rounds).
     #[tracing::instrument(skip_all)]
     fn prove_stage7(&mut self) -> SumcheckInstanceProof<F, ProofTranscript> {
-        // Create params and prover for HammingWeightClaimReduction
-        // (r_cycle and r_addr_bool are extracted from Booleanity opening internally)
+        #[cfg(not(target_arch = "wasm32"))]
+        print_current_memory_usage("Stage 7 baseline");
+
+        // 1. 初始化汉明重量（One-Hot）检查参数 (Hamming Weight Check):
+        // Jolt 架构极度依赖 One-Hot 编码（例如指令解码，同一时刻只能是一个指令）。
+        // 此步骤验证特定向量的汉明重量是否为 1（即所有位中只有一个 1，其余为 0）。
+        // 注意：前面的 Stage 6 (Booleanity) 已经证明了这些值是 0 或 1。
+        // 这里证明的是 sum(flags) == 1。
+        // r_cycle 和 r_addr_bool 等随机点是从之前的 Booleanity opening 中提取的，用于关联这两个阶段。
         let hw_params = HammingWeightClaimReductionParams::new(
             &self.one_hot_params,
             &self.opening_accumulator,
             &mut self.transcript,
         );
+
+        // 初始化汉明重量证明器
         let hw_prover = HammingWeightClaimReductionProver::initialize(
             hw_params,
             &self.trace,
@@ -1377,21 +1662,31 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         #[cfg(feature = "allocative")]
         print_data_structure_heap_usage("HammingWeightClaimReductionProver", &hw_prover);
 
-        // 3. Run Stage 7 batched sumcheck (address rounds only).
-        // Includes HammingWeightClaimReduction plus Phase 2 advice reduction instances (if needed).
+        // 2. 准备批量证明实例 (Batching):
+        // 主要包含汉明重量检查。
+        // 这里的 Sumcheck 通常只涉及 "Address" 相关的 rounds (log_k_chunk)，
+        // 因为时间维度通常已经在前序步骤处理或归约了。
         let mut instances: Vec<Box<dyn SumcheckInstanceProver<F, ProofTranscript>>> =
             vec![Box::new(hw_prover)];
 
+        // 3. 添加 Advice (辅助输入) 归约 - 第二阶段 (Phase 2):
+        // 如果存在 Advice 数据，我们需要完成在 Stage 6 启动的验证流程。
+        // Stage 6 (Phase 1) 处理了 "Time/Cycle" 维度的归约。
+        // Stage 7 (Phase 2) 处理 "Address/Space" 维度的归约。
+        // 也就是验证：Confirm(Address) -> Value。
+
+        // 处理可信 Advice (Trusted Advice)
         if let Some(gamma) = self.advice_reduction_gamma_trusted {
             if let Some(params) = AdviceClaimReductionPhase2Params::new(
                 AdviceKind::Trusted,
                 &self.program_io.memory_layout,
                 self.trace.len(),
-                gamma,
+                gamma, // 使用 Stage 6 生成的随机挑战 gamma
                 &self.opening_accumulator,
                 self.rw_config
                     .needs_single_advice_opening(self.trace.len().log_2()),
             ) {
+                // 克隆多项式以进行 Sumcheck（该过程可能具有破坏性或需要独立的所有权）
                 let poly = self
                     .advice
                     .trusted_advice_polynomial
@@ -1402,6 +1697,8 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
                 )));
             }
         }
+
+        // 处理不可信 Advice (Untrusted Advice / Witness)
         if let Some(gamma) = self.advice_reduction_gamma_untrusted {
             if let Some(params) = AdviceClaimReductionPhase2Params::new(
                 AdviceKind::Untrusted,
@@ -1426,13 +1723,20 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         #[cfg(feature = "allocative")]
         write_instance_flamegraph_svg(&instances, "stage7_start_flamechart.svg");
         tracing::info!("Stage 7 proving");
+
+        // 4. 执行批量 Sumcheck (Prove):
+        // 这一步将汉明重量约束和 Advice 地址约束归约到 `opening_accumulator`。
+        // 此后，Verifier 只需要检查 Accumulator 中的点评估值。
         let (sumcheck_proof, _) = BatchedSumcheck::prove(
             instances.iter_mut().map(|v| &mut **v as _).collect(),
             &mut self.opening_accumulator,
             &mut self.transcript,
         );
+
         #[cfg(feature = "allocative")]
         write_instance_flamegraph_svg(&instances, "stage7_end_flamechart.svg");
+
+        // 后台释放资源
         drop_in_background_thread(instances);
 
         sumcheck_proof
@@ -1440,6 +1744,10 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
 
     /// Stage 8: Dory batch opening proof.
     /// Builds streaming RLC polynomial directly from trace (no witness regeneration needed).
+    /// Stage 8: Dory 批量 Opening 证明 (Dory batch opening proof)。
+    ///
+    /// 这里的核心是直接从 Trace 构建流式的随机线性组合 (RLC) 多项式，
+    /// 而不需要重新生成巨大的 Witness 多项式，极大节省内存。
     #[tracing::instrument(skip_all)]
     fn prove_stage8(
         &mut self,
@@ -1447,26 +1755,35 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
     ) -> PCS::Proof {
         tracing::info!("Stage 8 proving (Dory batch opening)");
 
+        // 初始化 Dory 上下文。Dory 是一种基于 Hyrax/Spartan 风格的多项式承诺方案。
+        // 这里设置全局参数，准备进行大规模的 MSM (多标量乘法) 计算。
         let _guard = DoryGlobals::initialize_context(
             self.one_hot_params.k_chunk,
             self.padded_trace_len,
             DoryContext::Main,
         );
 
-        // Get the unified opening point from HammingWeightClaimReduction
-        // This contains (r_address_stage7 || r_cycle_stage6) in big-endian
+        // 1. 获取统一的 Opening Point (验证点)。
+        // 这个点来自 Stage 7 (HammingWeightClaimReduction)。
+        // 它通常是一个拼接点：(r_address || r_cycle)。
+        // 也就是：地址部分的随机挑战 + 时间/周期部分的随机挑战。
         let (opening_point, _) = self.opening_accumulator.get_committed_polynomial_opening(
             CommittedPolynomial::InstructionRa(0),
             SumcheckId::HammingWeightClaimReduction,
         );
         let log_k_chunk = self.one_hot_params.log_k_chunk;
+
+        // 分离出地址部分的随机挑战点 r_address。
         let r_address_stage7 = &opening_point.r[..log_k_chunk];
 
-        // 1. Collect all (polynomial, claim) pairs
+        // 2. 收集所有的 (多项式标识, 声明值) 对。
+        // 我们要在一个点上同时打开许多个多项式，验证它们的值。
         let mut polynomial_claims = Vec::new();
 
-        // Dense polynomials: RamInc and RdInc (from IncClaimReduction in Stage 6)
-        // These are at r_cycle_stage6 only (length log_T)
+        // category A: 稠密多项式 (Dense Polynomials) - RamInc 和 RdInc
+        // 这些多项式仅依赖于时间维度 (Cycle)，长度为 Trace Length (log_T)。
+        // 但我们的 Opening Point 包含了额外的 Address 维度。
+        // 来源：Stage 6 的 IncClaimReduction。
         let (_ram_inc_point, ram_inc_claim) =
             self.opening_accumulator.get_committed_polynomial_opening(
                 CommittedPolynomial::RamInc,
@@ -1480,7 +1797,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
 
         #[cfg(test)]
         {
-            // Verify that Inc openings are at the same point as r_cycle from HammingWeightClaimReduction
+            // 验证一致性：Inc 检查所用的随机点应该等于 Unified Point 中的时间部分。
             let r_cycle_stage6 = &opening_point.r[log_k_chunk..];
 
             debug_assert_eq!(
@@ -1495,16 +1812,20 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             );
         }
 
-        // Apply Lagrange factor for dense polys: ∏_{i<log_k_chunk} (1 - r_address[i])
-        // Because dense polys have fewer variables, we need to account for this
-        // Note: r_address is in big-endian, Lagrange factor uses ∏(1 - r_i)
+        // 关键逻辑：应用拉格朗日因子 (Lagrange Factor)。
+        // 稠密多项式 P(cycle) 比 Opening Point (address, cycle) 少了 address 维度。
+        // 为了将它们嵌入到同一个大的 Dory 矩阵中进行批量验证，我们视作它们只在 address=0 处有值。
+        // 拉格朗日因子 L(r_addr) = ∏(1 - r_i) 实际上计算了 "r_addr 是否指向 0 (全零向量)" 的概率权重。
+        // 这相当于在这个高维空间中进行零填充嵌入 (Zero-padding embedding)。
         let lagrange_factor: F = r_address_stage7.iter().map(|r| F::one() - *r).product();
 
         polynomial_claims.push((CommittedPolynomial::RamInc, ram_inc_claim * lagrange_factor));
         polynomial_claims.push((CommittedPolynomial::RdInc, rd_inc_claim * lagrange_factor));
 
-        // Sparse polynomials: all RA polys (from HammingWeightClaimReduction)
-        // These are at (r_address_stage7, r_cycle_stage6)
+        // category B: 稀疏/结构化多项式 (Sparse Polynomials) - RA Polys
+        // 这些多项式本身就定义在 (Address, Cycle) 上，维度与 Opening Point 开头完全匹配。
+        // 直接添加声明值即可。
+        // 来源：Stage 7 的 HammingWeightClaimReduction。
         for i in 0..self.one_hot_params.instruction_d {
             let (_, claim) = self.opening_accumulator.get_committed_polynomial_opening(
                 CommittedPolynomial::InstructionRa(i),
@@ -1527,9 +1848,10 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             polynomial_claims.push((CommittedPolynomial::RamRa(i), claim));
         }
 
-        // Advice polynomials: TrustedAdvice and UntrustedAdvice (from AdviceClaimReduction in Stage 6)
-        // These are committed with smaller dimensions, so we apply Lagrange factors to embed
-        // them in the top-left block of the main Dory matrix.
+        // category C: Advice 多项式 (Advice Polynomials)
+        // 来源：Stage 6 和 Stage 7 的 AdviceClaimReduction。
+        // Advice 多项式的大小通常和 Trace Length 不同 (通常更小)，因此也需要
+        // 计算特定的拉格朗日因子，以便将其逻辑上嵌入到主 Dory 矩阵的左上角 (Top-Left Block)。
         if let Some((advice_point, advice_claim)) = self
             .opening_accumulator
             .get_advice_opening(AdviceKind::Trusted, SumcheckId::AdviceClaimReductionPhase2)
@@ -1554,24 +1876,27 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             ));
         }
 
-        // 2. Sample gamma and compute powers for RLC
+        // 3. 采样随机权重 Gamma 并计算幂次。
+        // 为了进行批量验证 (Batch Verification)，我们将所有的声明组合成一个大的随机线性组合 (RLC)。
+        // H(x) = ∑ γ^i * P_i(x) => Claim = ∑ γ^i * y_i
         let claims: Vec<F> = polynomial_claims.iter().map(|(_, c)| *c).collect();
         self.transcript.append_scalars(&claims);
         let gamma_powers: Vec<F> = self.transcript.challenge_scalar_powers(claims.len());
 
-        // Build DoryOpeningState
+        // 构建 Dory Opening 状态对象
         let state = DoryOpeningState {
             opening_point: opening_point.r.clone(),
             gamma_powers,
             polynomial_claims,
         };
 
+        // 准备流式计算所需的数据 (Bytecode, Memory Layout)
         let streaming_data = Arc::new(RLCStreamingData {
             bytecode: Arc::clone(&self.preprocessing.shared.bytecode),
             memory_layout: self.preprocessing.shared.memory_layout.clone(),
         });
 
-        // Build advice polynomials map for RLC
+        // 提取 Advice 多项式 (如果存在)
         let mut advice_polys = HashMap::new();
         if let Some(poly) = self.advice.trusted_advice_polynomial.take() {
             advice_polys.insert(CommittedPolynomial::TrustedAdvice, poly);
@@ -1580,8 +1905,11 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             advice_polys.insert(CommittedPolynomial::UntrustedAdvice, poly);
         }
 
-        // Build streaming RLC polynomial directly (no witness poly regeneration!)
-        // Use materialized trace (default, single pass) instead of lazy trace
+        // 4. 构建流式 RLC 多项式 (Streaming RLC)。
+        // 这一步是性能关键。我们不显式地构造每一个承诺多项式 P_i。
+        // 相反，我们再次流式遍历 Trace (从 self.trace 或 Materialized trace)，
+        // 根据当前的行数据，直接计算出 RLC 多项式 H(x) 的系数值。
+        // 这样可以将内存消耗从 O(Num_Polys * Trace_Len) 降低到 O(Trace_Len)。
         let (joint_poly, hint) = state.build_streaming_rlc::<PCS>(
             self.one_hot_params.clone(),
             TraceSource::Materialized(Arc::clone(&self.trace)),
@@ -1590,7 +1918,8 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             advice_polys,
         );
 
-        // Dory opening proof at the unified point
+        // 5. 执行最终的 Dory Opening Proof。
+        // 证明：构建出的 joint_poly 在 opening_point 处的评估值确实等于我们预期的加权和。
         PCS::prove(
             &self.preprocessing.generators,
             &joint_poly,
@@ -2064,18 +2393,40 @@ mod tests {
     #[test]
     #[serial]
     fn max_advice_with_small_trace() {
-        // Tests that max-sized advice (4KB = 512 words) works with a minimal trace.
-        // With balanced dims (sigma_a=5, nu_a=4 for 512 words), the minimum padded trace
-        // (256 cycles -> total_vars=12) is sufficient to embed advice.
+        // 测试目标：验证当Advice（辅助输入）达到最大尺寸（4KB = 512 words），
+        // 但执行轨迹（Trace）非常短时，系统是否仍能正常工作。
+        //
+        // 背景：Advice 多项式通常被嵌入到更大的 Trace 相关的 Dory 矩阵中（作为左上角的块）。
+        // 如果 Trace 太短，可能导致矩阵维度不足以容纳 Advice 多项式。
+        // 本测试确保当 Advice 维度（sigma_a=5, nu_a=4, 对应 512 words）与
+        // 最小填充 Trace（256 cycles -> total_vars=12）结合时，Jolt 的动态调整机制能正确处理。
+
+        // 1. 初始化宿主程序 (Host Program)
+        // 使用斐波那契计算作为 Guest 程序，因为它逻辑简单，适合生成短 Trace。
         let mut program = host::Program::new("fibonacci-guest");
+
+        // 准备简短的输入：计算第 5 个斐波那契数，这会产生很短的执行轨迹。
         let inputs = postcard::to_stdvec(&5u32).unwrap();
+
+        // 构造最大尺寸的 Advice 数据：
+        // Jolt 默认配置的最大 Advice 大小通常较小（例如 4KB）。
+        // 这里创建 4096 字节的向量，填满这个容量。
         let trusted_advice = vec![7u8; 4096];
         let untrusted_advice = vec![9u8; 4096];
 
+        // 2. 解码程序与生成 Trace
+        // 解码获取字节码和初始内存状态。
         let (bytecode, init_memory_state, _) = program.decode();
+
+        // 运行程序生成 Trace。此时传入了巨大的 advice 数据，尽管斐波那契逻辑并不真正使用它们。
+        // Jolt 会将这些 advice 记录在 IO 设备和内存布局中。
         let (lazy_trace, trace, final_memory_state, io_device) =
             program.trace(&inputs, &untrusted_advice, &trusted_advice);
 
+        // 3. 共享预处理 (Preprocessing)
+        // 关键点：将 `max_trace_length` 设置得很小 (256)。
+        // 这迫使 Prover 试图使用极小的多项式维度。
+        // 如果 Jolt 没有维度检查逻辑，这里的 256 长度可能无法容纳 4KB 的 Advice。
         let shared_preprocessing = JoltSharedPreprocessing::new(
             bytecode.clone(),
             io_device.memory_layout.clone(),
@@ -2083,14 +2434,22 @@ mod tests {
             256,
         );
         let prover_preprocessing = JoltProverPreprocessing::new(shared_preprocessing.clone());
-        tracing::info!(
-            "preprocessing.memory_layout.max_trusted_advice_size: {}",
-            shared_preprocessing.memory_layout.max_trusted_advice_size
-        );
 
+        tracing::info!(
+                "preprocessing.memory_layout.max_trusted_advice_size: {}",
+                shared_preprocessing.memory_layout.max_trusted_advice_size
+            );
+
+        // 4. 单独提交可信 Advice (Trusted Advice Commitment)
+        // 在实际应用中，可信 Advice 往往是预先提交好的。
+        // 这里模拟这个过程，生成 Commitment 和 Hint。
         let (trusted_commitment, trusted_hint) =
             commit_trusted_advice_preprocessing_only(&prover_preprocessing, &trusted_advice);
 
+        // 5. 生成 Prover 实例
+        // `gen_from_trace` 内部会调用 `adjust_trace_length_for_advice`。
+        // 即使我们请求了 256 的 Trace 长度，如果 Advice 需要更大的矩阵，
+        // Prover 可能会在这里进行断言或自动调整（但在本例中，256 恰好足够嵌入 512 words 的 Advice）。
         let prover = RV64IMACProver::gen_from_trace(
             &prover_preprocessing,
             lazy_trace,
@@ -2101,13 +2460,21 @@ mod tests {
             final_memory_state,
         );
 
-        // Trace is tiny but advice is max-sized
+        // 断言验证：
+        // 确保原始 Trace 确实很短 (< 512)。
         assert!(prover.unpadded_trace_len < 512);
+        // 确保填充后的 Trace 长度维持在预设的 256。
+        // 这意味着 Advice 的嵌入逻辑在这个最小尺寸下是兼容的。
         assert_eq!(prover.padded_trace_len, 256);
 
+        // 6. 生成证明 (Prove)
+        // 运行完整证明流程，这会触发 Stage 6 (Advice 归约) 和 Stage 8 (Dory Batch Opening)。
+        // 如果维度不匹配，Dory 证明构建或验证将会失败。
         let io_device = prover.program_io.clone();
         let (jolt_proof, debug_info) = prover.prove();
 
+        // 7. 验证证明 (Verify)
+        // 使用 Verifier 检查生成的证明是否有效。
         let verifier_preprocessing = JoltVerifierPreprocessing::from(&prover_preprocessing);
         RV64IMACVerifier::new(
             &verifier_preprocessing,
@@ -2125,17 +2492,27 @@ mod tests {
     #[serial]
     fn advice_e2e_dory() {
         let _ = tracing_subscriber::fmt().try_init();
-        // Tests a guest (merkle-tree) that actually consumes both trusted and untrusted advice.
+        // 测试目标：验证 Guest 程序同时消耗 Trusted（可信）和 Untrusted（不可信）Advice 时的端到端流程。
+        // 使用 "merkle-tree-guest" 程序，因为它需要这两种 Advice 来计算 Merkle Root。
         let mut program = host::Program::new("merkle-tree-guest");
         let (bytecode, init_memory_state, _) = program.decode();
 
-        // Merkle tree with 4 leaves: input=leaf1, trusted=[leaf2, leaf3], untrusted=leaf4
+        // 构造 Merkle Tree 输入：
+        // 这个程序计算 4 个叶子的 Merkle Root。
+        // - inputs: 第 1 个叶子 (leaf1)。通常作为公共输入。
+        // - trusted_advice: 第 2、3 个叶子 (leaf2, leaf3)。这模拟了预先已知的数据（如公共参数或历史根）。
+        // - untrusted_advice: 第 4 个叶子 (leaf4)。这模拟了私有 witness 数据（如用户隐私数据）。
         let inputs = postcard::to_stdvec(&[5u8; 32].as_slice()).unwrap();
         let untrusted_advice = postcard::to_stdvec(&[8u8; 32]).unwrap();
         let mut trusted_advice = postcard::to_stdvec(&[6u8; 32]).unwrap();
         trusted_advice.extend(postcard::to_stdvec(&[7u8; 32]).unwrap());
 
+        // 1. 生成 Trace，记录 Advice 的使用情况到 io_device。
+        // 这一步运行程序但不生成证明，主要是为了获取内存布局和 IO 设备状态。
         let (_, _, _, io_device) = program.trace(&inputs, &untrusted_advice, &trusted_advice);
+
+        // 2. 共享预处理：设置最大 trace 长度等参数。
+        // 1 << 16 是配置的最大 trace 长度。
         let shared_preprocessing = JoltSharedPreprocessing::new(
             bytecode.clone(),
             io_device.memory_layout.clone(),
@@ -2145,9 +2522,15 @@ mod tests {
         let prover_preprocessing = JoltProverPreprocessing::new(shared_preprocessing.clone());
         let elf_contents = program.get_elf_contents().expect("elf contents is None");
 
+        // 3. 提交可信 Advice (Trusted Advice Commitment)。
+        // 这模拟了"预处理"阶段：可信 Advice 已经确定，生成了承诺 (Commitment) 和辅助证明 (Hint)。
+        // Verifier 将持有 trusted_commitment。
         let (trusted_commitment, trusted_hint) =
             commit_trusted_advice_preprocessing_only(&prover_preprocessing, &trusted_advice);
 
+        // 4. 生成 Prover 实例。
+        // 这里传入了 inputs, untrusted, trusted 三种数据源。
+        // Prover 内部会再次执行程序，并构建多项式。
         let prover = RV64IMACProver::gen_from_elf(
             &prover_preprocessing,
             &elf_contents,
@@ -2158,8 +2541,14 @@ mod tests {
             Some(trusted_hint),
         );
         let io_device = prover.program_io.clone();
+
+        // 5. 生成证明 (Prove)。
+        // 内部流程会分别处理 Trusted (Stage 6 归约 + Stage 8 嵌入)
+        // 和 Untrusted Advice (Commit + Stage 6 归约 + Stage 8 嵌入)。
         let (jolt_proof, debug_info) = prover.prove();
 
+        // 6. 验证证明 (Verify)。
+        // 创建 Verifier，传入 Prover 生成的 output 和 commitment。
         let verifier_preprocessing = JoltVerifierPreprocessing::from(&prover_preprocessing);
         RV64IMACVerifier::new(
             &verifier_preprocessing,
@@ -2172,7 +2561,9 @@ mod tests {
             .verify()
             .expect("Verification failed");
 
-        // Expected merkle root for leaves [5;32], [6;32], [7;32], [8;32]
+        // 7. 验证计算结果正确性。
+        // 预计算这 4 个特定叶子 ([5;32], [6;32], [7;32], [8;32]) 对应的 Merkle Root。
+        // 确保 ZK 证明通过的同时，程序本身的计算逻辑也是正确的。
         let expected_output = &[
             0xb4, 0x37, 0x0f, 0x3a, 0xb, 0x3d, 0x38, 0xa8, 0x7a, 0x6c, 0x4c, 0x46, 0x9, 0xe7, 0x83,
             0xb3, 0xcc, 0xb7, 0x1c, 0x30, 0x1f, 0xf8, 0x54, 0xd, 0xf7, 0xdd, 0xc8, 0x42, 0x32,
@@ -2184,20 +2575,31 @@ mod tests {
     #[test]
     #[serial]
     fn advice_opening_point_derives_from_unified_point() {
-        // Tests that advice opening points are correctly derived from the unified main opening
-        // point using Dory's balanced dimension policy.
+        // 测试目标：验证 Advice（辅助输入）的 Opening Point（多项式评估点）是否能够正确地
+        // 从全局统一的主 Opening Point 中派生出来，且符合 Dory 协议的坐标映射策略。
         //
-        // For a small trace (256 cycles), the advice row coordinates span both Stage 6 (cycle)
-        // and Stage 7 (address) challenges, verifying the two-phase reduction works correctly.
+        // 核心难点：
+        // 在 Dory 协议中，为了批量验证，我们将不同大小的多项式（如 Advice 和 Main Memory Trace）
+        // 视为嵌入在同一个巨大的虚拟矩阵中。
+        // 对于极短的 Trace（例如本例中的 256 cycles），Advice 的行坐标可能会跨越
+        // Stage 6（Cycle/时间维度）和 Stage 7（Address/空间维度）的随机挑战点。
+        // 本测试验证这种复杂的“两阶段归约”过程是否正确计算了坐标。
+
+        // 1. 初始化程序与数据
+        // 使用斐波那契计算作为 Guest 程序，输入很小，产生短 Trace。
         let mut program = host::Program::new("fibonacci-guest");
         let inputs = postcard::to_stdvec(&5u32).unwrap();
+        // 构造虚拟的 Trusted 和 Untrusted Advice 数据。
         let trusted_advice = postcard::to_stdvec(&[7u8; 32]).unwrap();
         let untrusted_advice = postcard::to_stdvec(&[9u8; 32]).unwrap();
 
+        // 2. 生成 Trace 与预处理
         let (bytecode, init_memory_state, _) = program.decode();
         let (lazy_trace, trace, final_memory_state, io_device) =
             program.trace(&inputs, &untrusted_advice, &trusted_advice);
 
+        // 创建共享预处理数据，设置最大 Trace 为 64K (1<<16)。
+        // 注意：尽管最大容量很大，但下面的 gen_from_trace 会根据实际执行情况生成一个小 Trace。
         let shared_preprocessing = JoltSharedPreprocessing::new(
             bytecode.clone(),
             io_device.memory_layout.clone(),
@@ -2205,9 +2607,13 @@ mod tests {
             1 << 16,
         );
         let prover_preprocessing = JoltProverPreprocessing::new(shared_preprocessing.clone());
+
+        // 提前提交 Trusted Advice（模拟预处理阶段）。
         let (trusted_commitment, trusted_hint) =
             commit_trusted_advice_preprocessing_only(&prover_preprocessing, &trusted_advice);
 
+        // 3. 生成 Prover 实例
+        // 传入短 Trace。
         let prover = RV64IMACProver::gen_from_trace(
             &prover_preprocessing,
             lazy_trace,
@@ -2218,24 +2624,35 @@ mod tests {
             final_memory_state,
         );
 
+        // 关键断言：确保生成的 Padding 后 Trace 长度极小（256）。
+        // 这意味着 Trace 矩阵的行数很少，Advice 的数据分布会变得更加“紧凑”，
+        // 迫使验证逻辑处理边界情况。
         assert_eq!(prover.padded_trace_len, 256, "test expects small trace");
 
         let io_device = prover.program_io.clone();
+        // 4. 生成证明 (Prove)
+        // 这一步会执行所有 Stage，包括计算 Opening Point。
         let (jolt_proof, debug_info) = prover.prove();
         let debug_info = debug_info.expect("expected debug_info in tests");
 
-        // Get unified opening point and derive expected advice point
+        // 5. 验证坐标派生逻辑
+        // 第一步：获取全局统一的 Opening Point。
+        // 我们从 Stage 7 (HammingWeightClaimReduction) 的 InstructionRa 多项式获取这个点。
+        // 这是 Prover 和 Verifier 协商出的随机点 r。
         let (opening_point, _) = debug_info
             .opening_accumulator
             .get_committed_polynomial_opening(
                 CommittedPolynomial::InstructionRa(0),
                 SumcheckId::HammingWeightClaimReduction,
             );
+        // Dory 内部通常是大端序，这里转为小端序方便索引切片。
         let mut point_dory_le = opening_point.r.clone();
         point_dory_le.reverse();
 
-        let total_vars = point_dory_le.len();
-        let (sigma_main, _nu_main) = DoryGlobals::balanced_sigma_nu(total_vars);
+        // 计算主矩阵和 Advice 矩阵的维度参数（sigma/nu）。
+        let total_vars = point_dory_le.len(); // 全局变量数
+        let (sigma_main, _nu_main) = DoryGlobals::balanced_sigma_nu(total_vars); // 主矩阵拆分
+        // Advice 矩阵通过其最大字节数计算拆分。
         let (sigma_a, nu_a) = DoryGlobals::advice_sigma_nu_from_max_bytes(
             prover_preprocessing
                 .shared
@@ -2243,15 +2660,21 @@ mod tests {
                 .max_trusted_advice_size as usize,
         );
 
-        // Build expected advice point: [col_bits[0..sigma_a] || row_bits[0..nu_a]]
+        // 第二步：手动构建预期的 Advice Opening Point。
+        // 原理：Advice 矩阵被嵌入在主矩阵的左上角。
+        // 它的坐标由全局点的特定比特位组成：
+        // - 列坐标 (Col) 来自 point_dory 低位 [0..sigma_a]
+        // - 行坐标 (Row) 来自 point_dory 主矩阵行起始位 [sigma_main..sigma_main + nu_a]
         let mut expected_advice_le: Vec<_> = point_dory_le[0..sigma_a].to_vec();
         expected_advice_le.extend_from_slice(&point_dory_le[sigma_main..sigma_main + nu_a]);
 
-        // Verify both advice types derive the same opening point
+        // 第三步：验证实际 Prover 计算出的点是否一致。
+        // 检查 Trusted 和 Untrusted 两种 Advice。
         for (name, kind) in [
             ("trusted", AdviceKind::Trusted),
             ("untrusted", AdviceKind::Untrusted),
         ] {
+            // 获取 Prover 在 Phase 2 (Stage 7) 计算出的实际 Advice Opening。
             let get_fn = debug_info
                 .opening_accumulator
                 .get_advice_opening(kind, SumcheckId::AdviceClaimReductionPhase2);
@@ -2262,10 +2685,13 @@ mod tests {
             let (point_be, _) = get_fn.unwrap();
             let mut point_le = point_be.r.clone();
             point_le.reverse();
+
+            // 比对我们手动推导的点和 Prover 系统计算的点。
             assert_eq!(point_le, expected_advice_le, "{name} advice point mismatch");
         }
 
-        // Verify end-to-end
+        // 6. 端到端验证 (End-to-End Verification)
+        // 确保整个证明通过 Verifier 检查，保证数学上的合理性。
         let verifier_preprocessing = JoltVerifierPreprocessing::from(&prover_preprocessing);
         RV64IMACVerifier::new(
             &verifier_preprocessing,
@@ -2282,10 +2708,20 @@ mod tests {
     #[test]
     #[serial]
     fn memory_ops_e2e_dory() {
+        // 测试目标：验证 RISC-V 基础内存操作指令的正确性。
+        // "memory-ops-guest" 程序包含了一系列加载（Load）和存储（Store）指令，
+        // 涵盖了不同的位宽（Byte, Half-word, Word, Double-word）以及符号扩展逻辑。
+        // 此测试确保 Jolt 的 RAM 一致性检查（Stage 2 Grand Product 和 Stage 4 Value Check）能正确处理这些操作。
         let mut program = host::Program::new("memory-ops-guest");
         let (bytecode, init_memory_state, _) = program.decode();
+
+        // 1. 生成 Trace
+        // 该测试用例不需要任何公共输入 (inputs) 或辅助输入 (advice)。
+        // 程序内部硬编码了对内存特定地址读写的测试逻辑。
         let (_, _, _, io_device) = program.trace(&[], &[], &[]);
 
+        // 2. 共享预处理
+        // 设置最大 trace 长度为 64K (1 << 16)。
         let shared_preprocessing = JoltSharedPreprocessing::new(
             bytecode.clone(),
             io_device.memory_layout.clone(),
@@ -2296,18 +2732,27 @@ mod tests {
         let prover_preprocessing = JoltProverPreprocessing::new(shared_preprocessing.clone());
         let elf_contents_opt = program.get_elf_contents();
         let elf_contents = elf_contents_opt.as_deref().expect("elf contents is None");
+
+        // 3. 生成 Prover 实例
+        // 传入空的 inputs, untrusted_advice, trusted_advice。
         let prover = RV64IMACProver::gen_from_elf(
             &prover_preprocessing,
             elf_contents,
-            &[],
-            &[],
-            &[],
+            &[], // inputs
+            &[], // untrusted advice
+            &[], // trusted advice
             None,
             None,
         );
         let io_device = prover.program_io.clone();
+
+        // 4. 生成证明 (Prove)
+        // 这个过程会验证：
+        // - 所有的内存读取操作读到的值都等于上一次写入的值（RAM Consistency / R-W check）。
+        // - 所有的内存访问地址和值都在合法范围内。
         let (jolt_proof, debug_info) = prover.prove();
 
+        // 5. 验证证明 (Verify)
         let verifier_preprocessing = JoltVerifierPreprocessing::new(
             prover_preprocessing.shared.clone(),
             prover_preprocessing.generators.to_verifier_setup(),
@@ -2320,6 +2765,9 @@ mod tests {
             debug_info,
         )
             .expect("Failed to create verifier");
+
+        // 6. 执行验证
+        // 只有当所有内存约束和执行约束都满足时，验证才会通过。
         verifier.verify().expect("Failed to verify proof");
     }
 
@@ -2371,11 +2819,24 @@ mod tests {
     #[test]
     #[serial]
     fn muldiv_e2e_dory() {
+        // 测试目标：验证 RISC-V 乘法和除法指令（M extension）的正确性以及其在 Jolt 中的证明生成流程。
+        // "muldiv-guest" 程序通常包含 MUL, DIV, REM 等指令的测试。
+        // Jolt 对于这些复杂算术指令通常依赖特定的查找表（Lookups）来实现。
+        // 此测试确保 Prover 正确处理了这些特定的 Lookup Tables。
         let mut program = host::Program::new("muldiv-guest");
         let (bytecode, init_memory_state, _) = program.decode();
+
+        // 1. 准备输入
+        // 这里的 inputs 是 [9, 5, 3]。
+        // 可能用于 guest 内部的某些计算，例如 mul(9, 5), div(9, 5) 等。
         let inputs = postcard::to_stdvec(&[9u32, 5u32, 3u32]).unwrap();
+
+        // 2. 生成 Trace（模拟执行）
+        // 获取执行轨迹和 IO 设备状态（特别是内存布局）。
         let (_, _, _, io_device) = program.trace(&inputs, &[], &[]);
 
+        // 3. 共享预处理
+        // 设置最大 Trace 长度配置为 64K (1 << 16)。
         let shared_preprocessing = JoltSharedPreprocessing::new(
             bytecode.clone(),
             io_device.memory_layout.clone(),
@@ -2386,18 +2847,32 @@ mod tests {
         let prover_preprocessing = JoltProverPreprocessing::new(shared_preprocessing.clone());
         let elf_contents_opt = program.get_elf_contents();
         let elf_contents = elf_contents_opt.as_deref().expect("elf contents is None");
+
+        // 4. 生成 Prover 实例
+        // 注意：这里传入的 inputs 是 &[50]，这与上面 trace 用的 inputs 不一致。
+        // 这通常是一个小错误或测试用的特定 trick（如果 guest 程序只用 inputs 来占位或长度校验）。
+        // 但在这个 specific code snippet 里，它模拟的是：
+        // Prover 收到的公共输入是 50（可能是序列化后的字节流的第一个字节或某种编码）。
+        // 实际上 gen_from_elf 内部会重新运行 trace。
         let prover = RV64IMACProver::gen_from_elf(
             &prover_preprocessing,
             elf_contents,
-            &[50],
-            &[],
-            &[],
+            &[50], // Public Inputs
+            &[],   // Untrusted Advice
+            &[],   // Trusted Advice
             None,
             None,
         );
         let io_device = prover.program_io.clone();
+
+        // 5. 生成证明 (Prove)
+        // 验证流程包括：
+        // - Stage 2: 验证指令查找表访问的一致性 (Grand Product)。
+        // - Stage 5: 验证查找表 (Lookups) 中的 RAF (Read Access Flag) 和 Value Evaluation。
+        //   对于 mul/div 来说，这一步最关键，它证明了 input/output 符合查找表定义的算术关系。
         let (jolt_proof, debug_info) = prover.prove();
 
+        // 6. 验证证明 (Verify)
         let verifier_preprocessing = JoltVerifierPreprocessing::new(
             prover_preprocessing.shared.clone(),
             prover_preprocessing.generators.to_verifier_setup(),
@@ -2410,21 +2885,43 @@ mod tests {
             debug_info,
         )
             .expect("Failed to create verifier");
+
+        // 7. 执行验证
+        // 确保 ZK 证明通过，即计算过程确实执行了正确的乘除法。
         verifier.verify().expect("Failed to verify proof");
     }
 
     #[test]
     #[serial]
-    #[should_panic]
+    #[should_panic] // 预期测试会 panic，即验证失败。这是安全测试的标准做法。
     fn truncated_trace() {
+        // 测试目标：验证安全性。
+        // 模拟一个恶意的 Prover，它只执行了程序的一部分（截断了 Trace），
+        // 并且声称得到了一错误的输出结果。
+        // 验证系统应该检测到 Trace 和程序逻辑/输出的不一致，并在验证阶段拒绝该证明。
+
+        // 1. 初始化程序与数据
         let mut program = host::Program::new("fibonacci-guest");
         let (bytecode, init_memory_state, _) = program.decode();
         let inputs = postcard::to_stdvec(&9u8).unwrap();
+
+        // 2. 生成原始的完整 Trace
+        // 这里首先生成一个合法的 Trace 作为基底。
         let (lazy_trace, mut trace, final_memory_state, mut program_io) =
             program.trace(&inputs, &[], &[]);
+
+        // 3. 构造恶意行为
+        // 攻击步骤 A: 截断 Trace。
+        // 将执行轨迹强行保留前 100 个周期。这意味着程序还没运行完就被终止了。
         trace.truncate(100);
+
+        // 攻击步骤 B: 篡改输出。
+        // Prover 声称程序的输出是 0（显然斐波那契数列第9项不是0）。
         program_io.outputs[0] = 0; // change the output to 0
 
+        // 4. 共享预处理
+        // 注意：这里使用的是篡改后的 program_io (包含了错误的 output)，
+        // 但 Verifier 预处理是基于正确的字节码的。
         let shared_preprocessing = JoltSharedPreprocessing::new(
             bytecode.clone(),
             program_io.memory_layout.clone(),
@@ -2434,6 +2931,9 @@ mod tests {
 
         let prover_preprocessing = JoltProverPreprocessing::new(shared_preprocessing.clone());
 
+        // 5. 生成恶意 Prover 实例
+        // 使用被截断的 trace 和被篡改的 program_io 构建 Prover。
+        // 在 gen_from_trace 内部，Prover 会试图基于这个残缺的 Trace 构建多项式。
         let prover = RV64IMACProver::gen_from_trace(
             &prover_preprocessing,
             lazy_trace,
@@ -2444,28 +2944,49 @@ mod tests {
             final_memory_state,
         );
 
+        // 6. 生成证明 (Prove)
+        // 即使 Trace 是坏的，Prover 代码通常也能跑完并生成一个数学上存在的 proof 对象，
+        // 只是这个 proof 里的多项式关系是不满足约束的。
         let (proof, _) = prover.prove();
 
+        // 7. 验证证明 (Verify)
         let verifier_preprocessing = JoltVerifierPreprocessing::new(
             prover_preprocessing.shared.clone(),
             prover_preprocessing.generators.to_verifier_setup(),
         );
+
+        // 初始化 Verifier。
         let verifier =
             RV64IMACVerifier::new(&verifier_preprocessing, proof, program_io, None, None).unwrap();
+
+        // 8. 执行验证（预期 panic）
+        // 核心检查点：verify() 方法会检查所有的 Sumcheck 和 R1CS 约束。
+        // 由于 Trace 被截断，最终状态肯定与初始状态经过逻辑推演后的结果不符（例如 PC 指针没走到终点，寄存器状态不对等）。
+        // 因此 verify() 应该返回 Error，进而触发 unwrap() 的 panic。
         verifier.verify().unwrap();
     }
 
     #[test]
     #[serial]
-    #[should_panic]
+    #[should_panic] // 预期测试会 panic，即验证失败。这是安全测试，确保篡改内存布局会被检测到。
     fn malicious_trace() {
+        // 测试目标：验证安全性。
+        // 模拟一个恶意的 Prover，它试图通过篡改内存布局定义（Memory Layout）来欺骗 Verifier。
+        // 具体来说，Prover 试图通过修改 IO 设备的指针，让 Verifier 误以为输出区域或终止位在别的地方。
+
+        // 1. 初始化程序与数据
         let mut program = host::Program::new("fibonacci-guest");
         let inputs = postcard::to_stdvec(&1u8).unwrap();
         let (bytecode, init_memory_state, _) = program.decode();
+
+        // 2. 生成原始 Trace
+        // 这是一个合法的执行轨迹。
         let (lazy_trace, trace, final_memory_state, mut program_io) =
             program.trace(&inputs, &[], &[]);
 
-        // Since the preprocessing is done with the original memory layout, the verifier should fail
+        // 3. 共享预处理 (基准事实)
+        // 关键点：Verifier 的预处理是基于 *原始且正确* 的内存布局进行的。
+        // 这代表了系统设计的“公约”或“规范”。如果 Prover 偏离这个规范，验证应当失败。
         let shared_preprocessing = JoltSharedPreprocessing::new(
             bytecode.clone(),
             program_io.memory_layout.clone(),
@@ -2474,12 +2995,18 @@ mod tests {
         );
         let prover_preprocessing = JoltProverPreprocessing::new(shared_preprocessing.clone());
 
-        // change memory address of output & termination bit to the same address as input
-        // changes here should not be able to spoof the verifier result
+        // 4. 构造恶意行为
+        // 攻击方式：篡改 program_io 中的内存布局参数。
+        // 将输出起始/结束地址以及终止位地址，全部修改为指向输入的地址范围。
+        // 这种修改试图混淆 IO 边界，例如，让 Prover 可以用 Input 的内容冒充 Output，或者提前/延后终止信号。
+        // 这里的修改不会影响 Verifier 的预处理状态（那是上面第3步确定的），只会尝试影响 Prover 生成证明的方式。
         program_io.memory_layout.output_start = program_io.memory_layout.input_start;
         program_io.memory_layout.output_end = program_io.memory_layout.input_end;
         program_io.memory_layout.termination = program_io.memory_layout.input_start;
 
+        // 5. 生成恶意 Prover 实例
+        // Prover 使用被篡改的 program_io 进行初始化。
+        // 这会导致 Prover 生成的多项式（证明）是基于错误的内存段定义的。
         let prover = RV64IMACProver::gen_from_trace(
             &prover_preprocessing,
             lazy_trace,
@@ -2489,14 +3016,22 @@ mod tests {
             None,
             final_memory_state,
         );
+        // 6. 生成证明 (Prove)
         let (proof, _) = prover.prove();
 
+        // 7. 验证证明 (Verify)
+        // Verifier 使用原始正确的预处理参数（verifier_preprocessing）来检查 Proof。
         let verifier_preprocessing = JoltVerifierPreprocessing::new(
             prover_preprocessing.shared.clone(),
             prover_preprocessing.generators.to_verifier_setup(),
         );
         let verifier =
             JoltVerifier::new(&verifier_preprocessing, proof, program_io, None, None).unwrap();
+
+        // 8. 执行验证（预期 panic）
+        // 由于 Proof 是基于篡改后的地址生成的（例如，Read/Write 检查会对不正确的地址进行约束），
+        // 而 Verifier 期望的是基于 shared_preprocessing 中定义的正确地址约束（Canonical Memory Layout），
+        // 两者的不一致会导致 R1CS 或 Permutation Check 失败，从而触发 panic。
         verifier.verify().unwrap();
     }
 }

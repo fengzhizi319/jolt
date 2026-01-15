@@ -6,6 +6,7 @@ use tracer::instruction::{Cycle, Instruction};
 use tracer::utils::virtual_registers::VirtualRegisterAllocator;
 use tracer::LazyTraceIterator;
 
+/// Configuration for program runtime
 /// 运行时配置结构体。
 /// 用于保存 Guest 程序运行时的输入输出限制。
 #[derive(Debug, Clone)]
@@ -14,6 +15,7 @@ pub struct RuntimeConfig {
     pub max_output_size: u64, // 最大输出字节数
 }
 
+/// Guest program that handles decoding and tracing
 /// Guest 程序封装结构体。
 /// 不同于 host::Program (负责编译)，这里的 Program 这里主要处理已编译好的 ELF 二进制数据。
 /// 它负责协调解码、内存配置和执行追踪。
@@ -33,7 +35,7 @@ impl Program {
             elf: None,
         }
     }
-
+    /// Decode the ELF file into instructions and memory initialization
     /// 解码 ELF 数据。
     /// 将二进制指令转换为 Jolt 内部的指令结构体列表，并返回内存初始化数据。
     /// 返回值: (指令列表, 内存初始化数据[(地址, 字节)], 程序段大小)
@@ -41,6 +43,7 @@ impl Program {
         decode(&self.elf_contents)
     }
 
+    /// Trace the program execution with given inputs
     /// 执行程序并生成追踪（Trace）。
     /// 这是生成证明（Prove）前的关键步骤，它模拟程序的每一步执行。
     ///
@@ -107,6 +110,7 @@ pub fn decode(elf: &[u8]) -> (Vec<Instruction>, Vec<(u64, u8)>, u64) {
     // 创建虚拟寄存器分配器，用于处理需要临时寄存器的指令展开
     let allocator = VirtualRegisterAllocator::default();
 
+    // Expand virtual sequences
     // 展开虚拟指令序列 (Virtual Sequences)
     // 某些高级操作无法直接映射到单条 CPU 指令，需要展开为多条基础指令。
     instructions = instructions
