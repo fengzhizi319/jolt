@@ -608,11 +608,11 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         );
 
         // 2. 准备基本参数
-        let T = DoryGlobals::get_T(); // 填充后的 Trace 总长度2048
+        let T = DoryGlobals::get_T(); // 填充后的 Trace 总长度1820->2048
         // 获取所有需要在这一步提交的多项式定义（Schema）
         let polys = all_committed_polynomials(&self.one_hot_params);//41
         let row_len = DoryGlobals::get_num_columns(); // Dory 矩阵的列数（宽度）256
-        let num_rows = T / DoryGlobals::get_max_num_rows(); // Dory 矩阵的行数。16
+        let num_rows = T / DoryGlobals::get_max_num_rows(); // Dory 矩阵的行数。16=2048/128
 
         tracing::debug!(
            "Generating and committing {} witness polynomials with T={}, row_len={}, num_rows={}",
@@ -665,7 +665,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         // --------------------------------------------------------------------------
 
         // 1. 构造迭代器链，但不立即消费
-        // 如果 Trace 不足 T，用 NoOp 填充，并按行宽切分
+        // 如果 Trace 不足 T，用 NoOp 填充，并按行宽切分,
         let trace_stream = self
             .lazy_trace
             .clone()
@@ -680,16 +680,16 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         tracing::info!("=== 开始 witness 多项式生成与 Commit (单线程调试模式) ===");
         tracing::info!("Trace 长度 T: {}, Dory 行宽: {}, 总行数: {}", T, row_len, num_rows);
 
-        // 3. 外层循环：遍历每一“行”（Trace 的一个 Chunk）
+        // 3. 外层循环：遍历每一“行”（Trace 的一个 Chunk，每个chunk有很多个trace）
         for (row_idx, (chunk, row_tier1_commitments)) in zipped_iter {
             tracing::info!(">>> 正在处理第 {} 行 (Row Index)", row_idx);
             tracing::info!("    当前 Chunk 大小: {}", chunk.len());
             // tracing::debug!("polys： {:?}", polys); // 保留原有的 log
 
-            // 4. 内层循环：遍历每一个多项式
+
             // 此时已移除 par_iter，改为串行处理
             let mut row_results = Vec::with_capacity(polys.len());
-
+            // 4. 内层循环：遍历每承诺一个多项式，即把多个trace的对应列提出出来，计算commitment
             for (poly_idx, poly) in polys.iter().enumerate() {
                 // 打印多项式信息
                 tracing::info!("    -> 处理第 {} 个多项式: {:?}", poly_idx, poly);

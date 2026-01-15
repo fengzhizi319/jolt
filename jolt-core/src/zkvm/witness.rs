@@ -136,13 +136,19 @@ impl CommittedPolynomial {
                 let row: Vec<i128> = row_cycles
                     .iter()
                     .map(|cycle| {
-                        // 获取 rd (目标寄存器) 的写操作数据
+                        // 步骤 1: 获取 rd (目标寄存器) 的写操作信息
+                        // `rd_write()` 返回 Option<(RegisterIndex, PreValue, PostValue)>
+                        // 如果指令不写寄存器（如 STORE），返回 None，unwrap_or_default 后变成 (0, 0, 0)
                         let (_, pre_value, post_value) = cycle.rd_write().unwrap_or_default();
-                        // 计算增量：新值 - 旧值
+
+                        // 步骤 2: 计算数学差值
+                        // 使用 i128 防止溢出，并允许负数结果
                         post_value as i128 - pre_value as i128
                     })
                     .collect();
-                // 调用 PCS 处理密集数据块
+
+                // 步骤 3: 提交给 PCS (多项式承诺方案)
+                // 这是一个 "Dense" (密集) 数据块，直接处理具体数值
                 PCS::process_chunk(setup, &row)
             }
 
@@ -153,11 +159,12 @@ impl CommittedPolynomial {
                 let row: Vec<i128> = row_cycles
                     .iter()
                     .map(|cycle| match cycle.ram_access() {
-                        // 仅当发生 RAM 写操作时计算差值
+                        // 分支 A: 只有明确的写入操作 (Store系列指令) 才计算增量
                         tracer::instruction::RAMAccess::Write(write) => {
+                            // 计算公式：写入后的新值 - 写入前的旧值
                             write.post_value as i128 - write.pre_value as i128
                         }
-                        // 读操作或无操作不产生增量
+                        // 分支 B: 读取操作 (Load) 或 无内存操作 (ALU计算)
                         _ => 0,
                     })
                     .collect();
@@ -169,13 +176,21 @@ impl CommittedPolynomial {
             // 用于证明指令查找表的正确性。
 
             CommittedPolynomial::InstructionRa(idx) => {
+                // 步骤 1: 遍历当前批次的 CPU 周期 (Row Cycles)
                 let row: Vec<Option<usize>> = row_cycles
                     .iter() // 这里使用标准的 iter() 确保是单线程顺序执行，方便日志阅读
                     .map(|cycle| {
-                        // 将输入转换为全局查找索引 (128位大整数，输入x,y交错拼接，方便chunk查表)
+                        // 步骤 2: 生成查找表索引 (Lookup Index)
+                        // 每一个指令周期的输入操作数 (x, y) 此时被转化为一个巨大的整数 (128位)。
+                        // 关键点：这个索引仅由操作数决定，不包含 Opcode。
                         let lookup_index = LookupQuery::<XLEN>::to_lookup_index(cycle);
-                        // 提取第 idx 个块的值，即获取了查表chunk的输入
+
+                        // 步骤 3: 切片提取 (Chunking)
+                        // 将巨大的 lookup_index 切分为若干小段 (chunks)。
+                        // 'idx' 参数指定我们要提取第几段 (例如第0段是低16位)。
+                        // Jolt 使用这种方式避免构建大小为 2^128 的不可能存在的表，而是构建多个 2^16 的小子表。
                         let chunk_val = one_hot_params.lookup_index_chunk(lookup_index, *idx) as usize;
+
 
                         // 详细打印调试信息：
                         // idx: 当前正在处理第几个切片（Chunk）
@@ -189,6 +204,8 @@ impl CommittedPolynomial {
                                         chunk_val
                                     );
 
+                        // 步骤 4: 记录证明数据 (Witness)
+                        // 这里返回的 chunk_val 稍后将通过 One-Hot 编码进行承诺。
                         Some(chunk_val)
                     })
                     .collect();
@@ -203,9 +220,14 @@ impl CommittedPolynomial {
                 let row: Vec<Option<usize>> = row_cycles
                     .iter()
                     .map(|cycle| {
-                        // 从预处理数据中获取该周期的 PC 值
+                        // 步骤 1: 获取当前周期的真实 PC 值
+                        // Jolt 在预处理阶段 (Preprocessing) 已经记录了每一行代码对应的 PC。
                         let pc = preprocessing.bytecode.get_pc(cycle);
-                        // 提取 PC 地址的第 idx 个块
+
+                        // 步骤 2: 切片 (Chunking)
+                        // 将巨大的 PC 地址 (如 64位) 切分成多个小段 (如 16位一段)。
+                        // idx 参数决定了我们要取哪一段。
+                        // 比如 idx=0 取低16位，idx=1 取次低16位...
                         Some(one_hot_params.bytecode_pc_chunk(pc, *idx) as usize)
                     })
                     .collect();
@@ -219,12 +241,22 @@ impl CommittedPolynomial {
                 let row: Vec<Option<usize>> = row_cycles
                     .iter()
                     .map(|cycle| {
-                        // 获取物理地址并重新映射（Remap）到连续空间
-                        remap_address(
-                            cycle.ram_access().address() as u64,
-                            &preprocessing.memory_layout,
-                        )
-                            // 提取重映射地址的第 idx 个块
+                        // 步骤 1: 获取原始物理地址 (Get Raw Address)
+                        // 从当前 cycle 中提取涉及的内存地址。
+                        // 如果是 RAM 指令 (LB, SW)，则是计算出的实际地址；
+                        // 如果是 ALU 指令 (ADD)，这里通常是 0 或无效值。
+                        let raw_addr = cycle.ram_access().address() as u64;
+
+                        // 步骤 2: 地址重映射 (Remap Address)
+                        // 虚拟机的地址空间很大 (如 64位)，但实际使用的内存是稀疏的 (代码段、堆、栈)。
+                        // remap_address 将稀疏的物理地址映射到连续的、较小的证明系统索引空间。
+                        // 关键点：如果当前 cycle 不涉及 RAM 访问，或者地址非法，这里会返回 None。
+                        remap_address(raw_addr, &preprocessing.memory_layout)
+
+                            // 步骤 3: 地址切片 (Chunking)
+                            // map 仅在 remap_address 成功(Some)时执行。
+                            // 将重映射后的地址切分为多个小块 (Chunk)。
+                            // idx 参数指定我们当前关注的是第几块 (比如低 16 位)。
                             .map(|address| one_hot_params.ram_address_chunk(address, *idx) as usize)
                     })
                     .collect();
