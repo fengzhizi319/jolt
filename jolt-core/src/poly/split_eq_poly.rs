@@ -80,63 +80,81 @@ pub struct GruenSplitEqPolynomial<F: JoltField> {
 }
 
 impl<F: JoltField> GruenSplitEqPolynomial<F> {
-    #[tracing::instrument(skip_all, name = "GruenSplitEqPolynomial::new_with_scaling")]
-    pub fn new_with_scaling(
-        w: &[F::Challenge],
-        binding_order: BindingOrder,
-        scaling_factor: Option<F>,
-    ) -> Self {
-        match binding_order {
-            BindingOrder::LowToHigh => {
-                let m = w.len() / 2;
-                //   w = [w_out, w_in, w_last]
-                //         ↑      ↑      ↑
-                //         |      |      |
-                //         |      |      last element
-                //         |      second half of remaining elements (for E_in)
-                //         first half of remaining elements (for E_out)
-                let (_w_last, wprime) = w.split_last().unwrap();
-                let (w_out, w_in) = wprime.split_at(m);
-                // evals_cached returns (n+1) tables where index k = eq over k vars.
-                // E_*_vec[0] = [1] already.
-                let (E_out_vec, E_in_vec) = rayon::join(
-                    || EqPolynomial::evals_cached(w_out),
-                    || EqPolynomial::evals_cached(w_in),
-                );
-                Self {
-                    current_index: w.len(),
-                    current_scalar: scaling_factor.unwrap_or(F::one()),
-                    w: w.to_vec(),
-                    E_in_vec,
-                    E_out_vec,
-                    binding_order,
-                }
-            }
-            BindingOrder::HighToLow => {
-                // For high-to-low binding, we bind from MSB (index 0) to LSB (index n-1).
-                // The split should be: w_in = first half, w_out = second half
-                // [w_first, w_in, w_out]
-                let (_, wprime) = w.split_first().unwrap();
-                let m = w.len() / 2;
-                let (w_in, w_out) = wprime.split_at(m);
-                // evals_cached_rev returns (n+1) tables where index k = eq over k vars.
-                // E_*_vec[0] = [1] already.
-                let (E_in_vec, E_out_vec) = rayon::join(
-                    || EqPolynomial::evals_cached_rev(w_in),
-                    || EqPolynomial::evals_cached_rev(w_out),
-                );
+#[tracing::instrument(skip_all, name = "GruenSplitEqPolynomial::new_with_scaling")]
+///针对一个挑战点tau，计算eq(w, tau)的2个预计算表 E_out_vec 和 E_in_vec
+pub fn new_with_scaling(
+    w: &[F::Challenge],          // 随机挑战点向量，例如 [r0, r1, ..., rn]
+    binding_order: BindingOrder, // 绑定顺序：从低位到高位 或 从高位到低位
+    scaling_factor: Option<F>,   // 可选的初始乘数因子
+) -> Self {
+    match binding_order {
+        // 场景 1: 从最后（最内层）的变量开始绑定 (通常用于标准 Sumcheck)
+        // 逻辑上的结构: multilinear(x_0, ..., x_{n-1}, x_n) -> 此时先处理 x_n
+        BindingOrder::LowToHigh => {
+            let m = w.len() / 2;
 
-                Self {
-                    current_index: 0, // Start from 0 for high-to-low up to w.len() - 1
-                    current_scalar: scaling_factor.unwrap_or(F::one()),
-                    w: w.to_vec(),
-                    E_in_vec,
-                    E_out_vec,
-                    binding_order,
-                }
+            // 拆分逻辑：
+            // w 向量被视为 [ w_out, w_in, w_last ]
+            // 1. split_last(): 剥离最后一个元素作为 w_last（当前正在被 Sumcheck 协议处理的变量）
+            //    wprime 是剩下的部分。
+            let (_w_last, wprime) = w.split_last().unwrap();
+
+            // 2. split_at(m): 将剩下的部分均分为两半，分别作为 "外部部分" 和 "内部部分"
+            //    w_out: 前一半变量
+            //    w_in:  后一半变量
+            let (w_out, w_in) = wprime.split_at(m);
+
+            // 3. 预计算 Partial Eq Tables
+            //    这里并行计算了这两个子向量对应的 Eq 多项式的所有前缀和。
+            //    evals_cached 会生成一个表，包含 [Eq(0 vars), Eq(1 var), ... Eq(k vars)]
+            let (E_out_vec, E_in_vec) = rayon::join(
+                || EqPolynomial::evals_cached(w_out),
+                || EqPolynomial::evals_cached(w_in),
+            );
+
+            Self {
+                current_index: w.len(), // 当前处理进度的索引，初始化为最大长度
+                current_scalar: scaling_factor.unwrap_or(F::one()),
+                w: w.to_vec(),
+                E_in_vec,
+                E_out_vec,
+                binding_order,
+            }
+        }
+
+        // 场景 2: 从第一个（最外层）的变量开始绑定
+        // 逻辑上的结构: multilinear(x_0, x_1, ..., x_n) -> 此时先处理 x_0
+        BindingOrder::HighToLow => {
+            // 拆分逻辑：
+            // w 向量被视为 [ w_first, w_in, w_out ]
+
+            // 1. split_first(): 剥离第一个元素作为 w_first（因为这是要第一个被处理的）
+            let (_, wprime) = w.split_first().unwrap();
+
+            let m = w.len() / 2;
+
+            // 2. 将剩余部分拆分
+            //    注意这里 w_in 对应前半部分，w_out 对应后半部分
+            let (w_in, w_out) = wprime.split_at(m);
+
+            // 3. 预计算 Partial Eq Tables (使用 Reverse 模式)
+            //    evals_cached_rev 可能是计算后缀或者为了配合从高位绑定的特殊顺序。
+            let (E_in_vec, E_out_vec) = rayon::join(
+                || EqPolynomial::evals_cached_rev(w_in),
+                || EqPolynomial::evals_cached_rev(w_out),
+            );
+
+            Self {
+                current_index: 0, // 当前处理进度的索引，初始化为 0
+                current_scalar: scaling_factor.unwrap_or(F::one()),
+                w: w.to_vec(),
+                E_in_vec,
+                E_out_vec,
+                binding_order,
             }
         }
     }
+}
 
     #[tracing::instrument(skip_all, name = "GruenSplitEqPolynomial::new")]
     pub fn new(w: &[F::Challenge], binding_order: BindingOrder) -> Self {

@@ -892,6 +892,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         // 从 Transcript 中获取随机挑战（challenge），这通常对应 Spartan 协议中 "Outer Sumcheck" 的初始随机数。
         // 这些参数决定了 Sumcheck 验证的具体多项式形式。
         let uni_skip_params = OuterUniSkipParams::new(&self.spartan_key, &mut self.transcript);
+        println!("uni_skip_params.tau: {:?}", uni_skip_params.tau);
 
         // 2. 初始化 UniSkip Prover：
         // 使用执行轨迹（Trace）和程序的字节码来初始化 Prove 过程。

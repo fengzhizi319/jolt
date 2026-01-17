@@ -128,26 +128,52 @@ pub struct OuterUniSkipProver<F: JoltField> {
 
 impl<F: JoltField> OuterUniSkipProver<F> {
     #[tracing::instrument(skip_all, name = "OuterUniSkipInstanceProver::initialize")]
+    /// 初始化 OuterUniSkipInstance 证明者实例。
+    ///
+    /// 该函数是在 Sumcheck 协议开始前调用的，用于准备证明所需的数据结构。
+    /// 它主要负责根据验证者提供的随机挑战点 `tau`，预先计算 Trace 多项式在这一点的评估值。
+    ///
+    /// # 参数
+    ///
+    /// * `params`: 包含协议参数，最重要的是 `tau` (随机挑战向量，通常来自上一轮 Sumcheck 或 Fiat-Shamir 变换)。
+    /// * `trace`: 程序的执行轨迹 (Execution Trace)，包含了每一步的 CPU 状态 (Cycle)。
+    /// * `bytecode_preprocessing`: 对程序字节码的静态预处理信息 (如指令解码信息)，用于辅助多项式评估。
+    ///
+    /// # 返回值
+    ///
+    /// 返回一个初始化的 `Self` (即 `OuterUniSkipInstance`)，包含后续 Sumcheck 步骤所需的所有状态。
     pub fn initialize(
         params: OuterUniSkipParams<F>,
         trace: &[Cycle],
         bytecode_preprocessing: &BytecodePreprocessing,
     ) -> Self {
+        // 核心步骤：计算扩展评估值 (Extended Evaluations)。
+        // 算法逻辑：
+        // 这里的 `tau` 是一个多线性扩展的随机挑战点（Random Challenge Point）。
+        // 函数会根据 Bytecode 信息和动态的 Trace 数据，计算出相关多项式（可能是由 Trace 列构成的多项式）
+        // 在该随机点 `tau` 上的值 (或者其某种形式的投影/扩展)。
+        // 这些值是后续进行线性时间 Sumcheck (Linear-time Sumcheck) 的基础。
+        // "Univariate Skip" 暗示这里可能涉及对 Trace 中某些行或逻辑的跳过处理，或者是一种基于单变量多项式的优化技术。
         let extended = Self::compute_univariate_skip_extended_evals(
-            bytecode_preprocessing,
-            trace,
-            &params.tau,
+            bytecode_preprocessing, // 用于确定每行 Trace 对应的具体计算逻辑（指令行为）
+            trace,                  // 实际的 Witness 数据
+            &params.tau,            // 随机评估点
         );
 
+        // 构建实例结构体
         let instance = Self {
-            params,
-            extended_evals: extended,
-            r0: None,
-            uni_poly: None,
+            params,                  // 保存参数以便后续轮次使用
+            extended_evals: extended,// 保存计算好的评估值，Sumcheck 过程中会不断折叠(fold)这些值
+            r0: None,                // 初始化状态，r0 可能用于存储某一轮的随机数，此时尚未生成
+            uni_poly: None,          // 初始化状态，缓存当前轮次生成的单变量多项式
         };
 
+        // 调试/性能分析：
+        // 如果开启了 "allocative" 特性，则打印该结构体的堆内存使用情况。
+        // 这对于优化大规模 ZK 证明器的内存消耗非常重要。
         #[cfg(feature = "allocative")]
         print_data_structure_heap_usage("OuterUniSkipInstance", &instance);
+
         instance
     }
 
@@ -165,57 +191,127 @@ impl<F: JoltField> OuterUniSkipProver<F> {
     ///
     /// \sum_{x_in'} eq(tau_in, (x_in', 0)) * Az(x_out, x_in', 0, y) * Bz(x_out, x_in', 0, y)
     ///     + eq(tau_in, (x_in', 1)) * Az(x_out, x_in', 1, y) * Bz(x_out, x_in', 1, y)
+    /// 计算单变量跳跃多项式（univariate skip polynomial）在扩展域上的评估值。
+    ///
+    /// 目标是计算：
+    /// t_1(y) = \sum_{x_out} eq(tau_out, x_out) * \sum_{x_in} eq(tau_in, x_in) * Az(x_out, x_in, y) * Bz(x_out, x_in, y)
+    ///
+    /// 其中：
+    /// - y: 在扩展域 {−D..D} 中的点（基窗口之外）。
+    /// - x_in 的最后一个比特对应约束的分组（Group Index）。这意味着我们将约束分为了两半。
+    /// - x_in 的其余比特与 x_out 组合，对应实际的 Trace 步骤（Step Index）。
+    ///
+    /// 具体的计算逻辑如下：
+    /// \sum_{x_in'} eq(tau_in, (x_in', 0)) * Az(x_out, x_in', 0, y) * Bz(x_out, x_in', 0, y)
+    ///     + eq(tau_in, (x_in', 1)) * Az(x_out, x_in', 1, y) * Bz(x_out, x_in', 1, y)
     fn compute_univariate_skip_extended_evals(
-        bytecode_preprocessing: &BytecodePreprocessing,
-        trace: &[Cycle],
-        tau: &[F::Challenge],
-    ) -> [F; OUTER_UNIVARIATE_SKIP_DEGREE] {
-        // Build split-eq over full τ; new_with_scaling drops the last variable (τ_high) for the split,
-        // and we carry an outer scaling factor (R^2) via current_scalar.
+        bytecode_preprocessing: &BytecodePreprocessing, // 预处理数据（包含矩阵 A, B, C 的结构信息）
+        trace: &[Cycle],                                // 执行轨迹（CPU 每一周期的状态）
+        tau: &[F::Challenge],                           // Sum-Check 的随机挑战点向量
+    ) -> [F; OUTER_UNIVARIATE_SKIP_DEGREE] {            // 返回值：多项式在特定点（通常是 0, 1, ...）的评估值
+
+        // -------------------------------------------------------------------
+        // 1. 初始化 Gruen 分裂 Eq 多项式生成器，建立缓存预计算表
+        // -------------------------------------------------------------------
+        // 原理：eq(τ, x) 可以分解为 eq(τ_high, x_high) * eq(τ_low, x_low)。
+        // split_eq 负责管理这种分解，使得我们可以并行处理高位，利用 L3 缓存处理低位。
         let split_eq = GruenSplitEqPolynomial::<F>::new_with_scaling(
             tau,
             BindingOrder::LowToHigh,
-            Some(F::MONTGOMERY_R_SQUARE),
+            Some(F::MONTGOMERY_R_SQUARE), // 初始乘子设为 R^2，用于抵消蒙哥马利约简的因子
         );
-        let outer_scale = split_eq.get_current_scalar(); // = R^2 at this stage
 
+        // 获取当前的外部缩放因子（此处初始为 R^2，用于修正后续蒙哥马利约简的系数）
+        let outer_scale = split_eq.get_current_scalar();
+
+        // -------------------------------------------------------------------
+        // 2. 计算维度与并行参数
+        // -------------------------------------------------------------------
+        // num_x_in_bits: "In" (内层循环) 的比特数，由 split_eq 根据 CPU 缓存大小自动计算。
         let num_x_in_bits = split_eq.E_in_current_len().log_2();
-        let num_x_in_prime_bits = num_x_in_bits.saturating_sub(1); // ignore last bit (group index)
 
+        // num_x_in_prime_bits: 真实的 Trace 索引在 "In" 部分占用的比特数。
+        // 关键点：因为 Jolt 将约束分为两组，使用索引的最低位 (LSB) 作为选择位。
+        // 所以，实际映射到 Trace 行号的比特数需要减 1。
+        let num_x_in_prime_bits = num_x_in_bits.saturating_sub(1);
+
+        // -------------------------------------------------------------------
+        // 3. 并行折叠 (Parallel Fold) - 核心计算循环
+        // -------------------------------------------------------------------
         split_eq
             .par_fold_out_in(
+                // A. 初始化累加器：每个线程拥有一个全零数组
                 || [Acc8S::<F>::zero(); OUTER_UNIVARIATE_SKIP_DEGREE],
+
+                // B. 核心折叠逻辑 (Folder)
+                // inner: 当前线程的累加器
+                // g: 全局索引 (对应 x 的高位部分)
+                // x_in: 局部索引 (对应 x 的低位部分)
+                // e_in: 预计算好的 eq(τ_in, x_in) 的值
                 |inner, g, x_in, e_in| {
-                    // Decode (x_out, x_in') from g and choose group by the last x_in bit
+                    // --- 步骤 I: 索引解码 (Mapping) ---
+
+                    // x_out 是高位索引
                     let x_out = g >> num_x_in_bits;
+
+                    // x_in_prime 是低位索引中属于 "行号" 的部分
+                    // ">> 1" 操作移除了最低位 (LSB)，该位用于 Group 选择
                     let x_in_prime = x_in >> 1;
+
+                    // 拼接高位和低位，算出当前是在处理 Trace 的第几行 (Cycle Index)
                     let base_step_idx = (x_out << num_x_in_prime_bits) | x_in_prime;
 
+                    // --- 步骤 II: 实时计算 Az, Bz (On-the-fly) ---
+
+                    // 根据行号 base_step_idx，从 Trace 中读取该周期的寄存器/内存值
+                    // 这重建了 R1CS 的输入向量 z (大小为 Trace 列数相关)
                     let row_inputs = R1CSCycleInputs::from_trace::<F>(
                         bytecode_preprocessing,
                         trace,
                         base_step_idx,
                     );
+
+                    // 构建评估器，准备计算矩阵乘法
                     let eval = R1CSEval::<F>::from_cycle_inputs(&row_inputs);
 
+                    // --- 步骤 III: 分组选择 (Group Selection) ---
+
+                    // 检查 x_in 的最低位 (LSB)。
+                    // 1 -> Group 1 (第二组约束)
+                    // 0 -> Group 0 (第一组约束)
                     let is_group1 = (x_in & 1) == 1;
+
+                    // --- 步骤 IV: 累加多项式评估值 ---
+
+                    // 遍历扩展域上的点 j (通常 j=0..degree)
                     for j in 0..OUTER_UNIVARIATE_SKIP_DEGREE {
+                        // 计算 Az(j) * Bz(j)。
+                        // Jolt 为了优化内存布局，将约束矩阵切分成了 First Group 和 Second Group。
                         let prod_s192 = if !is_group1 {
                             eval.extended_azbz_product_first_group(j)
                         } else {
                             eval.extended_azbz_product_second_group(j)
                         };
+
+                        // 执行加权累加： inner[j] += e_in * prod
+                        // e_in 是当前行的 eq 多项式权重
                         inner[j].fmadd(&e_in, &prod_s192);
                     }
                 },
+
+                // C. 归约器 (Reducer): 处理外层权重 eq(τ_out, x_out)
                 |_x_out, e_out, inner| {
                     let mut out = [F::Unreduced::<9>::zero(); OUTER_UNIVARIATE_SKIP_DEGREE];
                     for j in 0..OUTER_UNIVARIATE_SKIP_DEGREE {
+                        // 蒙哥马利约简，将累加器转回标准域
                         let reduced = inner[j].montgomery_reduce();
+                        // 乘以外部权重 e_out
                         out[j] = e_out.mul_unreduced::<9>(reduced);
                     }
                     out
                 },
+
+                // D. 合并器 (Consumer): 将所有并行的结果加在一起
                 |mut a, b| {
                     for j in 0..OUTER_UNIVARIATE_SKIP_DEGREE {
                         a[j] += b[j];
@@ -223,6 +319,7 @@ impl<F: JoltField> OuterUniSkipProver<F> {
                     a
                 },
             )
+            // 4. 最终修正：乘以初始缩放因子
             .map(|x| F::from_montgomery_reduce::<9>(x) * outer_scale)
     }
 }
@@ -398,7 +495,7 @@ impl<F: JoltField> OuterRemainingSumcheckVerifier<F> {
 }
 
 impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
-    for OuterRemainingSumcheckVerifier<F>
+for OuterRemainingSumcheckVerifier<F>
 {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         &self.params
@@ -494,7 +591,7 @@ impl<F: JoltField> OuterStreamingProverParams<F> {
 }
 
 pub type OuterRemainingStreamingSumcheck<F, S> =
-    StreamingSumcheck<F, S, OuterSharedState<F>, OuterStreamingWindow<F>, OuterLinearStage<F>>;
+StreamingSumcheck<F, S, OuterSharedState<F>, OuterStreamingWindow<F>, OuterLinearStage<F>>;
 
 #[derive(Allocative)]
 pub struct OuterSharedState<F: JoltField> {
