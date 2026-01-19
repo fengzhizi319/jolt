@@ -199,67 +199,117 @@ impl From<&JoltR1CSInputs> for OpeningId {
 pub struct R1CSCycleInputs {
     /// Left instruction input as a u64 bit-pattern.
     /// Typically `Rs1Value` or the current `UnexpandedPC`, depending on `CircuitFlags`.
+    /// 指令的左操作数，作为 u64 位模式存储。
+    /// 根据电路标志 (`CircuitFlags`) 的不同，这通常是源寄存器 1 的值 (`Rs1Value`) 或者当前的程序计数器 `UnexpandedPC` (例如在 AUIPC 指令中)。
     pub left_input: u64,
+
     /// Right instruction input as signed-magnitude `S64`.
     /// Typically `Imm` or `Rs2Value` with exact integer semantics.
+    /// 指令的右操作数，使用符号-幅值表示法 (`S64`) 存储。
+    /// 通常是立即数 (`Imm`) 或者源寄存器 2 的值 (`Rs2Value`)，保留了精确的整数语义（用于算术运算）。
     pub right_input: S64,
+
     /// Signed-magnitude `S128` product consistent with the `Product` witness.
     /// Computed from `left_input` × `right_input` using the same truncation semantics as the witness.
+    /// 符号-幅值表示的 128 位乘积 (`S128`)，与电路中的 `Product` 见证变量一致。
+    /// 它是通过 `left_input` × `right_input` 计算得出的，并且使用了与见证生成阶段完全相同的截断语义（用于处理乘法溢出等情况）。
     pub product: S128,
 
     /// Left lookup operand (u64) for the instruction lookup query.
     /// Matches `LeftLookupOperand` virtual polynomial semantics.
+    /// 用于指令查找查询（Lookup Query）的左操作数 (u64)。
+    /// 对应于 `LeftLookupOperand` 虚拟多项式的语义。在位运算等操作中，这是查找表的输入之一。
     pub left_lookup: u64,
+
     /// Right lookup operand (u128) for the instruction lookup query.
     /// Full-width integer encoding used by add/sub/mul/advice cases.
+    /// 用于指令查找查询的右操作数 (u128)。
+    /// 在加法/减法/乘法/Advice 等情况中使用的全宽整数编码。
     pub right_lookup: u128,
+
     /// Instruction lookup output (u64) for this cycle.
+    /// 当前周期的指令查找输出 (u64)。
+    /// 这是查找表返回的结果，通常也是指令的计算结果（如 ADD 的结果，或 EQ 的布尔值）。
     pub lookup_output: u64,
 
     /// Value read from Rs1 in this cycle.
+    /// 本周期从源寄存器 Rs1 读取的值。
     pub rs1_read_value: u64,
+
     /// Value read from Rs2 in this cycle.
+    /// 本周期从源寄存器 Rs2 读取的值。
     pub rs2_read_value: u64,
+
     /// Value written to Rd in this cycle.
+    /// 本周期写入目标寄存器 Rd 的值。
     pub rd_write_value: u64,
 
     /// RAM address accessed this cycle.
+    /// 本周期访问的 RAM 地址。
     pub ram_addr: u64,
+
     /// RAM read value for `Read`, pre-write value for `Write`, or 0 for `NoOp`.
+    /// 对于 `Read` 操作，这是读取到的值；对于 `Write` 操作，这是写入前的旧值（用于内存一致性检查）；对于 `NoOp` (无访存)，为 0。
     pub ram_read_value: u64,
+
     /// RAM write value: equals read value for `Read`, post-write value for `Write`, or 0 for `NoOp`.
+    /// 内存写入值：对于 `Read` 操作，它等于读取值（表示值未变）；对于 `Write` 操作，它是写入后的新值；对于 `NoOp`，为 0。
     pub ram_write_value: u64,
 
     /// Expanded PC used by bytecode instance.
+    /// 字节码实例使用的扩展 PC（物理 PC）。包含程序段前缀等信息，用于从只读内存中取指。
     pub pc: u64,
+
     /// Expanded PC for next cycle, or 0 if this is the last cycle in the domain.
+    /// 下一个周期的扩展 PC。如果这是执行域的最后一个周期，则为 0。
     pub next_pc: u64,
+
     /// Unexpanded PC (normalized instruction address) for this cycle.
+    /// 本周期的未扩展 PC（标准化的指令地址）。這是 CPU 视角的虚拟地址，例如 0x1000, 0x1004。
     pub unexpanded_pc: u64,
+
     /// Unexpanded PC for next cycle, or 0 if this is the last cycle in the domain.
+    /// 下一个周期的未扩展 PC。用于验证跳转逻辑是否正确。
     pub next_unexpanded_pc: u64,
 
     /// Immediate operand as signed-magnitude `S64`.
+    /// 立即数操作数，使用符号-幅值 `S64` 存储。
     pub imm: S64,
 
     /// Per-instruction circuit flags indexed by `CircuitFlags`.
+    /// 每个指令的电路标志位数组，通过 `CircuitFlags`枚举索引。
+    /// 包含了如 `IsAdd`, `IsLoad`, `IsJump` 等布尔标志，用于控制约束系统的选择逻辑。
     pub flags: [bool; NUM_CIRCUIT_FLAGS],
+
     /// `IsNoop` flag for the next cycle (false for last cycle).
+    /// 下一个周期是否为 `NoOp`（空操作）的标志。用于处理 Padding 行或程序结束的情况。
     pub next_is_noop: bool,
 
     /// Derived: `Jump && !NextIsNoop`.
+    /// 派生字段：是否应该发生跳转。逻辑为 `Jump` 指令且下一条指令不是填充的 `NoOp`。
     pub should_jump: bool,
+
     /// Derived: `Branch && (LookupOutput == 1)`.
+    /// 派生字段：是否应该执行分支跳转。逻辑为当前是分支指令 (`Branch`) 且比较结果为真 (`LookupOutput == 1`)。
     pub should_branch: bool,
 
     /// `IsRdNotZero` && ` `WriteLookupOutputToRD`
+    /// 派生字段：是否将 Lookup 的结果写入 RD 寄存器。
+    /// 仅当指令需要写回结果 (`WriteLookupOutputToRD`) 且目标寄存器索引非零 (`IsRdNotZero`, 即不是 x0) 时为真。
     pub write_lookup_output_to_rd_addr: bool,
+
     /// `IsRdNotZero` && `Jump`
+    /// 派生字段：是否将 PC 值（通常是返回地址）写入 RD 寄存器。
+    /// 用于 JAL/JALR 指令，且仅当 RD != x0 时为真。
     pub write_pc_to_rd_addr: bool,
 
     /// `VirtualInstruction` flag for the next cycle (false for last cycle).
+    /// 下一个周期是否属于虚拟指令及其序列的标志。
+    /// Jolt 将复杂指令拆解为微指令序列，此标志用于维护序列内部 PC 的连续性。
     pub next_is_virtual: bool,
+
     /// `FirstInSequence` flag for the next cycle (false for last cycle).
+    /// 下一个周期是否是新指令序列的第一条指令。用于界定微指令序列的边界。
     pub next_is_first_in_sequence: bool,
 }
 

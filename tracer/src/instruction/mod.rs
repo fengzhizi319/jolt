@@ -310,10 +310,16 @@ impl From<()> for RAMAccess {
 
 #[derive(Default)]
 pub struct NormalizedInstruction {
+    /// 指令所在的内存地址（程序计数器 PC 的值）。
     pub address: usize,
+    /// 标准化后的操作数，包含 rd, rs1, rs2, imm 等，统一格式以便处理。
     pub operands: NormalizedOperands,
+    /// 如果该指令属于一个虚拟指令序列（宏指令展开），此字段表示后续还剩多少条指令待执行。
+    /// `None` 表示这是一个普通的单条指令，不是序列的一部分。
     pub virtual_sequence_remaining: Option<u16>,
+    /// 标记该指令是否为一个虚拟指令序列（宏指令展开）的第一条指令。
     pub is_first_in_sequence: bool,
+    /// 标记该指令原始形式是否为压缩指令（16位，RVC扩展）。
     pub is_compressed: bool,
 }
 

@@ -81,7 +81,8 @@ pub struct GruenSplitEqPolynomial<F: JoltField> {
 
 impl<F: JoltField> GruenSplitEqPolynomial<F> {
 #[tracing::instrument(skip_all, name = "GruenSplitEqPolynomial::new_with_scaling")]
-///针对一个挑战点tau，计算eq(w, tau)的2个预计算表 E_out_vec 和 E_in_vec
+///针对一个挑战点tau，计算eq(w, tau)的2个预计算表 E_out_vec 和 E_in_vec.除掉最高位的变量w_last
+/// w_last 是最后一个变量，它表示约束的组数，所以不参与计算
 pub fn new_with_scaling(
     w: &[F::Challenge],          // 随机挑战点向量，例如 [r0, r1, ..., rn]
     binding_order: BindingOrder, // 绑定顺序：从低位到高位 或 从高位到低位
@@ -96,6 +97,7 @@ pub fn new_with_scaling(
             // 拆分逻辑：
             // w 向量被视为 [ w_out, w_in, w_last ]
             // 1. split_last(): 剥离最后一个元素作为 w_last（当前正在被 Sumcheck 协议处理的变量）
+            //因为约束分为2组，所以最后一个变量表示组数，所以单独剥离出来
             //    wprime 是剩下的部分。
             let (_w_last, wprime) = w.split_last().unwrap();
 

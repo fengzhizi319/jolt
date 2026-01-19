@@ -681,7 +681,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         tracing::info!("Trace 长度 T: {}, Dory 行宽: {}, 总行数: {}", T, row_len, num_rows);
 
         // 3. 外层循环：遍历每一“行”（Trace 的一个 Chunk，每个chunk有很多个trace）
-        for (row_idx, (chunk, row_tier1_commitments)) in zipped_iter {
+        for (_row_idx, (chunk, row_tier1_commitments)) in zipped_iter {
             //tracing::info!(">>> 正在处理第 {} 行 (Row Index)", row_idx);
             //tracing::info!("    当前 Chunk 大小: {}", chunk.len());
             // tracing::debug!("polys： {:?}", polys); // 保留原有的 log
@@ -690,7 +690,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             // 此时已移除 par_iter，改为串行处理
             let mut row_results = Vec::with_capacity(polys.len());
             // 4. 内层循环：遍历每承诺一个多项式，即把多个trace的对应列提出出来，计算commitment
-            for (poly_idx, poly) in polys.iter().enumerate() {
+            for (_poly_idx, poly) in polys.iter().enumerate() {
                 // 打印多项式信息
                 //tracing::info!("    -> 处理第 {} 个多项式: {:?}", poly_idx, poly);
 

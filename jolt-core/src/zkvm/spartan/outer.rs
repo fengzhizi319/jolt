@@ -214,7 +214,7 @@ impl<F: JoltField> OuterUniSkipProver<F> {
         // 1. 初始化 Gruen 分裂 Eq 多项式生成器，建立缓存预计算表
         // -------------------------------------------------------------------
         // 原理：eq(τ, x) 可以分解为 eq(τ_high, x_high) * eq(τ_low, x_low)。
-        // split_eq 负责管理这种分解，使得我们可以并行处理高位，利用 L3 缓存处理低位。
+
         let split_eq = GruenSplitEqPolynomial::<F>::new_with_scaling(
             tau,
             BindingOrder::LowToHigh,
@@ -227,7 +227,7 @@ impl<F: JoltField> OuterUniSkipProver<F> {
         // -------------------------------------------------------------------
         // 2. 计算维度与并行参数
         // -------------------------------------------------------------------
-        // num_x_in_bits: "In" (内层循环) 的比特数，由 split_eq 根据 CPU 缓存大小自动计算。
+        // num_x_in_bits: "In" (内层循环) 的比特数
         let num_x_in_bits = split_eq.E_in_current_len().log_2();
 
         // num_x_in_prime_bits: 真实的 Trace 索引在 "In" 部分占用的比特数。
@@ -238,6 +238,7 @@ impl<F: JoltField> OuterUniSkipProver<F> {
         // -------------------------------------------------------------------
         // 3. 并行折叠 (Parallel Fold) - 核心计算循环
         // -------------------------------------------------------------------
+
         split_eq
             .par_fold_out_in(
                 // A. 初始化累加器：每个线程拥有一个全零数组
@@ -321,7 +322,71 @@ impl<F: JoltField> OuterUniSkipProver<F> {
             )
             // 4. 最终修正：乘以初始缩放因子
             .map(|x| F::from_montgomery_reduce::<9>(x) * outer_scale)
+
+
+
     }
+    fn compute_univariate_skip_extended_evals1(
+        bytecode_preprocessing: &BytecodePreprocessing,
+        trace: &[Cycle],
+        tau: &[F::Challenge],
+    ) -> [F; OUTER_UNIVARIATE_SKIP_DEGREE] {
+        // 1. 初始化 split_eq
+        let split_eq = GruenSplitEqPolynomial::<F>::new_with_scaling(
+            tau,
+            BindingOrder::LowToHigh,
+            Some(F::MONTGOMERY_R_SQUARE),
+        );
+        let outer_scale = split_eq.get_current_scalar();
+        let num_x_in_bits = split_eq.E_in_current_len().log_2();
+        let num_x_in_prime_bits = num_x_in_bits.saturating_sub(1);
+        let (e_out_slice, e_in_slice) = split_eq.E_out_in_for_window(num_x_in_bits);
+
+        // [修复]: 使用 Acc8S 累加器替代普通的 F 数组
+        // Acc8S 专门用于处理 Field * SignedInt 的累加
+        let mut sum_acc = [Acc8S::<F>::zero(); OUTER_UNIVARIATE_SKIP_DEGREE];
+
+        // 2. 双层循环遍历
+        for (x_out, &e_out_val) in e_out_slice.iter().enumerate() {
+            for (x_in, &e_in_val) in e_in_slice.iter().enumerate() {
+                // 计算 Trace 行号
+                let x_in_prime = x_in >> 1;
+                let base_step_idx = (x_out << num_x_in_prime_bits) | x_in_prime;
+
+                // 恢复 Trace 数据
+                let row_inputs = R1CSCycleInputs::from_trace::<F>(
+                    bytecode_preprocessing,
+                    trace,
+                    base_step_idx,
+                );
+                let eval = R1CSEval::<F>::from_cycle_inputs(&row_inputs);
+                let is_group1 = (x_in & 1) == 1;
+
+                // 计算当前项的总权重 (F 类型)
+                let weight = e_out_val * e_in_val;
+
+                for j in 0..OUTER_UNIVARIATE_SKIP_DEGREE {
+                    // prod 是 SignedBigInt<3> 类型 (192-bit signed integer)
+                    let prod = if !is_group1 {
+                        eval.extended_azbz_product_first_group(j)
+                    } else {
+                        eval.extended_azbz_product_second_group(j)
+                    };
+
+                    // [修复]: 使用 fmadd 来执行: sum_acc += weight * prod
+                    sum_acc[j].fmadd(&weight, &prod);
+                }
+            }
+        }
+
+        // 3. 最终结果转换：将累加器归约为 F 并应用缩放
+        let mut sum = [F::zero(); OUTER_UNIVARIATE_SKIP_DEGREE];
+        for (j, acc) in sum_acc.iter().enumerate() {
+            sum[j] = acc.montgomery_reduce() * outer_scale;
+        }
+        sum
+    }
+    
 }
 
 impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterUniSkipProver<F> {
