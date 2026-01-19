@@ -124,19 +124,44 @@ pub fn build_uniskip_first_round_poly<
     UniPoly::from_coeff(s1_coeffs.to_vec())
 }
 
-/// Prove-only helper for a uni-skip first round instance.
-/// Produces the proof object, the uni-skip challenge r0, and the next claim s1(r0).
+/// Univariate Skip 协议第一轮的 Prover 辅助函数。
+///
+/// 该函数执行 Sumcheck 协议第一轮（针对 Uni-skip 场景）的核心逻辑：
+/// 1. 获取输入声明（Input Claim）。
+/// 2. 计算第一轮的单变量多项式。
+/// 3. 将多项式提交到 Transcript 以进行 Fiat-Shamir 变换。
+/// 4. 获取验证者的随机挑战点 $r_0$。
+/// 5. 更新实例状态，为后续轮次做准备。
 pub fn prove_uniskip_round<F: JoltField, T: Transcript, I: SumcheckInstanceProver<F, T>>(
     instance: &mut I,
     opening_accumulator: &mut ProverOpeningAccumulator<F>,
     transcript: &mut T,
 ) -> UniSkipFirstRoundProof<F, T> {
+    // 1. 获取实例当前的输入声明（Input Claim）。
+    // 在 Sumcheck 开始时，这通常是 Prover 声称的计算总和（Sum）。
     let input_claim = instance.input_claim(opening_accumulator);
+
+    // 2. 计算第 0 轮（即第一轮）的消息。
+    // Prover 需要在所有布尔超立方体顶点上对多项式进行求和，将其规约为一个单变量多项式 S(X)。
+    // 在 Uni-skip 场景中，这个多项式可能具有特定的度数结构。
     let uni_poly = instance.compute_message(0, input_claim);
-    // Append full polynomial and derive r0
+
+    // 3. 将完整的多项式（系数形式）附加到 Transcript 中。
+    // 这一步模拟了 Prover 将多项式发送给 Verifier 的过程。
+    // Transcript 会吸收这些数据以作为生成后续随机挑战的熵源。
     uni_poly.append_to_transcript(transcript);
+
+    // 4. 从 Transcript 中确定性地派生出随机挑战点 r_0。
+    // 这是 Fiat-Shamir 启发式应用，代替了交互式协议中 Verifier 发送随机数的一步。
     let r0: F::Challenge = transcript.challenge_scalar_optimized::<F>();
+
+    // 5. 将挑战点 r_0 缓存到实例中，并利用它更新内部状态。
+    // 实际上，这里会执行 Partial Evaluation（部分评估）：
+    // 将多变量多项式的第一个变量固定为 r_0，从而将问题规模从 n 个变量减少到 n-1 个变量，
+    // 为下一轮 Sumcheck 做准备。同时也会更新 accumulator 中的声明值。
     instance.cache_openings(opening_accumulator, transcript, &[r0]);
+
+    // 6. 将生成的单变量多项式封装在证明结构体中返回。
     UniSkipFirstRoundProof::new(uni_poly)
 }
 

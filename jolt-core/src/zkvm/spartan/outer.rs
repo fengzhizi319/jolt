@@ -151,7 +151,7 @@ impl<F: JoltField> OuterUniSkipProver<F> {
         // 算法逻辑：
         // 这里的 `tau` 是一个多线性扩展的随机挑战点（Random Challenge Point）。
         // 函数会根据 Bytecode 信息和动态的 Trace 数据，计算出相关多项式（可能是由 Trace 列构成的多项式）
-        // 在该随机点 `tau` 上的值 (或者其某种形式的投影/扩展)。
+        // 在该随机点 `tau` 上的值 (或者其某种形式的投影/扩展)。得到sum-check矩阵，正常情况下矩阵所有点都为0
         // 这些值是后续进行线性时间 Sumcheck (Linear-time Sumcheck) 的基础。
         // "Univariate Skip" 暗示这里可能涉及对 Trace 中某些行或逻辑的跳过处理，或者是一种基于单变量多项式的优化技术。
         let extended = Self::compute_univariate_skip_extended_evals(
