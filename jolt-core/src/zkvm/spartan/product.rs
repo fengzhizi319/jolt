@@ -82,25 +82,52 @@ pub struct ProductVirtualUniSkipParams<F: JoltField> {
 }
 
 impl<F: JoltField> ProductVirtualUniSkipParams<F> {
+    /// 初始化 `ProductVirtualUniSkipParams` 结构体。
+    ///
+    /// # 作用
+    /// 准备乘法子协议（Product Subprotocol）所需的挑战点（Challenge Points）和基准评估值（Base Evaluations）。
+    ///
+    /// # 流程解析
+    /// 1. **继承挑战点**: 从上一阶段（Spartan Outer Sumcheck）获取评估点 `r_cycle`，作为本阶段的低位挑战点 `τ_low`。
+    /// 2. **生成新挑战**: 从 Transcript 中采样一个新的挑战点 `τ_high`。这用于通过随机线性组合将多个不同的乘法约束（如指令编码、跳转逻辑等）合并为一个多项式。
+    /// 3. **收集目标值**: 从 Opening Accumulator 中提取上一阶段声称的、各个乘法项的评估值（Claims），这些值将作为本阶段 Sumcheck 的验证目标。
     pub fn new<T: Transcript>(
         opening_accumulator: &dyn OpeningAccumulator<F>,
         transcript: &mut T,
     ) -> Self {
-        // Reuse r_cycle from Stage 1 (outer) for τ_low, and sample τ_high
+        // 1. 复用第一阶段 (Spartan Outer) 的随机点 `r_cycle`。
+        // 在乘法虚拟化中，这个向量变成了 `τ_low` (tau_low)。
+        // 这样做是为了确保本阶段证明的多项式与上一阶段的主约束系统是在同一点上进行评估的，保证一致性。
         let r_cycle = opening_accumulator
             .get_virtual_polynomial_opening(VirtualPolynomial::Product, SumcheckId::SpartanOuter)
             .0
             .r;
+
+        // 2. 从 Fiat-Shamir Transcript 中采样一个新的标量挑战 `τ_high` (tau_high)。
+        // 这是一个 "Univariate Skip" 维度的挑战点。
+        // Jolt 有 5 类乘法约束（Instruction, WriteRD, WritePC, Branch, Jump），
+        // 我们在大小为 5 的域上使用这个随机点将它们“混合”在一起。
         let tau_high = transcript.challenge_scalar_optimized::<F>();
+
+        // 3. 构建完整的挑战向量 τ = [τ_low || τ_high]。
+        // 注意顺序：先是来自 Outer 的周期变量挑战点，最后追加新的高位挑战点。
         let mut tau = r_cycle;
         tau.push(tau_high);
 
+        // 4. 初始化基准评估值数组。
+        // 这里存储的是上一阶段声称的、各个具体乘法项的值。
         let mut base_evals: [F; NUM_PRODUCT_VIRTUAL] = [F::zero(); NUM_PRODUCT_VIRTUAL];
+
+        // 遍历所有定义的乘法约束 (PRODUCT_CONSTRAINTS)
         for (i, cons) in PRODUCT_CONSTRAINTS.iter().enumerate() {
+            // 从累加器中获取该约束对应的虚拟多项式在 `SpartanOuter` 阶段的评估值。
+            // 例如：如果是 `ShouldJump` 约束，这里获取的就是该约束在 `r_cycle` 点的值。
+            // 这些值构成了本次 Sumcheck 协议要证明的等式右边（Right-Hand Side）。
             let (_, eval) = opening_accumulator
                 .get_virtual_polynomial_opening(cons.output, SumcheckId::SpartanOuter);
             base_evals[i] = eval;
         }
+
         Self { tau, base_evals }
     }
 }
@@ -187,45 +214,92 @@ impl<F: JoltField> ProductVirtualUniSkipProver<F> {
     /// - WritePCtoRD: IsRdNotZero is bool/u8 → i32; Jump flag is bool/u8 → i32.
     /// - ShouldBranch: LookupOutput is u64 → i128; Branch flag is bool/u8 → i32.
     /// - ShouldJump: Jump flag (left) is bool/u8 → i32; Right^eff = (1 − NextIsNoop) is bool/u8 → i32.
+    /// 计算单变量跳过 (Univariate Skip) 阶段第一轮多项式在扩展域上的评估值。
+    ///
+    /// # 目的
+    /// 计算 $t_1(z)$ 在扩展点集上的值 (Outside base window)。
+    /// 这里的 $z$ 对应于 `PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE` 定义的几个点。
+    ///
+    /// # 数学原理
+    /// 我们需要计算：
+    /// $t_1(z) = \sum_{x} Eq(\tau, x) \cdot P_{fused}(z, x)$
+    /// 其中：
+    /// * $x = (x_{out} || x_{in})$ 是 Trace 的索引（Cycle Count）。
+    /// * $P_{fused}(z, x)$ 是 5 种乘法约束在点 $z$ 处的“融合”多项式值。
+    ///   它实际上是 $Left(z, x) \cdot Right(z, x)$。
+    ///
+    /// # 优化策略 (Split-Eq / Gruen)
+    /// 采用了 Gruen 的 Split-Eq 优化算法：
+    /// $Eq(\tau, x) = E_{out}(x_{out}) \cdot E_{in}(x_{in})$
+    ///
+    /// 算法流程：
+    /// 1. 并行遍历 $x_{out}$。
+    /// 2. 在内层循环遍历 $x_{in}$，累加 $\sum E_{in} \cdot Val$。
+    /// 3. 外层循环将内层结果乘以 $E_{out}$。
     fn compute_univariate_skip_extended_evals(
         trace: &[Cycle],
-        tau: &[F::Challenge],
+        tau: &[F::Challenge], // 挑战点向量 τ (包含 τ_low 和 τ_high)
     ) -> [F; PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE] {
-        // Build split-eq over full τ; new_with_scaling drops τ_high from the split and
-        // carries a global R^2 scaling via current_scalar for balanced Montgomery reduction.
+        // 构建 Split-Eq 多项式辅助结构。
+        // `new_with_scaling` 会根据 τ 构建 Eq(τ, x) 的评估逻辑。
+        // BindingOrder::LowToHigh 表示变量绑定顺序。
+        // 传入 `F::MONTGOMERY_R_SQUARE` 作为缩放因子，这是为了后续使用 Unreduced 的
+        // 蒙哥马利乘法进行累加，最后统一做一次 Reduction 以提高性能。
         let split_eq = GruenSplitEqPolynomial::<F>::new_with_scaling(
             tau,
             BindingOrder::LowToHigh,
             Some(F::MONTGOMERY_R_SQUARE),
         );
-        let outer_scale = split_eq.get_current_scalar(); // = R^2
+        let outer_scale = split_eq.get_current_scalar(); // 获取当前的全局缩放因子 (= R^2)
 
-        // Fold-out-in across (x_out, x_in) using signed Montgomery accumulators, mirroring outer.rs
+        // 使用 "Fold-Out-In" 模式并行计算 Sumcheck 和。
+        // 这种模式将求和域分解为 External (x_out) 和 Internal (x_in) 两部分以利用缓存和向量化。
         split_eq
             .par_fold_out_in(
+                // 1. 初始化线程局部累加器
+                // 创建一组大小为 DEGREE 的累加器，用于存储每个扩展点 j 的部分和。
+                // Acc8S 是一个针对 SIMD 优化的 8 肢符号累加器。
                 || [Acc8S::<F>::zero(); PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE],
+
+                // 2. 内层循环处理 (Fold Inner)
+                // 遍历 x_in (g 是当前全局索引)，计算 Σ E_in * Val
                 |inner, g, _x_in, e_in| {
-                    // Materialize product-cycle row with raw types for this group index
+                    // 从 Trace 中恢复当前 Cycle 的输入数据 (ProductCycleInputs)。
+                    // 这里使用的是原始类型 (raw types)，尚未转换为 Field 元素。
                     let row = ProductCycleInputs::from_trace::<F>(trace, g);
 
-                    // For each extended target j, compute fused left·right integer product using shared evaluator
+                    // 遍历所有扩展评估点 j (例如 0..3)
                     for j in 0..PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE {
+                        // 核心计算逻辑：
+                        // 计算“融合”后的左右乘积在扩展点 j 的值。
+                        // "Fused" 意味着它根据点 j 的拉格朗日插值系数，
+                        // 动态结合了 Instruction, WriteRD, WritePC 等 5 种乘法项。
+                        // 结果 prod_s256 是一个宽整数类型，防止溢出。
                         let prod_s256 =
                             ProductVirtualEval::extended_fused_product_at_j::<F>(&row, j);
 
-                        // Fold e_in into signed 8-limb accumulator for this j
+                        // 将计算结果乘以当前的 Eq 分量 (e_in) 并累加到 inner[j]。
+                        // fmadd: Fused Multiply-Add (inner += e_in * prod).
                         inner[j].fmadd(&e_in, &prod_s256);
                     }
                 },
+
+                // 3. 外层循环处理 (Map Outer)
+                // 内层循环结束后，将结果乘以 E_out(x_out)
                 |_x_out, e_out, inner| {
                     let mut out =
                         [F::Unreduced::<9>::zero(); PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE];
                     for j in 0..PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE {
+                        // 先对内层累加结果做一次蒙哥马利约减 (Reduce)
                         let reduced = inner[j].montgomery_reduce();
+                        // 再乘以 e_out 分量 (Outer Eq check)
                         out[j] = e_out.mul_unreduced::<9>(reduced);
                     }
                     out
                 },
+
+                // 4. 并行归约 (Reduce)
+                // 将不同线程/块计算出的 partial sums 相加
                 |mut a, b| {
                     for j in 0..PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE {
                         a[j] += b[j];
@@ -233,6 +307,8 @@ impl<F: JoltField> ProductVirtualUniSkipProver<F> {
                     a
                 },
             )
+            // 5. 最终处理
+            // 对最终的总和做最后一次蒙哥马利约减，并乘以全局缩放因子 (outer_scale)。
             .map(|x| F::from_montgomery_reduce::<9>(x) * outer_scale)
     }
 }
@@ -308,7 +384,7 @@ impl<F: JoltField> ProductVirtualUniSkipVerifier<F> {
 }
 
 impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
-    for ProductVirtualUniSkipVerifier<F>
+for ProductVirtualUniSkipVerifier<F>
 {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         &self.params
@@ -350,18 +426,46 @@ pub struct ProductVirtualRemainderParams<F: JoltField> {
 }
 
 impl<F: JoltField> ProductVirtualRemainderParams<F> {
+    /// 初始化 `ProductVirtualRemainderParams` 结构体。
+    ///
+    /// # 作用
+    /// 准备乘法子协议第二阶段（Remainder / Remaining Rounds）所需的参数。
+    ///
+    /// # 背景：两阶段 Sumcheck
+    /// 乘法虚拟化 Sumcheck 被分为了两个阶段：
+    /// 1. **Univariate Skip (第一阶段)**: 在大小为 5 的小域上进行，将 5 类乘法约束（指令、跳转等）压缩为一个。
+    ///    这产生了一个挑战点 $r_0$。
+    /// 2. **Remainder (本阶段)**: 在布尔超立方体（即 Trace 的 Cycle 维度）上进行的标准 Sumcheck。
+    ///
+    /// 本函数主要负责从第一阶段的输出中提取 $r_0$，并设置剩余 Sumcheck 的规模（变量数）。
+    ///
+    /// # 参数
+    /// * `trace_len`: 执行轨迹的长度。决定了本阶段 Sumcheck 需要进行的轮数 ($\log_2(\text{len})$)。
+    /// * `uni_skip_params`: 第一阶段的参数，包含原始的 $\tau$ 向量。
+    /// * `opening_accumulator`: 全局累加器，用于获取第一阶段产生的挑战点 $r_0$。
     pub fn new(
         trace_len: usize,
         uni_skip_params: ProductVirtualUniSkipParams<F>,
         opening_accumulator: &dyn OpeningAccumulator<F>,
     ) -> Self {
+        // 1. 获取第一阶段 (Univariate Skip) 的挑战点 r0。
+        // 在上一轮 Sumcheck 结束时，Verifier（或 Fiat-Shamir）生成了一个随机点 r_uni_skip。
+        // 这个点用于将那一轮的多项式 $t_1(X)$ 归约为一个标量值。
+        // 这里的 `r_uni_skip` 实际上是一个长度为 1 的向量，因为 Univariate Skip 仅针对一个变量。
         let (r_uni_skip, _) = opening_accumulator.get_virtual_polynomial_opening(
-            VirtualPolynomial::UnivariateSkip,
-            SumcheckId::SpartanProductVirtualization,
+            VirtualPolynomial::UnivariateSkip,       // 目标：第一阶段产生的虚拟多项式
+            SumcheckId::SpartanProductVirtualization, // ID：当前子协议
         );
+
+        // 验证确实只收到了一个挑战点
         debug_assert_eq!(r_uni_skip.len(), 1);
         let r0 = r_uni_skip[0];
 
+        // 2. 构建本阶段参数
+        // * n_cycle_vars: 剩余的 Sumcheck 轮数，对应于 Log2(TraceLength)。
+        // * tau: 继承自第一阶段的完整挑战向量 [τ_low || τ_high]。
+        //   (注：第二阶段主要用到 τ_low 来计算 Eq 多项式，τ_high 和 r0 用于组合系数)。
+        // * r0: 第一阶段的挑战点，将在本阶段作为拉格朗日插值的基点。
         Self {
             n_cycle_vars: trace_len.log_2(),
             tau: uni_skip_params.tau,
@@ -438,21 +542,65 @@ pub struct ProductVirtualRemainderProver<F: JoltField> {
 }
 
 impl<F: JoltField> ProductVirtualRemainderProver<F> {
+    /// 初始化 `ProductVirtualRemainderProver` 实例。
+    ///
+    /// # 作用
+    /// 准备乘法子协议第二阶段（Remainder / Cycle 变量绑定阶段）的 Prover。
+    /// 此阶段的任务是对已经通过 Univariate Skip 归约后的“融合”多项式进行关于 Cycle 维度的 Sumcheck。
+    ///
+    /// # 核心逻辑
+    /// 1. **计算融合权重**:
+    ///    计算拉格朗日基函数在上一阶段产生的挑战点 $r_0$ 处的评估值 `lagrange_evals_r`。
+    ///    这组权重 $w_i = L_i(r_0)$ 将用于把 5 组不同的乘法多项式（指令、跳转等输入输出）线性组合（融合）成两个单一的多项式 $Left$ 和 $Right$。
+    ///    即：$Left(x) = \sum w_i \cdot Left_i(x)$。
+    ///
+    /// 2. **分离挑战向量**:
+    ///    将总挑战向量 $\tau$ 分拆为：
+    ///    * $\tau_{high}$: 对应于 Univariate Skip 维度的变量。
+    ///    * $\tau_{low}$: 对应于 Cycle (执行时间步) 维度的变量。
+    ///
+    /// 3. **计算全局缩放因子**:
+    ///    计算 $L(\tau_{high}, r_0)$。因为完整的验证方程依赖于 $Eq(\tau, r)$，
+    ///    即使我们现在只处理 Cycle 维度，高位维度的贡献 $Eq(\tau_{high}, r_0)$ 作为一个常数乘数（Scaling Factor）仍然存在。
+    ///
+    /// 4. **初始化 Eq 多项式**:
+    ///    使用 $\tau_{low}$ 和上述缩放因子初始化 `GruenSplitEqPolynomial`。
+    ///    这用于高效计算 $Eq(\tau_{low}, x) \cdot \text{Scaling}$。
+    ///
+    /// 5. **物化密集多项式与计算首轮状态**:
+    ///    调用 `compute_first_quadratic_evals_and_bound_polys`：
+    ///    * 将原始 Trace 数据根据权重“物化”（Materialize）为两个密集的向量 `left` 和 `right`。
+    ///      这两个向量是后续每一轮 Sumcheck 折叠的基础。
+    ///    * 同时计算当前 Sumcheck 首轮多项式的评估值 $t(0)$ 和 $t(inf)$，用于构造 Prover Message。
     #[tracing::instrument(skip_all, name = "ProductVirtualRemainderProver::initialize")]
     pub fn initialize(params: ProductVirtualRemainderParams<F>, trace: Arc<Vec<Cycle>>) -> Self {
+        // 1. 计算权重向量 w，其中 w[i] = L_i(r0)。
+        // 这里的 r0 是来自 Univariate Skip 阶段的随机点 (challenge)。
+        // 这些权重用于将 5 个独立的乘法约束项融合成一组 Left 和 Right 多项式。
         let lagrange_evals_r = LagrangePolynomial::<F>::evals::<
             F::Challenge,
             PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DOMAIN_SIZE,
         >(&params.r0);
 
+        // 2. 分解挑战向量 tau。
+        // tau 是从 Spartan Outer 传下来的，包含了所有变量的随机挑战。
+        // tau_high: Univariate Skip 维度的挑战点 (最后一项)。
+        // tau_low: Cycle 维度的挑战点向量 (其余项)。
         let tau_high = params.tau[params.tau.len() - 1];
         let tau_low = &params.tau[..params.tau.len() - 1];
 
+        // 3. 计算高位缩放因子 scalar = L(tau_high, r0)。
+        // 完整的 Eq(\tau, x) 可以分解为 Eq(\tau_low, x_cycle) * Eq(\tau_high, r0)。
+        // 对于 Univariate Skip 这样的小域，Eq 实际上就是 Lagrange 插值核。
+        // 这个因子将在后续计算中一直伴随，确保验证等式两边的一致性。
         let lagrange_tau_r0 = LagrangePolynomial::<F>::lagrange_kernel::<
             F::Challenge,
             PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DOMAIN_SIZE,
         >(&tau_high, &params.r0);
 
+        // 4. 初始化 Split-Eq 多项式。
+        // 传入 scalar (lagrange_tau_r0) 作为初始缩放因子。
+        // 使得该多项式后续吐出的系数实际上是 Eq(tau_low, x) * scalar。
         let split_eq_poly: GruenSplitEqPolynomial<F> =
             GruenSplitEqPolynomial::<F>::new_with_scaling(
                 tau_low,
@@ -460,6 +608,10 @@ impl<F: JoltField> ProductVirtualRemainderProver<F> {
                 Some(lagrange_tau_r0),
             );
 
+        // 5. 核心计算：生成首轮多项式评估点和绑定后的密集多项式。
+        // 这一步会扫描 Trace，利用权重 lagrange_evals_r 将多列数据融合，
+        // 生成 Left 和 Right 向量，并同时计算出 Sumcheck 第一轮所需的 t0 和 t_inf。
+        // 这个函数完成了从“原始执行轨迹”到“Sumcheck 密集多项式”的转换。
         let (t0, t_inf, left_bound, right_bound) =
             Self::compute_first_quadratic_evals_and_bound_polys(
                 &trace,
@@ -470,9 +622,9 @@ impl<F: JoltField> ProductVirtualRemainderProver<F> {
         Self {
             split_eq_poly,
             trace,
-            left: left_bound,
-            right: right_bound,
-            first_round_evals: (t0, t_inf),
+            left: left_bound,   // 存储融合后的密集 Left 多项式 (用于后续 rounds 绑定)
+            right: right_bound, // 存储融合后的密集 Right 多项式 (用于后续 rounds 绑定)
+            first_round_evals: (t0, t_inf), // 第一轮 Sumcheck 消息所需的点值
             params,
         }
     }
@@ -587,7 +739,7 @@ impl<F: JoltField> ProductVirtualRemainderProver<F> {
 }
 
 impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
-    for ProductVirtualRemainderProver<F>
+for ProductVirtualRemainderProver<F>
 {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         &self.params
@@ -657,7 +809,7 @@ impl<F: JoltField> ProductVirtualRemainderVerifier<F> {
 }
 
 impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
-    for ProductVirtualRemainderVerifier<F>
+for ProductVirtualRemainderVerifier<F>
 {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         &self.params

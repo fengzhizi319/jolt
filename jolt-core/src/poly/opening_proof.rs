@@ -44,7 +44,7 @@ impl<const E: Endianness, F: JoltField> std::ops::Index<usize> for OpeningPoint<
 }
 
 impl<const E: Endianness, F: JoltField> std::ops::Index<std::ops::RangeFull>
-    for OpeningPoint<E, F>
+for OpeningPoint<E, F>
 {
     type Output = [F::Challenge];
 
@@ -294,15 +294,34 @@ where
 }
 
 impl<F: JoltField> OpeningAccumulator<F> for ProverOpeningAccumulator<F> {
+    /// 获取虚拟多项式 (Virtual Polynomial) 的打开信息 (打开点和评估值)。
+    ///
+    /// # 作用
+    /// 在 Sumcheck 协议的连接点，下一阶段经常需要上一阶段声称的某个虚拟多项式的评估值。
+    /// 此函数从累加器中查找并返回该值 (`claim`) 以及它对应的随机点 (`point`)。
+    ///
+    /// # 参数
+    /// * `polynomial`: 目标虚拟多项式的标识符 (如 `Product`, `Eq`, `Memory` 等)。
+    /// * `sumcheck`: 产生该打开请求的 Sumcheck 阶段标识符 (用于区分同一多项式在不同阶段的打开)。
+    ///
+    /// # 测试环境行为 (`cfg(test)`)
+    /// 在测试模式下，它会从 `appended_virtual_openings` 列表中移除被访问过的条目。
+    /// 这里的目的是为了测试完备性：在处理流程结束时，所有被 append 进去的 opening 都应该被 get 出来消费掉，
+    /// 如果列表非空，说明有部分约束或多项式被遗漏处理了。
     fn get_virtual_polynomial_opening(
         &self,
         polynomial: VirtualPolynomial,
         sumcheck: SumcheckId,
     ) -> (OpeningPoint<BIG_ENDIAN, F>, F) {
+        // 尝试从 map 中获取，如果不存在则 panic。
+        // 因为在正常的证明流程中，如果这里请求了一个 Opening，必然是因为前期已经计算并存入了这个 Opening。
         let (point, claim) = self
             .openings
             .get(&OpeningId::Virtual(polynomial, sumcheck))
             .unwrap_or_else(|| panic!("opening for {sumcheck:?} {polynomial:?} not found"));
+
+        // [测试辅助逻辑]
+        // 记录消费状态。如果某个 virtual opening 从未被消费，可以在测试结束时报错。
         #[cfg(test)]
         {
             let mut virtual_openings = self.appended_virtual_openings.borrow_mut();
@@ -316,6 +335,13 @@ impl<F: JoltField> OpeningAccumulator<F> for ProverOpeningAccumulator<F> {
         (point.clone(), *claim)
     }
 
+    /// 获取已承诺多项式 (Committed Polynomial) 的打开信息。
+    ///
+    /// # 作用
+    /// 获取具体的物理多项式（如 Trace 列、Wintess 列）在之前的某个 Sumcheck 步骤中产生的评估值。
+    ///
+    /// 与虚拟多项式不同，已承诺的多项式对应实际的数据列，它们通常作为基本组件被组合成虚拟多项式。
+    /// 这里返回的值通常是 Sumcheck 最终步骤产生的 claim，用于后续 Batched Opening Proof 的输入。
     fn get_committed_polynomial_opening(
         &self,
         polynomial: CommittedPolynomial,
@@ -328,15 +354,28 @@ impl<F: JoltField> OpeningAccumulator<F> for ProverOpeningAccumulator<F> {
         (point.clone(), *claim)
     }
 
+    /// 获取 Advice (辅助/建议) 多项式的打开信息。
+    ///
+    /// # 作用
+    /// Advice 多项式通常不在主 Trace 中，而是为了优化某些特定逻辑（如读写检查）而额外引入的辅助列。
+    ///
+    /// # 参数
+    /// * `kind`: Advice 的类型，分为 `Trusted` (可信) 和 `Untrusted` (不可信)。
+    /// * `sumcheck_id`: 关联的 Sumcheck 阶段。
+    ///
+    /// # 返回值
+    /// 返回 `Option`，因为并不是所有的 Sumcheck 阶段都会产生 Advice Opening。
     fn get_advice_opening(
         &self,
         kind: AdviceKind,
         sumcheck_id: SumcheckId,
     ) -> Option<(OpeningPoint<BIG_ENDIAN, F>, F)> {
+        // 根据 Advice 类型构造查找键
         let opening_id = match kind {
             AdviceKind::Trusted => OpeningId::TrustedAdvice(sumcheck_id),
             AdviceKind::Untrusted => OpeningId::UntrustedAdvice(sumcheck_id),
         };
+        // 查找并返回。这里使用 ? 操作符，如果找不到直接返回 None。
         let (point, claim) = self.openings.get(&opening_id)?;
         Some((point.clone(), *claim))
     }

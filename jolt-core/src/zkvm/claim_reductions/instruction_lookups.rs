@@ -36,20 +36,54 @@ pub struct InstructionLookupsClaimReductionSumcheckParams<F: JoltField> {
 }
 
 impl<F: JoltField> InstructionLookupsClaimReductionSumcheckParams<F> {
+    /// 初始化 `InstructionLookupsClaimReductionSumcheckParams` 实例。
+    ///
+    /// # 作用
+    /// 为“指令查找表主张归约”（Instruction Lookups Claim Reduction）协议准备参数。
+    /// 这个协议运行在一个更大规模的 Spartan Sumcheck 协议之后（或与之并行）。
+    /// 它的目的是将针对三个不同多项式 (`LookupOutput`, `LeftLookupOperand`, `RightLookupOperand`)
+    /// 在随机点 `r_spartan` 上的评估检查，归约为针对单个线性组合多项式的 Sumcheck。
+    ///
+    /// # 核心逻辑
+    /// 1. **生成随机挑战 $\gamma$**:
+    ///    从 Fiat-Shamir Transcript 中获取一个随机数 $\gamma$。
+    ///    这个系数用于将三个查找表相关的多项式进行随机线性组合：
+    ///    $P_{combined} = \text{Output} + \gamma \cdot \text{Left} + \gamma^2 \cdot \text{Right}$。
+    ///
+    /// 2. **获取上下文挑战 $r_{spartan}$**:
+    ///    这个 Sumcheck 并非独立存在，而是为了验证 Spartan 协议外层 Sumcheck (SpartanOuter) 产生的某个主张。
+    ///    我们需要从 `accumulator` 中提取出 Spartan 协议使用的随机挑战点 $r_{spartan}$。
+    ///    当前的 Sumcheck 将证明：在 $r_{spartan}$ 这一点上，各查找多项式的加权和是正确的。
+    ///
+    /// 3. **计算轮数**:
+    ///    Sumcheck 的轮数由执行轨迹长度（`trace_len`）的对数决定。
+    ///
+    /// # 参数
+    /// * `trace_len`: 执行轨迹的长度（Cycle 数）。必须是 2 的幂。
+    /// * `accumulator`: 累加器，存储了之前协议阶段生成的挑战点和多项式开启信息。
+    /// * `transcript`: Fiat-Shamir Transcript，用于生成安全的伪随机数。
     pub fn new(
         trace_len: usize,
         accumulator: &dyn OpeningAccumulator<F>,
         transcript: &mut impl Transcript,
     ) -> Self {
+        // 1. 生成随机挑战 gamma，用于线性组合多个多项式。
         let gamma = transcript.challenge_scalar::<F>();
+        // 预计算 gamma 的平方，对应于第三个多项式（RightOperand）的系数。
         let gamma_sqr = gamma.square();
+
+        // 2. 从累加器中获取 Spartan Outer Sumcheck 阶段生成的随机挑战点 r_spartan。
+        // 这个点定义了 Eq 多项式的求值位置：eq(r_spartan, x)。
+        // 我们只关心挑战点 r_spartan 本身 (Tuple 的第一个元素)，忽略具体的评估值。
         let (r_spartan, _) = accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::LookupOutput,
             SumcheckId::SpartanOuter,
         );
+
         Self {
             gamma,
             gamma_sqr,
+            // 3. 计算 Sumcheck 需要运行的轮数 (即变量个数)。
             n_cycle_vars: trace_len.log_2(),
             r_spartan,
         }
@@ -104,14 +138,38 @@ enum InstructionLookupsClaimReductionPhase<F: JoltField> {
 }
 
 impl<F: JoltField> InstructionLookupsClaimReductionSumcheckProver<F> {
+    /// 初始化 `InstructionLookupsClaimReductionSumcheckProver` 实例。
+    ///
+    /// # 作用
+    /// 启动指令查找表主张归约的 Sumcheck Prover。
+    /// 该方法的关键任务是创建初始阶段（Phase 1）的状态。
+    ///
+    /// # 背景：混合 Sumcheck 策略 (Hybrid Sumcheck)
+    /// 为了处理这种特定的 Sumcheck 实例（涉及前缀/后缀拆分的大规模多线性多项式计算），
+    /// Jolt采用了两阶段策略（参考代码中的注释引用 <https://eprint.iacr.org/2025/611.pdf>）：
+    /// 1. **Phase 1 (Prefix-Suffix Sumcheck)**:
+    ///    处理 Sumcheck 的前几轮。在这个阶段，多项式被隐式表示为前缀（Eq 多项式部分）和后缀（Trace 数据部分）的组合。
+    ///    这种方式避免了立即物化巨大的密集多项式，节省内存并允许并行计算。
+    ///    `InstructionLookupsPhase1State::initialize` 会负责预计算 Phase 1 所需的 $P$ 和 $Q$ 缓冲区。
+    /// 2. **Phase 2 (Regular Sumcheck)**:
+    ///    在 Phase 1 缩减了足够多的变量后，协议会转换到 Phase 2。
+    ///    此时剩余的问题规模足够小，可以将多项式完全物化（Materialize）为密集向量，并使用常规的线性时间 Sumcheck 算法完成剩余轮次。
+    ///
+    /// # 参数
+    /// * `params`: 包含了随机挑战因子 $\gamma$ 和目标点 $r_{spartan}$ 的参数集。
+    /// * `trace`: 完整的执行轨迹（Trace），包含了每个 Cycle 的指令和查找表信息。
     #[tracing::instrument(skip_all, name = "InstructionClaimReductionSumcheckProver::initialize")]
     pub fn initialize(
         params: InstructionLookupsClaimReductionSumcheckParams<F>,
         trace: Arc<Vec<Cycle>>,
     ) -> Self {
+        // 初始化 Phase 1 状态。
+        // 这一步会预计算 Eq 多项式的前缀部分，并扫描 Trace 计算后缀部分的线性组合 Q。
+        // 这是这类 Sumcheck 性能优化的核心起点。
         let phase = InstructionLookupsClaimReductionPhase::Phase1(
             InstructionLookupsPhase1State::initialize(trace, &params),
         );
+        
         Self { phase, params }
     }
 }

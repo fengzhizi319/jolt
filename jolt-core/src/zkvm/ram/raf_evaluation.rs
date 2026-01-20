@@ -52,23 +52,49 @@ pub struct RafEvaluationSumcheckParams<F: JoltField> {
 }
 
 impl<F: JoltField> RafEvaluationSumcheckParams<F> {
-    pub fn new(
-        memory_layout: &MemoryLayout,
-        one_hot_params: &OneHotParams,
-        opening_accumulator: &dyn OpeningAccumulator<F>,
-    ) -> Self {
-        let start_address = memory_layout.get_lowest_address();
-        let log_K = one_hot_params.ram_k.log_2();
-        let (r_cycle, _) = opening_accumulator.get_virtual_polynomial_opening(
-            VirtualPolynomial::RamAddress,
-            SumcheckId::SpartanOuter,
-        );
-        Self {
-            log_K,
-            start_address,
-            r_cycle,
-        }
-    }
+      /// 初始化 `RafEvaluationSumcheckParams` 结构体。
+      ///
+      /// # 作用
+      /// 准备 RAM 地址频率 (RAF - Read Access Frequency) 评估 Sumcheck 协议所需的参数。
+      /// 这个 Sumcheck 旨在证明 RAM 地址的重映射逻辑（Remapping）与原始 trace 中的地址访问记录是一致的。
+      ///
+      /// # 核心逻辑
+      /// 1. 确定地址空间范围（基地址和大小）。
+      /// 2. 提取上一阶段（Spartan Outer）产生的随机挑战点 `r_cycle`，确保两个证明阶段针对的是同一个多项式评估点。
+      ///
+      /// # 参数
+      /// * `memory_layout`: 内存布局配置，定义了 RAM 的起始物理地址。
+      /// * `one_hot_params`: 包含 RAM 相关的配置，如地址空间大小 $K$。
+      /// * `opening_accumulator`: 累加器，用于获取两个阶段之间的关联数据（Opening）。
+      pub fn new(
+          memory_layout: &MemoryLayout,
+          one_hot_params: &OneHotParams,
+          opening_accumulator: &dyn OpeningAccumulator<F>,
+      ) -> Self {
+          // 1. 获取 RAM 的起始物理地址。
+          // Jolt 为了优化内存证明，可能将稀疏的内存地址映射到一段连续的空间 (0..K)。
+          // `start_address` 用于后续构建 `Unmap` 多项式，将映射后的索引还原为真实的物理地址。
+          let start_address = memory_layout.get_lowest_address();
+  
+          // 2. 计算地址空间的对数大小 (log K)。
+          // 这对应于 Sumcheck 协议需要进行的轮数 (number of rounds)。
+          let log_K = one_hot_params.ram_k.log_2();
+  
+          // 3. 从 Opening Accumulator 获取挑战点 `r_cycle`。
+          // 在 Spartan Outer Sumcheck 结束时，Verifier 请求了 `RamAddress` 虚拟多项式在随机点 `r_cycle` 处的值。
+          // 当前的 RAF Sumcheck 需要基于同一个 `r_cycle` 来构建其内部的多项式 `ra` (Random Access)。
+          // 这里的 `_` 忽略了评估值 (claim)，因为我们在参数初始化阶段只需要挑战点坐标。
+          let (r_cycle, _) = opening_accumulator.get_virtual_polynomial_opening(
+              VirtualPolynomial::RamAddress, // 目标虚拟多项式
+              SumcheckId::SpartanOuter,      // 来源阶段 ID
+          );
+  
+          Self {
+              log_K,
+              start_address,
+              r_cycle,
+          }
+      }
 }
 
 impl<F: JoltField> SumcheckInstanceParams<F> for RafEvaluationSumcheckParams<F> {
@@ -107,6 +133,24 @@ pub struct RafEvaluationSumcheckProver<F: JoltField> {
 }
 
 impl<F: JoltField> RafEvaluationSumcheckProver<F> {
+    /// 初始化 `RafEvaluationSumcheckProver` 实例。
+    ///
+    /// # 作用
+    /// 计算并构建 `ra` (Random Access) 多项式和 `unmap` 多项式。
+    /// `ra` 多项式是一个向量，长度为 $K$ (RAM 大小)，其中每个位置 $k$ 存储了该地址所有访问的加权和。
+    /// 权重由之前的 Sumcheck 阶段生成的随机挑战点 $r_{cycle}$ 决定。
+    ///
+    /// # 数学公式
+    /// $$ ra(k) = \sum_{j=0}^{T-1} eq(r_{cycle}, j) \cdot \mathbb{1}[\text{address}(j) = k] $$
+    ///
+    /// # 核心逻辑
+    /// 1. **Split-Eq 优化**: 将 $r_{cycle}$ 拆分为高位 ($r_{hi}$) 和低位 ($r_{lo}$)，分别预计算 Eq 表。
+    ///    这利用了 $eq(r, j) = eq(r_{hi}, j_{hi}) \cdot eq(r_{lo}, j_{lo})$ 的性质，
+    ///    将计算结构化为两层循环，便于并行化处理。
+    /// 2. **并行累加**: 使用 Rayon 对时间步（Cycle）的高位部分进行并行分块。
+    ///    每个线程维护一个大小为 $K$ 的局部 `partial` 向量，用于统计该线程负责的时间片段内的地址访问贡献。
+    /// 3. **全局归约**: 将所有线程的 `partial` 向量逐元素相加，得到最终的 `ra` 向量。
+    /// 4. **构建多项式**: 将结果封装为 `MultilinearPolynomial`，并初始化辅助的 `unmap` 多项式。
     #[tracing::instrument(skip_all, name = "RamRafEvaluationSumcheckProver::initialize")]
     pub fn initialize(
         params: RafEvaluationSumcheckParams<F>,
@@ -116,47 +160,61 @@ impl<F: JoltField> RafEvaluationSumcheckProver<F> {
         let T = trace.len();
         let K = 1 << params.log_K;
 
-        // Two-table split-eq:
-        // EqPolynomial::evals uses big-endian bit order: r_cycle[0] is MSB, r_cycle[last] is LSB.
-        // To get contiguous blocks in the cycle index, we split off the LSB half (suffix) as E_lo.
+        // Split-Eq (分块 Eq) 优化：
+        // EqPolynomial::evals 使用大端序：r_cycle[0] 是最高位 (MSB)。
+        // 为了在循环中获得连续的 Cycle 索引访问模式，我们将 r_cycle 拆分为高位和低位两部分。
+        // 后缀（低位）作为内层循环 E_lo，前缀（高位）作为外层并行循环 E_hi。
         let r_cycle = &params.r_cycle.r;
         let log_T = r_cycle.len();
         let lo_bits = log_T / 2;
         let hi_bits = log_T - lo_bits;
+        // split_at: 将 challenge 向量切分为 r_hi 和 r_lo
         let (r_hi, r_lo) = r_cycle.split_at(hi_bits);
 
+        // 并行预计算 Eq 表：
+        // E_hi: 大小为 2^hi_bits，对应时间步的高位部分
+        // E_lo: 大小为 2^lo_bits，对应时间步的低位部分
         let (E_hi, E_lo) = rayon::join(
             || EqPolynomial::<F>::evals(r_hi),
             || EqPolynomial::<F>::evals(r_lo),
         );
 
-        let in_len = E_lo.len(); // 2^lo_bits
+        let in_len = E_lo.len(); // 内层循环长度 = 2^lo_bits
 
-        // Split E_hi into chunks for parallel processing
+        // 确定并行度：将 E_hi 分块给不同的线程处理
         let num_threads = rayon::current_num_threads();
         let chunk_size = E_hi.len().div_ceil(num_threads);
 
-        // Each thread computes partial ra_evals using split-eq optimization
+        // 并行计算 partial ra_evals (局部 ra 统计向量)：
+        // 每个线程独立分配一个大小为 K 的零向量，避免锁竞争。
         let ra_evals: Vec<F> = E_hi
             .par_chunks(chunk_size)
             .enumerate()
             .map(|(chunk_idx, chunk)| {
+                // 分配本地累加器，大小为 K (地址空间大小)
                 let mut partial: Vec<F> = unsafe_allocate_zero_vec(K);
 
                 let chunk_start = chunk_idx * chunk_size;
+                // 外层循环：遍历分配给当前线程的 E_hi 块
                 for (local_idx, &e_hi) in chunk.iter().enumerate() {
                     let c_hi = chunk_start + local_idx;
+                    // c_hi 是高位索引，对应的实际 cycle 索引基数是 c_hi * 2^lo_bits
                     let c_hi_base = c_hi * in_len;
 
+                    // 内层循环：遍历所有低位组合
                     for c_lo in 0..in_len {
                         let j = c_hi_base + c_lo;
+                        // 边界检查：防止 j 超出 Trace 实际长度
                         if j >= T {
                             break;
                         }
 
+                        // 获取第 j 个 cycle 访问的物理地址，并映射到密集索引 k
                         if let Some(k) =
                             remap_address(trace[j].ram_access().address() as u64, memory_layout)
                         {
+                            // 累加权重：eq(r_cycle, j) = E_hi[c_hi] * E_lo[c_lo]
+                            // 将结果加到对应的地址桶 k 中
                             partial[k as usize] += e_hi * E_lo[c_lo];
                         }
                     }
@@ -164,6 +222,7 @@ impl<F: JoltField> RafEvaluationSumcheckProver<F> {
 
                 partial
             })
+            // Reduce 阶段：将所有线程产生的 partial 向量对应位置相加
             .reduce(
                 || unsafe_allocate_zero_vec(K),
                 |mut running, new| {
@@ -175,7 +234,12 @@ impl<F: JoltField> RafEvaluationSumcheckProver<F> {
                 },
             );
 
+        // 构造密集的多线性多项式 ra
         let ra = MultilinearPolynomial::from(ra_evals);
+        
+        // 构造 Unmap 多项式
+        // 这是一个简单的多项式，用于表示从重映射地址 k 恢复到物理地址的映射关系。
+        // 它在 Sumcheck 验证中用于确保 proving 的地址是一致的。
         let lowest_memory_address = memory_layout.get_lowest_address();
         let unmap = UnmapRamAddressPolynomial::new(K.log_2(), lowest_memory_address);
 
