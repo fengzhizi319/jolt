@@ -368,47 +368,122 @@ impl CommittedPolynomial {
 }
 
 #[derive(Hash, PartialEq, Eq, Copy, Clone, Debug, PartialOrd, Ord, Allocative)]
+/// `VirtualPolynomial` 枚举表示 Jolt zkVM 证明系统中的各种虚拟多项式（列）。
+///
+/// 在多项式交互式预言证明（IOP）的上下文中，这些变体代表了全名多项式（Witness Polynomials）
+/// 或者是由其他多项式产生的中间值。它们用于定义 R1CS 约束、查找表（Lookup）参数
+/// 以及内存一致性检查。
+///
+/// 这些多项式通常由 `trace_length`（执行步数）作为域的大小。
 pub enum VirtualPolynomial {
+    /// Program Counter (PC): 当前执行指令的程序计数器地址。
     PC,
+    /// Unexpanded PC: 未展开的程序计数器。通常对应于 RISC-V 压缩指令集或者伪指令处理前的原始 PC。
     UnexpandedPC,
+    /// Next PC: 下一条指令的程序计数器地址。
     NextPC,
+    /// Next Unexpanded PC: 下一时刻的未展开 PC。
     NextUnexpandedPC,
+    
+    /// Next Is Noop: 布尔标志位，表示下一条指令是否为 No-op（空操作）。
+    /// 这常用于处理 padding（填充）行或控制流。
     NextIsNoop,
+    /// Next Is Virtual: 布尔标志位，表示下一条指令是否属于虚拟步骤（Virtual Flag）。
+    /// 在某些指令分解过程中使用。
     NextIsVirtual,
+    /// Next Is First In Sequence: 布尔标志位，表示下一条指令是否为指令序列的第一步。
+    /// 用于标识一个宏指令或复杂指令序列的开始。
     NextIsFirstInSequence,
+
+    /// Left Lookup Operand: 查找表查询的左操作数（输入X）。
+    /// 用于乘法、逻辑运算等基于 Lookup Table 的操作。
     LeftLookupOperand,
+    /// Right Lookup Operand: 查找表查询的右操作数（输入Y）。
     RightLookupOperand,
+    
+    /// Left Instruction Input: 指令的左输入值（通常来自 rs1 寄存器）。
     LeftInstructionInput,
+    /// Right Instruction Input: 指令的右输入值（通常来自 rs2 寄存器或立即数）。
     RightInstructionInput,
+    
+    /// Product: 两个值的乘积结果。通常用于 mul 指令的验证。
     Product,
+
+    /// Should Jump: 布尔标志位，表示当前指令是否触发了跳转（JAL/JALR）。
     ShouldJump,
+    /// Should Branch: 布尔标志位，表示当前指令是否触发了条件分支跳转（BEQ/BNE 等）。
     ShouldBranch,
+    
+    /// Write PC to RD: 布尔标志位，表示是否需要将当前 PC 或 Next PC 写入目标寄存器 RD（如 JAL/JALR 指令）。
     WritePCtoRD,
+    /// Write Lookup Output To RD: 布尔标志位，表示是否将查找表的输出结果写入目标寄存器 RD。
     WriteLookupOutputToRD,
+    
+    /// Rd: 目标寄存器（Destination Register）的索引值 (0-31)。
     Rd,
+    /// Imm: 立即数（Immediate）的值。由指令解码得出。
     Imm,
+    
+    /// Rs1 Value: 源寄存器 1 (Source Register 1) 中的数值。
     Rs1Value,
+    /// Rs2 Value: 源寄存器 2 (Source Register 2) 中的数值。
     Rs2Value,
+    
+    /// Rd Write Value: 最终写入目标寄存器 RD 的数值。
     RdWriteValue,
+    
+    /// Rs1 Ra: 源寄存器 1 的读取地址（Read Address）。通常用于内存一致性检查。
     Rs1Ra,
+    /// Rs2 Ra: 源寄存器 2 的读取地址。
     Rs2Ra,
+    /// Rd Wa: 目标寄存器 RD 的写入地址（Write Address）。
     RdWa,
+    
+    /// Lookup Output: 查找表查询的输出结果（Z = Lookup(X, Y)）。
     LookupOutput,
+    
+    /// Instruction RAF (Read Access Flag): 指令读取访问标志。
+    /// 用于区分指令存取和其他内存存取。
     InstructionRaf,
+    /// Instruction RAF Flag: 辅助标志位，用于构建 Instruction RAF。
     InstructionRafFlag,
+    /// Instruction RA (Read Address): 指令读取地址的部分。
+    /// 这里的 `usize` 参数表示分块索引（Chunk Index），每一块对应地址的一部分。
     InstructionRa(usize),
+    
+    /// Registers Val: 寄存器堆当前的数值状态。
     RegistersVal,
+    
+    /// RAM Address: 内存操作的目标地址。
     RamAddress,
+    /// RAM RA: RAM 读取地址。
     RamRa,
+    /// RAM Read Value: 从内存读取到的值。
     RamReadValue,
+    /// RAM Write Value: 写入内存的值。
     RamWriteValue,
+    /// RAM Val: 当前 RAM 单元的值。
     RamVal,
+    /// RAM Val Init: RAM 单元的初始值（用于离线内存检查）。
     RamValInit,
+    /// RAM Val Final: RAM 单元的最终值（用于离线内存检查）。
     RamValFinal,
+    /// RAM Hamming Weight: 用于内存地址检查等的汉明重量（Hamming Weight）约束值。
     RamHammingWeight,
+    
+    /// Univariate Skip: 用于构建 Sumcheck 协议中的单变量多项式时的辅助跳过标志。
     UnivariateSkip,
+    
+    /// Op Flags: 指令操作标志集合。
+    /// 包含如 ADD, SUB, MUL 等具体指令类型的 One-Hot 编码标志。
     OpFlags(CircuitFlags),
+    
+    /// Instruction Flags: 指令元数据标志位。
+    /// 包含指令格式（R-type, I-type 等）或其他控制信号。
     InstructionFlags(InstructionFlags),
+    
+    /// Lookup Table Flag: 查找表选择标志位。
+    /// `usize` 表示选择了第几个查找表（例如 AND 表, OR 表, MUL 表）。
     LookupTableFlag(usize),
 }
 

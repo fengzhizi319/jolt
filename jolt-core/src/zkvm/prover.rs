@@ -129,29 +129,117 @@ use tracer::{
 };
 
 /// Jolt CPU prover for RV64IMAC.
+/// Jolt CPU 证明器的主结构体，针对 RV64IMAC 指令集。
+///
+/// 该结构体由证明者 (Prover) 实例化，负责协调整个零知识证明的生成过程。
+/// 它维护了生成证明所需的所有状态，包括执行轨迹 (Trace)、多项式承诺参数、
+/// Fiat-Shamir Transcript 状态以及各个阶段产生的中间数据。
+///
+/// 泛型参数:
+/// - `'a`: 预处理数据的生命周期。
+/// - `F`: 基础域 (Field)，证明系统运行所在的数学域。
+/// - `PCS`: 多项式承诺方案 (Polynomial Commitment Scheme)，例如 Dory，必须支持流式处理。
+/// - `ProofTranscript`: 用于 Fiat-Shamir 变换的 Transcript 实现。
 pub struct JoltCpuProver<
     'a,
     F: JoltField,
     PCS: StreamingCommitmentScheme<Field = F>,
     ProofTranscript: Transcript,
 > {
+    /// 证明者的预处理数据。
+    ///
+    /// 包含多项式承诺方案的公共参数 (Generators/SRS) 以及程序共享的静态信息 (如字节码摘要)。
+    /// 这些数据在证明生成之前创建，并且可以被多个证明过程复用。
     pub preprocessing: &'a JoltProverPreprocessing<F, PCS>,
+
+    /// Jolt 设备 IO 状态。
+    ///
+    /// 包含程序的公共输入 (Inputs)、公共输出 (Outputs) 以及内存布局 (Memory Layout) 配置。
+    /// 也用于跟踪 IO 边界，供 Verifier 验证公共输入输出的一致性。
     pub program_io: JoltDevice,
+
+    /// 惰性 Trace 迭代器。
+    ///
+    /// 允许按需生成或流式访问执行轨迹数据，而不需要一次性将所有复杂的 Trace 对象加载到内存中。
+    /// 这对于优化内存使用至关重要，特别是在处理长 Trace 时。
     pub lazy_trace: LazyTraceIterator,
+
+    /// 内存中的完整执行轨迹。
+    ///
+    /// `Cycle` 结构体包含了单个时钟周期内发生的所有状态变化（指令、操作数、内存访问等）。
+    /// 使用 `Arc` 包装以便在多个线程或并行子任务间共享而不进行深拷贝。
     pub trace: Arc<Vec<Cycle>>,
+
+    /// 辅助输入 (Advice) 管理器。
+    ///
+    /// 负责持有和管理：
+    /// 1. **Untrusted Advice**: 私有的 Witness 数据（Verifier 不可见）。
+    /// 2. **Trusted Advice**: 预处理阶段已知的辅助数据。
+    /// 以及它们对应的多项式形式和承诺值。
     pub advice: JoltAdvice<F, PCS>,
-    /// Phase-bridge randomness for two-phase advice claim reduction.
-    /// Stored after Stage 6 initialization and reused in Stage 7.
+
+    /// 用于两阶段 Advice 归约 (Phase-Bridge) 的随机挑战值 (Gamma) - Trusted Advice。
+    ///
+    /// Jolt 对 Advice 的检查分为两个阶段：
+    /// 1. **Stage 6 (Phase 1)**: 消除时间维度 (Cycle)。在此阶段生成 Gamma。
+    /// 2. **Stage 7 (Phase 2)**: 消除空间维度 (Address)。
+    /// 这个随机值 $\gamma$ 存储在这里，以确保在两个独立的 Sumcheck 阶段之间保持一致性。
     advice_reduction_gamma_trusted: Option<F>,
+
+    /// 用于两阶段 Advice 归约的随机挑战值 (Gamma) - Untrusted Advice。
+    ///
+    /// 作用机制同上，但针对不可信的私有 Witness 数据。
     advice_reduction_gamma_untrusted: Option<F>,
+
+    /// 原始执行轨迹的长度 (Unpadded)。
+    ///
+    /// 程序实际执行的指令周期数。
     pub unpadded_trace_len: usize,
+
+    /// 填充后的执行轨迹长度 (Padded)。
+    ///
+    /// 通常向上取整到最近的 2 的幂次。这是为了满足多线性多项式 (Multilinear Polynomials)
+    /// 结构的定义，以及适配多项式承诺方案 (如 Dory) 对矩阵维度的要求。
     pub padded_trace_len: usize,
+
+    /// Fiat-Shamir Transcript。
+    ///
+    /// 用于实现非交互式零知识证明。随着证明过程的推进，Prover 会将生成的承诺和数据
+    /// “吸收”到 Transcript 中，并从中“挤出”伪随机挑战 (Challenge)。
     pub transcript: ProofTranscript,
+
+    /// 证明打开累加器 (Opening Accumulator)。
+    ///
+    /// 在整个 Sumcheck 协议的 8 个阶段中，会产生大量的多项式点值评估声明 (Claims)。
+    /// 累加器将这些分散的声明收集起来，最后通过一次批量的 Dory Opening Proof 来统一证明，
+    /// 极大地摊销了验证成本。
     pub opening_accumulator: ProverOpeningAccumulator<F>,
+
+    /// Spartan 证明系统的密钥/参数。
+    ///
+    /// Jolt 使用 Spartan 的变体来证明 R1CS 约束的可满足性。
+    /// 这里存储了用于处理 Uniform R1CS 结构的参数（如矩阵维度信息）。
     pub spartan_key: UniformSpartanKey<F>,
+
+    /// 初始内存状态快照。
+    ///
+    /// 记录了程序开始执行前，所有非零内存地址上的值。
+    /// 用于 Stage 4 的内存一致性检查（验证 Initial -> Final 状态转换的正确性）。
     pub initial_ram_state: Vec<u64>,
+
+    /// 最终内存状态快照。
+    ///
+    /// 记录了程序终止时，所有非零内存地址上的值。
     pub final_ram_state: Vec<u64>,
+
+    /// One-Hot 编码参数。
+    ///
+    /// 用于配置指令解码、标志位检查等涉及 One-Hot 向量的组件，确保位向量的有效性。
     pub one_hot_params: OneHotParams,
+
+    /// 读写一致性配置 (Read-Write Config)。
+    ///
+    /// 定义了 RAM 和寄存器文件在进行读写一致性检查时的具体策略和参数。
     pub rw_config: ReadWriteConfig,
 }
 impl<'a, F: JoltField, PCS: StreamingCommitmentScheme<Field = F>, ProofTranscript: Transcript>
@@ -911,7 +999,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         // 这个 `tau` 是 Verifier 选择的随机向量，用于将 R1CS 的矩阵约束压缩为单一的多项式约束。
         // `spartan_key` 包含了电路结构相关的矩阵信息。
         let uni_skip_params = OuterUniSkipParams::new(&self.spartan_key, &mut self.transcript);
-        println!("uni_skip_params.tau: {:?}", uni_skip_params.tau);
+        println!("stage1 : uni_skip_params.tau: {:?}", uni_skip_params.tau);
 
         // 2. 初始化 UniSkip Prover:
         // 使用完整的执行轨迹 (Trace) 和字节码 (Bytecode) 来初始化 Prover。
@@ -989,7 +1077,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
     /// # 作用
     /// Stage 2 是 Jolt 证明系统中并行度最高、任务最繁杂的阶段之一。
     /// 它主要处理以下任务：
-    /// 1. **Spartan Grand Product (Product Check)**: 完成从 Stage 1 开始的乘积论证，用于证明 R1CS 矩阵向量乘法中的变量一致性。
+    /// 1. **Spartan Grand Product (Product Check)**: 完成从 Stage 1 开始的连乘论证，用于证明 R1CS 矩阵向量乘法中的变量一致性。
     /// 2. **RAM Coherence (内存一致性)**: 证明内存读写操作的正确性（Read/Write Consistency），即每次读取的值必须等于最后一次写入的值。
     /// 3. **Output Check (输出检查)**: 证明程序的公共输出与内存最终状态一致。
     /// 4. **Instruction Lookup (指令查找)**: 将指令执行的正确性归约为查找表查询的正确性。
@@ -1007,16 +1095,18 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         #[cfg(not(target_arch = "wasm32"))]
         print_current_memory_usage("Stage 2 baseline");
 
-        // Use Case: 启动 Spartan 协议中的 "Grand Product Argument"（乘积论证）证明。
+        // Use Case: 启动 Spartan 协议中的 "Grand Product Argument"（连乘论证）证明。
         // 这通常用于证明内存一致性（Memory Consistency）或查找表一致性（Lookup Consistency）。
-        // 乘积论证的核心是证明两个集合的元素在某种变换下的乘积相等。
+        // 连乘论证的核心是证明两个集合的元素在某种变换下的乘积相等。
 
         // 1. Product Virtualization UniSkip (Stage 2a):
-        // 类似于 Stage 1，这里处理乘积论证中的第一轮 Sumcheck。
+        // 类似于 Stage 1，这里处理连乘论证中的第一轮 Sumcheck。
         // 由于 Jolt 使用 One-Hot 编码表示指令，该轮次主要涉及稀疏的指令标志位（Instruction Flags）。
         // 使用 `UniSkip` 优化可以跳过对大量 0 值的计算，快速归约指令维度的变量。
         let uni_skip_params =
             ProductVirtualUniSkipParams::new(&self.opening_accumulator, &mut self.transcript);
+        println!("stage2 : uni_skip_params.tau: {:?}", uni_skip_params.tau);
+
         let mut uni_skip =
             ProductVirtualUniSkipProver::initialize(uni_skip_params.clone(), &self.trace);
 
@@ -1031,7 +1121,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         // 2. 初始化各子任务参数 (Initialization params)：
         // Stage 2 是一个批量处理阶段，它并行运行多个不同的 Sumcheck 协议：
 
-        // a. 乘积论证剩余部分 (Product Remainder)：
+        // a. 连乘论证剩余部分 (Product Remainder)：
         // 处理 Grand Product 论证中剩下的所有轮次（即时间/周期维度）。
         // "Virtual" 意味着 Prover 不会显式构造巨大的乘积多项式，而是动态计算，节省内存。
         let spartan_product_virtual_remainder_params = ProductVirtualRemainderParams::new(
@@ -1085,7 +1175,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         // 根据上述参数和 Trace 数据创建实际的计算对象。
 
         // A. 初始化 Spartan Product Remainder Prover。
-        // 这是 Grand Product Argument（乘积论证）的第二阶段。
+        // 这是 Grand Product Argument（连乘论证）的第二阶段。
         // 它的任务是处理 Cycle（时间步）维度的变量绑定。
         // 结合 Stage 1 的 Univariate Skip，这两个阶段共同证明了 Spartan 协议中的 Grand Product 约束。
         let spartan_product_virtual_remainder = ProductVirtualRemainderProver::initialize(

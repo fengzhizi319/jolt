@@ -69,15 +69,40 @@ use tracer::instruction::Cycle;
 /// Degree of the sumcheck round polynomials for [`ProductVirtualRemainderVerifier`].
 const PRODUCT_VIRTUAL_REMAINDER_DEGREE: usize = 3;
 
+
 #[derive(Allocative, Clone)]
+/// 用于 Spartan 协议中 "乘积参数检查 (Product Argument)" 的辅助结构体。
+///
+/// 这个结构体封装了执行 "Univariate Skip" (单变量跳跃) 优化所需的参数。
+/// 这里的 "Virtual Polynomial"（虚拟多项式）并不是一个实体化的多项式，
+/// 而是通过这种优化技术，将 5 个分散的逻辑检查项（分支、跳转、写入等）
+/// 视为一个定义在大小为 5 的小域上的单变量多项式的点值。
+///
+/// 这种技术允许我们在几乎不增加验证成本的情况下，批量处理指令执行逻辑中的复杂状态转换约束。
 pub struct ProductVirtualUniSkipParams<F: JoltField> {
-    /// τ = [τ_low || τ_high]
-    /// - τ_low: the cycle-point r_cycle carried from Spartan outer (length = num_cycle_vars)
-    /// - τ_high: the univariate-skip binding point sampled for the size-5 domain (length = 1)
-    ///   Ordering matches outer: variables are MSB→LSB with τ_high last
+    /// 评估点向量 τ (Tau)，由两部分拼接而成：[τ_low || τ_high]。
+    ///
+    /// 这个向量代表了多线性多项式的评估坐标：
+    /// - **τ_low**: 来自 Spartan 外层 Sumcheck 的随机挑战点 (即 `r_cycle`)。
+    ///   它的长度等于 `num_cycle_vars`，用于锁定执行轨迹中的特定时间步（Cycle）。
+    /// - **τ_high**: 为 Univariate Skip 优化引入的额外随机挑战点（绑定位）。
+    ///   它的长度为 1。这个变量用于在这个微小的虚拟域（大小为5）上进行随机线性组合或评估。
+    ///
+    /// 注意：变量排序通常遵循 MSB -> LSB，其中 τ_high 位于最后（即作为最低维度的变量扩展）。
     pub tau: Vec<F::Challenge>,
-    /// Base evaluations (claims) for the five product terms at the base domain
+
+    /// 在基础域上这 5 个乘积项的基础评估值 (Base Evaluations/Claims)。
+    ///
+    /// 这里的每一个值对应于在 `τ_low` 点处评估特定逻辑多项式得到的结果。
+    /// Sumcheck 的任务是证明这些分散值的组合满足约束。
+    ///
+    /// 数组中的顺序必须严格对应 `NUM_PRODUCT_VIRTUAL` (通常为 5) 定义的组件顺序：
     /// Order: [Product, WriteLookupOutputToRD, WritePCtoRD, ShouldBranch, ShouldJump]
+    /// 1. **Product**: 累积乘积项（通常用于 Grand Product Argument 的中间状态或累加器）。
+    /// 2. **WriteLookupOutputToRD**: 指示该指令是否将查找表(Lookup)的结果写入目标寄存器 (RD)。
+    /// 3. **WritePCtoRD**: 指示该指令是否将 PC+4 写入目标寄存器 (用于 JAL/JALR 指令)。
+    /// 4. **ShouldBranch**: 指示该指令逻辑上是否应该触发条件分支 (Branch taken)。
+    /// 5. **ShouldJump**: 指示该指令逻辑上是否应该触发无条件跳转 (Jump)。
     pub base_evals: [F; NUM_PRODUCT_VIRTUAL],
 }
 
@@ -102,6 +127,7 @@ impl<F: JoltField> ProductVirtualUniSkipParams<F> {
             .get_virtual_polynomial_opening(VirtualPolynomial::Product, SumcheckId::SpartanOuter)
             .0
             .r;
+        println!("stage2 new : r_cycle: {:?}", r_cycle);
 
         // 2. 从 Fiat-Shamir Transcript 中采样一个新的标量挑战 `τ_high` (tau_high)。
         // 这是一个 "Univariate Skip" 维度的挑战点。
@@ -194,26 +220,7 @@ impl<F: JoltField> ProductVirtualUniSkipProver<F> {
         instance
     }
 
-    /// Compute the extended-domain evaluations t1(z) for univariate-skip (outside base window).
-    ///
-    /// - For each z target, compute
-    ///   t1(z) = Σ_{x_out} E_out[x_out] · Σ_{x_in} E_in[x_in] · left_z(x) · right_z(x),
-    ///   where x is the concatenation of (x_out || x_in) in MSB→LSB order.
-    ///
-    /// Lagrange fusion per target z on (current) extended window {−4,−3,3,4}:
-    /// - Compute c[0..4] = LagrangeHelper::shift_coeffs_i32(shift(z)) using the same shifted-kernel
-    ///   as outer.rs (indices correspond to the 5 base points).
-    /// - Define fused values at this z by linearly combining the 5 product witnesses with c:
-    ///   left_z(x)  = Σ_i c[i] · Left_i(x)
-    ///   right_z(x) = Σ_i c[i] · Right_i^eff(x)
-    ///   with Right_4^eff(x) = 1 − NextIsNoop(x) for the ShouldJump term only.
-    ///
-    /// Small-value lifting rules for integer accumulation before converting to the field:
-    /// - Instruction: LeftInstructionInput is u64 → lift to i128; RightInstructionInput is S64 → i128.
-    /// - WriteLookupOutputToRD: IsRdNotZero is bool/u8 → i32; flag is bool/u8 → i32.
-    /// - WritePCtoRD: IsRdNotZero is bool/u8 → i32; Jump flag is bool/u8 → i32.
-    /// - ShouldBranch: LookupOutput is u64 → i128; Branch flag is bool/u8 → i32.
-    /// - ShouldJump: Jump flag (left) is bool/u8 → i32; Right^eff = (1 − NextIsNoop) is bool/u8 → i32.
+
     /// 计算单变量跳过 (Univariate Skip) 阶段第一轮多项式在扩展域上的评估值。
     ///
     /// # 目的
@@ -236,15 +243,30 @@ impl<F: JoltField> ProductVirtualUniSkipProver<F> {
     /// 1. 并行遍历 $x_{out}$。
     /// 2. 在内层循环遍历 $x_{in}$，累加 $\sum E_{in} \cdot Val$。
     /// 3. 外层循环将内层结果乘以 $E_{out}$。
+    /// Compute the extended-domain evaluations t1(z) for univariate-skip (outside base window).
+    ///
+    /// - For each z target, compute
+    ///   t1(z) = Σ_{x_out} E_out[x_out] · Σ_{x_in} E_in[x_in] · left_z(x) · right_z(x),
+    ///   where x is the concatenation of (x_out || x_in) in MSB→LSB order.
+    ///
+    /// Lagrange fusion per target z on (current) extended window {−4,−3,3,4}:
+    /// - Compute c[0..4] = LagrangeHelper::shift_coeffs_i32(shift(z)) using the same shifted-kernel
+    ///   as outer.rs (indices correspond to the 5 base points).
+    /// - Define fused values at this z by linearly combining the 5 product witnesses with c:
+    ///   left_z(x)  = Σ_i c[i] · Left_i(x)
+    ///   right_z(x) = Σ_i c[i] · Right_i^eff(x)
+    ///   with Right_4^eff(x) = 1 − NextIsNoop(x) for the ShouldJump term only.
+    ///
+    /// Small-value lifting rules for integer accumulation before converting to the field:
+    /// - Instruction: LeftInstructionInput is u64 → lift to i128; RightInstructionInput is S64 → i128.
+    /// - WriteLookupOutputToRD: IsRdNotZero is bool/u8 → i32; flag is bool/u8 → i32.
+    /// - WritePCtoRD: IsRdNotZero is bool/u8 → i32; Jump flag is bool/u8 → i32.
+    /// - ShouldBranch: LookupOutput is u64 → i128; Branch flag is bool/u8 → i32.
+    /// - ShouldJump: Jump flag (left) is bool/u8 → i32; Right^eff = (1 − NextIsNoop) is bool/u8 → i32.
     fn compute_univariate_skip_extended_evals(
         trace: &[Cycle],
         tau: &[F::Challenge], // 挑战点向量 τ (包含 τ_low 和 τ_high)
     ) -> [F; PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE] {
-        // 构建 Split-Eq 多项式辅助结构。
-        // `new_with_scaling` 会根据 τ 构建 Eq(τ, x) 的评估逻辑。
-        // BindingOrder::LowToHigh 表示变量绑定顺序。
-        // 传入 `F::MONTGOMERY_R_SQUARE` 作为缩放因子，这是为了后续使用 Unreduced 的
-        // 蒙哥马利乘法进行累加，最后统一做一次 Reduction 以提高性能。
         let split_eq = GruenSplitEqPolynomial::<F>::new_with_scaling(
             tau,
             BindingOrder::LowToHigh,
@@ -252,64 +274,38 @@ impl<F: JoltField> ProductVirtualUniSkipProver<F> {
         );
         let outer_scale = split_eq.get_current_scalar(); // 获取当前的全局缩放因子 (= R^2)
 
-        // 使用 "Fold-Out-In" 模式并行计算 Sumcheck 和。
-        // 这种模式将求和域分解为 External (x_out) 和 Internal (x_in) 两部分以利用缓存和向量化。
-        split_eq
-            .par_fold_out_in(
-                // 1. 初始化线程局部累加器
-                // 创建一组大小为 DEGREE 的累加器，用于存储每个扩展点 j 的部分和。
-                // Acc8S 是一个针对 SIMD 优化的 8 肢符号累加器。
-                || [Acc8S::<F>::zero(); PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE],
+        let e_out = split_eq.E_out_current();
+        let e_in = split_eq.E_in_current();
+        let out_len = e_out.len();
+        let in_len = e_in.len();
 
-                // 2. 内层循环处理 (Fold Inner)
-                // 遍历 x_in (g 是当前全局索引)，计算 Σ E_in * Val
-                |inner, g, _x_in, e_in| {
-                    // 从 Trace 中恢复当前 Cycle 的输入数据 (ProductCycleInputs)。
-                    // 这里使用的是原始类型 (raw types)，尚未转换为 Field 元素。
-                    let row = ProductCycleInputs::from_trace::<F>(trace, g);
+        let mut final_acc = [F::zero(); PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE];
 
-                    // 遍历所有扩展评估点 j (例如 0..3)
-                    for j in 0..PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE {
-                        // 核心计算逻辑：
-                        // 计算“融合”后的左右乘积在扩展点 j 的值。
-                        // "Fused" 意味着它根据点 j 的拉格朗日插值系数，
-                        // 动态结合了 Instruction, WriteRD, WritePC 等 5 种乘法项。
-                        // 结果 prod_s256 是一个宽整数类型，防止溢出。
-                        let prod_s256 =
-                            ProductVirtualEval::extended_fused_product_at_j::<F>(&row, j);
+        // Serial Fold-Out
+        for x_out in 0..out_len {
+            let mut inner_acc = [Acc8S::<F>::zero(); PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE];
 
-                        // 将计算结果乘以当前的 Eq 分量 (e_in) 并累加到 inner[j]。
-                        // fmadd: Fused Multiply-Add (inner += e_in * prod).
-                        inner[j].fmadd(&e_in, &prod_s256);
-                    }
-                },
+            // Serial Fold-In
+            for x_in in 0..in_len {
+                let g = split_eq.group_index(x_out, x_in);
+                let e_in_val = e_in[x_in];
 
-                // 3. 外层循环处理 (Map Outer)
-                // 内层循环结束后，将结果乘以 E_out(x_out)
-                |_x_out, e_out, inner| {
-                    let mut out =
-                        [F::Unreduced::<9>::zero(); PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE];
-                    for j in 0..PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE {
-                        // 先对内层累加结果做一次蒙哥马利约减 (Reduce)
-                        let reduced = inner[j].montgomery_reduce();
-                        // 再乘以 e_out 分量 (Outer Eq check)
-                        out[j] = e_out.mul_unreduced::<9>(reduced);
-                    }
-                    out
-                },
+                let row = ProductCycleInputs::from_trace::<F>(trace, g);
 
-                // 4. 并行归约 (Reduce)
-                // 将不同线程/块计算出的 partial sums 相加
-                |mut a, b| {
-                    for j in 0..PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE {
-                        a[j] += b[j];
-                    }
-                    a
-                },
-            )
-            // 5. 最终处理
-            // 对最终的总和做最后一次蒙哥马利约减，并乘以全局缩放因子 (outer_scale)。
-            .map(|x| F::from_montgomery_reduce::<9>(x) * outer_scale)
+                for j in 0..PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE {
+                    let prod_s256 = ProductVirtualEval::extended_fused_product_at_j::<F>(&row, j);
+                    inner_acc[j].fmadd(&e_in_val, &prod_s256);
+                }
+            }
+
+            let e_out_val = e_out[x_out];
+            for j in 0..PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE {
+                let inner_val = inner_acc[j].montgomery_reduce();
+                final_acc[j] += e_out_val * inner_val;
+            }
+        }
+
+        final_acc.map(|x| x * outer_scale)
     }
 }
 
@@ -450,7 +446,7 @@ impl<F: JoltField> ProductVirtualRemainderParams<F> {
     ) -> Self {
         // 1. 获取第一阶段 (Univariate Skip) 的挑战点 r0。
         // 在上一轮 Sumcheck 结束时，Verifier（或 Fiat-Shamir）生成了一个随机点 r_uni_skip。
-        // 这个点用于将那一轮的多项式 $t_1(X)$ 归约为一个标量值。
+        // 这个点用于将那一轮的多项式 $t_1(X)$ 归减为一个标量值。
         // 这里的 `r_uni_skip` 实际上是一个长度为 1 的向量，因为 Univariate Skip 仅针对一个变量。
         let (r_uni_skip, _) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::UnivariateSkip,       // 目标：第一阶段产生的虚拟多项式

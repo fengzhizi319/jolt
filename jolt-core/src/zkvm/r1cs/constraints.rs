@@ -558,10 +558,18 @@ pub struct ProductConstraint {
     pub output: VirtualPolynomial,
 }
 
-/// Canonical list of the product constraints in the same order as
-/// `PRODUCT_VIRTUAL_TERMS` used by the product virtualization stage.
+
+/// 乘法约束（Product Constraints）的规范列表。
+/// 这个列表的顺序必须与乘法虚拟化阶段（product virtualization stage）使用的 `PRODUCT_VIRTUAL_TERMS` 完全一致。
+///
+/// 这里的每一个约束都定义了一个乘法关系：`Left * Right = Output`。
+/// 这些约束用于在 R1CS 系统中验证指令执行逻辑的正确性（例如控制流标志的计算）。
 pub const PRODUCT_CONSTRAINTS: [ProductConstraint; NUM_PRODUCT_CONSTRAINTS] = [
     // 0: Product = LeftInstructionInput · RightInstructionInput
+    //
+    // 指令操作数乘积约束。
+    // 验证虚拟多项式 `Product` 的值等于 `LeftInstructionInput` 和 `RightInstructionInput` 的乘积。
+    // 这通常用于处理指令的核心运算逻辑或查找表索引构建，确保输入与预期的运算结果（作为输入对的乘积）一致。
     ProductConstraint {
         label: ProductConstraintLabel::Instruction,
         left: ProductFactorExpr::Var(VirtualPolynomial::LeftInstructionInput),
@@ -569,6 +577,13 @@ pub const PRODUCT_CONSTRAINTS: [ProductConstraint; NUM_PRODUCT_CONSTRAINTS] = [
         output: VirtualPolynomial::Product,
     },
     // 1: WriteLookupOutputToRD = IsRdNotZero · OpFlags(WriteLookupOutputToRD)
+    //
+    // 写入查找表结果到目标寄存器 (RD) 的控制信号约束。
+    // 在 RISC-V 中，寄存器 x0 硬编码为 0，对其写入会被忽略。
+    // 此约束确保只有当：
+    // 1. 指令本身意图写入查找结果到 RD (`OpFlags` 中 WriteLookupOutputToRD 标志为真)
+    // 2. AND 目标寄存器索引不是 x0 (`IsRdNotZero` 为真)
+    // 此时，实际的逻辑写入信号 `WriteLookupOutputToRD` 才为真。
     ProductConstraint {
         label: ProductConstraintLabel::WriteLookupOutputToRD,
         left: ProductFactorExpr::Var(VirtualPolynomial::InstructionFlags(
@@ -580,6 +595,11 @@ pub const PRODUCT_CONSTRAINTS: [ProductConstraint; NUM_PRODUCT_CONSTRAINTS] = [
         output: VirtualPolynomial::WriteLookupOutputToRD,
     },
     // 2: WritePCtoRD = IsRdNotZero · OpFlags(Jump)
+    //
+    // 跳转指令写入 PC 到 RD 的控制信号约束 (用于 JAL/JALR 指令)。
+    // 同样遵循 x0 不可写的原则。
+    // 只有当指令是跳转指令 (`OpFlags(Jump)`) 且 RD 不是 x0 时，
+    // `WritePCtoRD` 信号才为真，允许将返回地址 (PC+4) 提交到寄存器堆。
     ProductConstraint {
         label: ProductConstraintLabel::WritePCtoRD,
         left: ProductFactorExpr::Var(VirtualPolynomial::InstructionFlags(
@@ -589,6 +609,12 @@ pub const PRODUCT_CONSTRAINTS: [ProductConstraint; NUM_PRODUCT_CONSTRAINTS] = [
         output: VirtualPolynomial::WritePCtoRD,
     },
     // 3: ShouldBranch = LookupOutput · InstructionFlags(Branch)
+    //
+    // 条件分支判定约束。
+    // 决定是否应该执行分支跳转 (例如 BEQ, BNE)。
+    // 逻辑：如果当前指令是分支指令 (`InstructionFlags(Branch)`)，
+    // 并且条件比较的结果 (`LookupOutput`，在此上下文中作为布尔值 0 或 1) 为真，
+    // 则 `ShouldBranch` 信号为真。
     ProductConstraint {
         label: ProductConstraintLabel::ShouldBranch,
         left: ProductFactorExpr::Var(VirtualPolynomial::LookupOutput),
@@ -598,6 +624,12 @@ pub const PRODUCT_CONSTRAINTS: [ProductConstraint; NUM_PRODUCT_CONSTRAINTS] = [
         output: VirtualPolynomial::ShouldBranch,
     },
     // 4: ShouldJump = OpFlags(Jump) · (1 − NextIsNoop)
+    //
+    // 无条件跳转判定约束。
+    // 决定是否执行无条件跳转 (JAL, JALR)。
+    // 逻辑：如果当前指令标记为跳转 (`OpFlags(Jump)`)，
+    // 并且下一个状态不是 Noop (即 `1 - NextIsNoop` 为 1，表示它是活跃的执行步骤)，
+    // 则 `ShouldJump` 为真。这防止了在 Trace 填充或非活跃周期错误地触发跳转逻辑。
     ProductConstraint {
         label: ProductConstraintLabel::ShouldJump,
         left: ProductFactorExpr::Var(VirtualPolynomial::OpFlags(CircuitFlags::Jump)),
