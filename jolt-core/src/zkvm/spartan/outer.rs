@@ -227,7 +227,11 @@ impl<F: JoltField> OuterUniSkipProver<F> {
         // -------------------------------------------------------------------
         // 2. 计算维度与并行参数
         // -------------------------------------------------------------------
-        // num_x_in_bits: "In" (内层循环) 的比特数
+        let e_out = split_eq.E_out_current();
+        let e_in = split_eq.E_in_current();
+        let out_len = e_out.len();
+        let in_len = e_in.len();
+
         let num_x_in_bits = split_eq.E_in_current_len().log_2();
 
         // num_x_in_prime_bits: 真实的 Trace 索引在 "In" 部分占用的比特数。
@@ -236,95 +240,62 @@ impl<F: JoltField> OuterUniSkipProver<F> {
         let num_x_in_prime_bits = num_x_in_bits.saturating_sub(1);
 
         // -------------------------------------------------------------------
-        // 3. 并行折叠 (Parallel Fold) - 核心计算循环
+        // 3. 串行折叠 (Serial Fold)
         // -------------------------------------------------------------------
 
-        split_eq
-            .par_fold_out_in(
-                // A. 初始化累加器：每个线程拥有一个全零数组
-                || [Acc8S::<F>::zero(); OUTER_UNIVARIATE_SKIP_DEGREE],
+        let mut final_acc = [F::zero(); OUTER_UNIVARIATE_SKIP_DEGREE];
 
-                // B. 核心折叠逻辑 (Folder)
-                // inner: 当前线程的累加器
-                // g: 全局索引 (对应 x 的高位部分)
-                // x_in: 局部索引 (对应 x 的低位部分)
-                // e_in: 预计算好的 eq(τ_in, x_in) 的值
-                |inner, g, x_in, e_in| {
-                    // --- 步骤 I: 索引解码 (Mapping) ---
+        // 遍历 External 变量组合 (x_out)
+        for x_out in 0..out_len {
+            let mut inner_acc = [Acc8S::<F>::zero(); OUTER_UNIVARIATE_SKIP_DEGREE];
 
-                    // x_out 是高位索引
-                    let x_out = g >> num_x_in_bits;
+            // 遍历 Internal 变量组合 (x_in)
+            for x_in in 0..in_len {
+                let e_in_val = e_in[x_in];
 
-                    // x_in_prime 是低位索引中属于 "行号" 的部分
-                    // ">> 1" 操作移除了最低位 (LSB)，该位用于 Group 选择
-                    let x_in_prime = x_in >> 1;
+                // --- 步骤 I: 索引解码 (Mapping) ---
+                // x_out 是高位索引
+                // x_in_prime 是低位索引中属于 "行号" 的部分
+                let x_in_prime = x_in >> 1;
 
-                    // 拼接高位和低位，算出当前是在处理 Trace 的第几行 (Cycle Index)
-                    let base_step_idx = (x_out << num_x_in_prime_bits) | x_in_prime;
+                // 拼接高位和低位，算出当前是在处理 Trace 的第几行 (Cycle Index)
+                let base_step_idx = (x_out << num_x_in_prime_bits) | x_in_prime;
 
-                    // --- 步骤 II: 实时计算 Az, Bz (On-the-fly) ---
+                // --- 步骤 II: 实时计算 Az, Bz (On-the-fly) ---
+                let row_inputs = R1CSCycleInputs::from_trace::<F>(
+                    bytecode_preprocessing,
+                    trace,
+                    base_step_idx,
+                );
 
-                    // 根据行号 base_step_idx，从 Trace 中读取该周期的寄存器/内存值
-                    // 这重建了 R1CS 的输入向量 z (大小为 Trace 列数相关)
-                    let row_inputs = R1CSCycleInputs::from_trace::<F>(
-                        bytecode_preprocessing,
-                        trace,
-                        base_step_idx,
-                    );
+                let eval = R1CSEval::<F>::from_cycle_inputs(&row_inputs);
 
-                    // 构建评估器，准备计算矩阵乘法
-                    let eval = R1CSEval::<F>::from_cycle_inputs(&row_inputs);
+                // --- 步骤 III: 分组选择 (Group Selection) ---
+                let is_group1 = (x_in & 1) == 1;
 
-                    // --- 步骤 III: 分组选择 (Group Selection) ---
+                // --- 步骤 IV: 累加多项式评估值 ---
+                for j in 0..OUTER_UNIVARIATE_SKIP_DEGREE {
+                    let prod_s192 = if !is_group1 {
+                        eval.extended_azbz_product_first_group(j)
+                    } else {
+                        eval.extended_azbz_product_second_group(j)
+                    };
 
-                    // 检查 x_in 的最低位 (LSB)。
-                    // 1 -> Group 1 (第二组约束)
-                    // 0 -> Group 0 (第一组约束)
-                    let is_group1 = (x_in & 1) == 1;
+                    inner_acc[j].fmadd(&e_in_val, &prod_s192);
+                }
+            }
 
-                    // --- 步骤 IV: 累加多项式评估值 ---
+            // 归约当前 External 块的结果
+            let e_out_val = e_out[x_out];
+            for j in 0..OUTER_UNIVARIATE_SKIP_DEGREE {
+                let reduced = inner_acc[j].montgomery_reduce();
+                // 乘以外部权重 e_out 并累加到总和
+                final_acc[j] += e_out_val * reduced;
+            }
+        }
 
-                    // 遍历扩展域上的点 j (通常 j=0..degree)
-                    for j in 0..OUTER_UNIVARIATE_SKIP_DEGREE {
-                        // 计算 Az(j) * Bz(j)。
-                        // Jolt 为了优化内存布局，将约束矩阵切分成了 First Group 和 Second Group。
-                        let prod_s192 = if !is_group1 {
-                            eval.extended_azbz_product_first_group(j)
-                        } else {
-                            eval.extended_azbz_product_second_group(j)
-                        };
-
-                        // 执行加权累加： inner[j] += e_in * prod
-                        // e_in 是当前行的 eq 多项式权重
-                        inner[j].fmadd(&e_in, &prod_s192);
-                    }
-                },
-
-                // C. 归约器 (Reducer): 处理外层权重 eq(τ_out, x_out)
-                |_x_out, e_out, inner| {
-                    let mut out = [F::Unreduced::<9>::zero(); OUTER_UNIVARIATE_SKIP_DEGREE];
-                    for j in 0..OUTER_UNIVARIATE_SKIP_DEGREE {
-                        // 蒙哥马利约简，将累加器转回标准域
-                        let reduced = inner[j].montgomery_reduce();
-                        // 乘以外部权重 e_out
-                        out[j] = e_out.mul_unreduced::<9>(reduced);
-                    }
-                    out
-                },
-
-                // D. 合并器 (Consumer): 将所有并行的结果加在一起
-                |mut a, b| {
-                    for j in 0..OUTER_UNIVARIATE_SKIP_DEGREE {
-                        a[j] += b[j];
-                    }
-                    a
-                },
-            )
-            // 4. 最终修正：乘以初始缩放因子
-            .map(|x| F::from_montgomery_reduce::<9>(x) * outer_scale)
-
-
-
+        // 4. 最终修正
+        final_acc.map(|x| x * outer_scale)
     }
 
     
