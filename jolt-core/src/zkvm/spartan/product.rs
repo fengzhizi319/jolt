@@ -207,6 +207,7 @@ impl<F: JoltField> ProductVirtualUniSkipProver<F> {
     #[tracing::instrument(skip_all, name = "ProductVirtualUniSkipInstanceProver::initialize")]
     pub fn initialize(params: ProductVirtualUniSkipParams<F>, trace: &[Cycle]) -> Self {
         // Compute extended univariate-skip evals using split-eq fold-in-out (includes R^2 scaling)
+        //计算5中乘法约束的评估值，并且用eq进行点的加扰，目的是证明CPU视角的trace跟内存、查找表视角的输入输出是一致的。
         let extended_evals = Self::compute_univariate_skip_extended_evals(trace, &params.tau);
         let instance = Self {
             extended_evals,
@@ -265,8 +266,12 @@ impl<F: JoltField> ProductVirtualUniSkipProver<F> {
     /// - ShouldJump: Jump flag (left) is bool/u8 → i32; Right^eff = (1 − NextIsNoop) is bool/u8 → i32.
     fn compute_univariate_skip_extended_evals(
         trace: &[Cycle],
-        tau: &[F::Challenge], // 挑战点向量 τ (包含 τ_low 和 τ_high)
+        tau: &[F::Challenge], // 挑战点向量 τ (包含 τ_low 和 τ_high)，用于构建 Eq 多项式
     ) -> [F; PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE] {
+        // 初始化 Gruen 分裂 Eq 多项式工具。
+        // 这将 tau 分解为两部分，并预计算 E_out (外层/高位部分) 和 E_in (内层/低位部分) 的评估值表。
+        // 这种技术允许我们在遍历 Trace 时复用计算结果，将复杂度从 O(N) 乘法降低。
+        // `new_with_scaling` 这里传入了 R^2 (Montgomery 常数) 作为缩放因子，用于后续 SIMD/ASM 优化的累加器。
         let split_eq = GruenSplitEqPolynomial::<F>::new_with_scaling(
             tau,
             BindingOrder::LowToHigh,
@@ -274,37 +279,63 @@ impl<F: JoltField> ProductVirtualUniSkipProver<F> {
         );
         let outer_scale = split_eq.get_current_scalar(); // 获取当前的全局缩放因子 (= R^2)
 
+        // 获取预计算的 Eq 表。
+        // e_out 对应 Trace 索引的高比特部分，e_in 对应低比特部分。
         let e_out = split_eq.E_out_current();
         let e_in = split_eq.E_in_current();
         let out_len = e_out.len();
         let in_len = e_in.len();
 
+        // 最终的评估结果数组，存储了虚拟多项式在 [0, ..., DEGREE-1] 各个点的累加和。
         let mut final_acc = [F::zero(); PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE];
 
-        // Serial Fold-Out
+        // 外层循环 (Serial Fold-Out)：遍历高位索引 x_out
         for x_out in 0..out_len {
+            // 初始化内层累加器。
+            // Acc8S 是一个优化的累加器结构 (通常用于 SIMD)，可以延迟取模操作以提高性能。
             let mut inner_acc = [Acc8S::<F>::zero(); PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE];
 
-            // Serial Fold-In
+            // 内层循环 (Serial Fold-In)：遍历低位索引 x_in
             for x_in in 0..in_len {
+                // 根据 x_out 和 x_in 计算全局 Trace 索引 g。
+                // 相当于 g = x_out * in_len + x_in (具体取决于 BindingOrder)。
                 let g = split_eq.group_index(x_out, x_in);
+
+                // 获取当前低位对应的 Eq 值 (eq_lo)。
                 let e_in_val = e_in[x_in];
 
+                // 从 Trace 中读取第 g 行的数据，构建用于产品检查的输入数据结构。
                 let row = ProductCycleInputs::from_trace::<F>(trace, g);
 
+                // 对于 Sumcheck 协议需要构建的单变量多项式，计算其在每个评估点 j (0..degree) 的值:
                 for j in 0..PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE {
+                    // 计算 Grand Product 电路在该行的特定代数结构值。
+                    // "prod_s256" 暗示这里可能涉及 SIMD 或者特定的 256 位操作优化。
                     let prod_s256 = ProductVirtualEval::extended_fused_product_at_j::<F>(&row, j);
+
+                    // 累加：inner_acc[j] += eq_lo * value_at_row
+                    // 使用 fmadd (fused multiply-add) 进行高效累加。
                     inner_acc[j].fmadd(&e_in_val, &prod_s256);
                 }
             }
 
+            // 获取当前高位对应的 Eq 值 (eq_hi)。
             let e_out_val = e_out[x_out];
+
+            // 将内层累加结果归约并合并到最终结果中。
             for j in 0..PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE {
+                // 将优化的累加器转回标准域元素 (Montgomery Reduction)。
+                // 此时 inner_val = ∑_{x_in} (eq_lo[x_in] * P(row))
                 let inner_val = inner_acc[j].montgomery_reduce();
+
+                // final_acc[j] += eq_hi[x_out] * inner_val
+                // 展开后即为：∑_{x_out} eq_hi[x_out] * (∑_{x_in} eq_lo[x_in] * P(...))
+                //           = ∑_{g} Eq(g) * P(g)
                 final_acc[j] += e_out_val * inner_val;
             }
         }
 
+        // 应用全局缩放因子 (对应最初传入的 R^2)，修正数值并返回。
         final_acc.map(|x| x * outer_scale)
     }
 }

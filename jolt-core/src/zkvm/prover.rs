@@ -124,6 +124,7 @@ use allocative::FlameGraphBuilder;
 use common::jolt_device::MemoryConfig;
 use itertools::{zip_eq, Itertools};
 use rayon::prelude::*;
+use tracing::info;
 use tracer::{
     emulator::memory::Memory, instruction::Cycle, ChunksIterator, JoltDevice, LazyTraceIterator,
 };
@@ -992,14 +993,14 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         #[cfg(not(target_arch = "wasm32"))]
         print_current_memory_usage("Stage 1 baseline");
 
-        tracing::info!("Stage 1 proving");
+        info!("begin Stage 1 proving");
 
         // 1. 初始化 UniSkip 参数 (Outer Sumcheck Params):
         // 从 Transcript 中获取随机挑战点 `tau` ($\tau$)。
         // 这个 `tau` 是 Verifier 选择的随机向量，用于将 R1CS 的矩阵约束压缩为单一的多项式约束。
         // `spartan_key` 包含了电路结构相关的矩阵信息。
         let uni_skip_params = OuterUniSkipParams::new(&self.spartan_key, &mut self.transcript);
-        println!("stage1 : uni_skip_params.tau: {:?}", uni_skip_params.tau);
+        info!("stage1 : uni_skip_params.tau: {:?}", uni_skip_params.tau);
 
         // 2. 初始化 UniSkip Prover:
         // 使用完整的执行轨迹 (Trace) 和字节码 (Bytecode) 来初始化 Prover。
@@ -1107,6 +1108,8 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             ProductVirtualUniSkipParams::new(&self.opening_accumulator, &mut self.transcript);
         println!("stage2 : uni_skip_params.tau: {:?}", uni_skip_params.tau);
 
+        //主要计算5种乘法约束的评估值，并且用eq进行点的加扰，目的是后续证明CPU视角的trace跟内存、查找表视角的输入输出是一致的。
+        //此处计算的是CPU视角的值
         let mut uni_skip =
             ProductVirtualUniSkipProver::initialize(uni_skip_params.clone(), &self.trace);
 

@@ -1437,22 +1437,52 @@ impl ProductVirtualEval {
         (left_acc.barrett_reduce(), right_acc.barrett_reduce())
     }
 
-    /// Compute the fused left·right product at the j-th extended uniskip target for product virtualization.
-    /// Uses precomputed integer Lagrange coefficients over the size-5 base window and returns an S256 product.
+    /// 计算用于乘积虚拟化（Product Virtualization）的融合左右乘积。
+    ///
+    /// **背景**:
+    /// Jolt 有 5 种不同的乘法约束（例如指令解码、寄存器写入、跳转标志等）。
+    /// 为了提高效率，我们不分别验证这 5 个约束，而是将它们“虚拟化”为一个单变量多项式 $$P(x) = L(x) \cdot R(x)$$。
+    /// - 在基础域（Base Domain, x=0..4）上，$P(x)$ 的值分别对应这 5 个约束的计算结果 ($$L_i \cdot R_i$$)。
+    /// - 为了运行 Sumcheck 协议，我们需要在更大的**扩展域**上求值。
+    ///
+    /// **功能**:
+    /// 此函数计算该虚拟多项式在扩展域的第 `j` 个点（uniskip target）上的值。
+    /// 计算公式大致为：
+    /// $$ Value_j = (\sum_{k=0}^4 c_{j,k} \cdot Left_k) \times (\sum_{k=0}^4 c_{j,k} \cdot Right_k) $$
+    /// 其中 $c_{j,k}$ 是预计算的拉格朗日插值系数，$Left_k$ 和 $Right_k$ 是第 $k$ 个约束的左、右输入。
+    ///
+    /// **参数**:
+    /// - `row`: 当前执行周期（Cycle）的所有输入数据（标志位、操作数等）。
+    /// - `j`: 扩展域上的评估点索引。
+    ///
+    /// **返回**:
+    /// - `S256`: 为了防止溢出，结果使用 256 位有符号整数表示。
     #[inline]
     pub fn extended_fused_product_at_j<F: JoltField>(row: &ProductCycleInputs, j: usize) -> S256 {
+        // 1. 获取预计算的插值系数。
+        // `c` 是一个数组，包含 5 个系数，对应于将扩展域点 `j` 映射回基础域 0..4 的拉格朗日基函数值。
         let c: &[i32; PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DOMAIN_SIZE] =
             &PRODUCT_VIRTUAL_COEFFS_PER_J[j];
 
-        // Weighted components lifted to i128
+        // 初始化加权后的左、右分量数组。
+        // 使用 i128 是为了确保中间计算（系数 * 输入）不会溢出。
         let mut left_w: [i128; NUM_PRODUCT_VIRTUAL] = [0; NUM_PRODUCT_VIRTUAL];
         let mut right_w: [i128; NUM_PRODUCT_VIRTUAL] = [0; NUM_PRODUCT_VIRTUAL];
 
-        // 0: Instruction (LeftInstructionInput × RightInstructionInput)
+        // -------------------------------------------------------------------------
+        // 2. 计算 5 个虚拟约束分量的加权值
+        // -------------------------------------------------------------------------
+
+        // 约束 0: 指令解码约束 (Instruction)
+        // 逻辑: 验证指令操作数的拆解是否正确。
+        // Left: 指令的左半部分输入
+        // Right: 指令的右半部分输入
         left_w[0] = (c[0] as i128) * (row.instruction_left_input as i128);
         right_w[0] = (c[0] as i128) * row.instruction_right_input;
 
-        // 1: WriteLookupOutputToRD (IsRdNotZero × WriteLookupOutputToRD_flag)
+        // 约束 1: 查找表输出写入 RD 寄存器 (WriteLookupOutputToRD)
+        // 逻辑: 如果是 RD 写操作且不是跳转，则验证查找表结果是否写入 RD。
+        // 原始约束: IsRdNotZero * WriteLookupOutputToRD_flag
         left_w[1] = if row.is_rd_not_zero { c[1] as i128 } else { 0 };
         right_w[1] = if row.write_lookup_output_to_rd_flag {
             c[1] as i128
@@ -1460,11 +1490,16 @@ impl ProductVirtualEval {
             0
         };
 
-        // 2: WritePCtoRD (IsRdNotZero × Jump_flag)
+        // 约束 2: PC 值写入 RD 寄存器 (WritePCtoRD)
+        // 逻辑: 用于 JAL/JALR 指令，将 PC+4 写入 RD。
+        // 原始约束: IsRdNotZero * Jump_flag
         left_w[2] = if row.is_rd_not_zero { c[2] as i128 } else { 0 };
         right_w[2] = if row.jump_flag { c[2] as i128 } else { 0 };
 
-        // 3: ShouldBranch (LookupOutput × Branch_flag)
+        // 约束 3: 分支判断 (ShouldBranch)
+        // 逻辑: 验证分支条件是否成立（由查找表输出决定）。
+        // 原始约束: LookupOutput * Branch_flag
+        // 该约束通常用于验证 BEQ, BNE 等指令的比较结果。
         left_w[3] = (c[3] as i128) * (row.should_branch_lookup_output as i128);
         right_w[3] = if row.should_branch_flag {
             c[3] as i128
@@ -1472,11 +1507,18 @@ impl ProductVirtualEval {
             0
         };
 
-        // 4: ShouldJump (Jump_flag × (1 − NextIsNoop))
+        // 约束 4: 跳转判断 (ShouldJump)
+        // 逻辑: 验证是否需要执行跳转更新 PC。
+        // 原始约束: Jump_flag * (1 - NextIsNoop)
+        // 如果下一条不是空操作(Noop)，且当前是跳转指令，则触发跳转逻辑。
         left_w[4] = if row.jump_flag { c[4] as i128 } else { 0 };
         right_w[4] = if row.not_next_noop { c[4] as i128 } else { 0 };
 
-        // Fuse in i128, then multiply as S128×S128 → S256
+        // -------------------------------------------------------------------------
+        // 3. 融合 (Fusion)
+        // -------------------------------------------------------------------------
+        // 将所有约束的加权左项求和，得到虚拟多项式的左因子 L(x_j)。
+        // 将所有约束的加权右项求和，得到虚拟多项式的右因子 R(x_j)。
         let mut left_sum: i128 = 0;
         let mut right_sum: i128 = 0;
         let mut i = 0;
@@ -1485,8 +1527,16 @@ impl ProductVirtualEval {
             right_sum += right_w[i];
             i += 1;
         }
+
+        // -------------------------------------------------------------------------
+        // 4. 计算最终乘积
+        // -------------------------------------------------------------------------
+        // 计算 P(x_j) = L(x_j) * R(x_j)。
+        // 使用宽整数类型 (S128 -> S256) 进行乘法，以避免溢出并保持精度。
         let left_s128 = S128::from_i128(left_sum);
         let right_s128 = S128::from_i128(right_sum);
+
+        // 返回最终的 S256 结果
         left_s128.mul_trunc::<2, 4>(&right_s128)
     }
 
