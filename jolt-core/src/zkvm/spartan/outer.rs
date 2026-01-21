@@ -4,6 +4,7 @@ use std::sync::Arc;
 use allocative::Allocative;
 use ark_std::Zero;
 use rayon::prelude::*;
+use tracing::info;
 use tracer::instruction::Cycle;
 
 use crate::field::BarrettReduce;
@@ -244,7 +245,7 @@ impl<F: JoltField> OuterUniSkipProver<F> {
         // -------------------------------------------------------------------
 
         let mut final_acc = [F::zero(); OUTER_UNIVARIATE_SKIP_DEGREE];
-
+        // info!("Starting univariate-skip extended evals computation: out_len = {}, in_len = {}", out_len, in_len);//out_len = 32, in_len = 32
         // 遍历 External 变量组合 (x_out)
         for x_out in 0..out_len {
             let mut inner_acc = [Acc8S::<F>::zero(); OUTER_UNIVARIATE_SKIP_DEGREE];
@@ -252,6 +253,7 @@ impl<F: JoltField> OuterUniSkipProver<F> {
             // 遍历 Internal 变量组合 (x_in)
             for x_in in 0..in_len {
                 let e_in_val = e_in[x_in];
+                // info!("Processing x_out = {}, x_in = {}, e_in_val = {}", x_out, x_in, e_in_val);
 
                 // --- 步骤 I: 索引解码 (Mapping) ---
                 // x_out 是高位索引
@@ -260,6 +262,7 @@ impl<F: JoltField> OuterUniSkipProver<F> {
 
                 // 拼接高位和低位，算出当前是在处理 Trace 的第几行 (Cycle Index)
                 let base_step_idx = (x_out << num_x_in_prime_bits) | x_in_prime;
+                // info!("Processing x_out = {}, x_in = {}, base_step_idx = {}", x_out, x_in, base_step_idx);
 
                 // --- 步骤 II: 实时计算 Az, Bz (On-the-fly) ---
                 let row_inputs = R1CSCycleInputs::from_trace::<F>(
@@ -272,12 +275,15 @@ impl<F: JoltField> OuterUniSkipProver<F> {
 
                 // --- 步骤 III: 分组选择 (Group Selection) ---
                 let is_group1 = (x_in & 1) == 1;
+                // info!("is_group1 = {}", is_group1);
 
                 // --- 步骤 IV: 累加多项式评估值 ---
                 for j in 0..OUTER_UNIVARIATE_SKIP_DEGREE {
                     let prod_s192 = if !is_group1 {
+                       // info!("Using first group for j = {}", j);
                         eval.extended_azbz_product_first_group(j)
                     } else {
+                        // info!("Using second group for j = {}", j);
                         eval.extended_azbz_product_second_group(j)
                     };
 

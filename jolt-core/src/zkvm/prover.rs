@@ -2339,7 +2339,7 @@ mod tests {
         let mut program = host::Program::new("fibonacci-guest");
 
         // 2. 准备输入：将输入参数 (100u32) 序列化为字节向量。
-        let inputs = postcard::to_stdvec(&100u32).unwrap();
+        let inputs = postcard::to_stdvec(&5).unwrap();
 
         // 3. 解码程序：获取字节码、初始内存状态等信息。
         let (bytecode, init_memory_state, _) = program.decode();

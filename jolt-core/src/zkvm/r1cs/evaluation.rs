@@ -41,6 +41,7 @@ use ark_ff::biginteger::{S128, S160, S192, S256, S64};
 use ark_std::Zero;
 use rayon::prelude::*;
 use strum::IntoEnumIterator;
+use tracing::info;
 use tracer::instruction::Cycle;
 
 use crate::field::{BarrettReduce, FMAdd, JoltField};
@@ -530,10 +531,13 @@ impl<'a, F: JoltField> R1CSEval<'a, F> {
 
         // 获取预计算好的拉格朗日系数，对应于评估点 j
         let coeffs_i32: &[i32; OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE] = &COEFFS_PER_J[j];
+        //info!("extended_azbz_product_first_group: j = {}, coeffs_i32 = {:?}", j, coeffs_i32);
 
         // 从当前 Trace 行中提取 Az (标志位组) 和 Bz (约束值组)
         let az = self.eval_az_first_group();
+        //info!("extended_azbz_product_first_group: az = {:?}", az);
         let bz = self.eval_bz_first_group();
+        //info!("extended_azbz_product_first_group: bz = {:?}", bz);
 
         // 初始化累加器
         // Az 部分全是布尔值和系数相加，用 i32 足够（系数很小）
