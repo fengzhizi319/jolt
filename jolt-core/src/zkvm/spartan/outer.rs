@@ -634,6 +634,40 @@ impl<F: JoltField> OuterSharedState<F> {
         skip_all,
         name = "OuterSharedState::extrapolate_from_binary_grid_to_tertiary_grid"
     )]
+    /// 从二进制网格扩展到三进制网格的辅助函数。
+    ///
+    /// 在 Sumcheck 协议中，为了构建下一轮的多项式，我们需要在 {0, 1} 构成的超立方体上进行插值。
+    /// 为了确定一个多线性多项式（或低度多项式），通常需要在足够的点上进行评估。
+    /// 这里提到的 "Tertiary Grid" 通常指 {0, 1, 2}^n 或者类似的扩展域，用于后续的 Karatsuba 乘法或者多项式插值。
+    ///
+    /// # 参数
+    ///
+    /// * `acc_az`: Az 多项式的累加器。
+    /// * `acc_bz_first`: Bz 多项式（第一组约束）的累加器。
+    /// * `acc_bz_second`: Bz 多项式（第二组约束）的累加器。
+    /// * `grid_az`: 输出的 Az 网格评估值。
+    /// * `grid_bz`: 输出的 Bz 网格评估值。
+    /// * `jlen`: 当前窗口大小对应的网格点数量 (1 << window_size)。
+    /// * `klen`: 扩展挑战点组合的数量 (1 << num_challenges)。
+    /// * `offset`: 全局索引的偏移量。
+    /// * `scaled_w`: 预计算的权重向量 (Lagrange basis * random challenge weights)。
+    ///
+    /// # 算法逻辑
+    ///
+    /// 1. **约束分组 (Constraint Grouping)**:
+    ///    - 代码中用来 `selector = (full_idx & 1) == 1` 来区分约束组。
+    ///    - `full_idx` 是当前的全局索引。如果 LSB 为 0，属于第一组；为 1，属于第二组。
+    ///    - 这种分组策略（Interleaved Grouping）允许将所有约束均匀分布在同一个处理流程中，
+    ///      而不需要显式地构建两个完全分离的矩阵。这有助于负载均衡和并行计算。
+    ///
+    /// 2. **按需生成 (On-the-fly Generation)**:
+    ///    - `R1CSCycleInputs::from_trace` 根据 `step_idx` (Trace 行号) 实时重构出电路输入。
+    ///    - 这避免了将庞大的 R1CS 矩阵完全物化在内存中（Memory Efficient）。
+    ///    - `eval.fmadd_...` 方法将具体的电路值代入到约束多项式中，并利用 `scaled_w` 进行加权累加。
+    ///
+    /// 3. **Barrett Reduction**:
+    ///    - 为了性能，累加过程使用了延迟归约 (Acc5U, Acc6S 等)。
+    ///    - 最后阶段 `grid_az`/`grid_bz` 的计算中才调用 `barrett_reduce` 将大整数结果归约回有限域元素。
     fn extrapolate_from_binary_grid_to_tertiary_grid(
         &self,
         acc_az: &mut [Acc5U<F>],
@@ -673,14 +707,19 @@ impl<F: JoltField> OuterSharedState<F> {
             .for_each(|(j, ((acc_az_j, acc_bz_first_j), acc_bz_second_j))| {
                 for k in 0..klen {
                     let full_idx = offset + j * klen + k;
+                    // 通过右移一位获取真实的 Trace 步骤索引 (Trace Step Index)
+                    // 因为最低位被用作分组选择器 (Group Selector)
                     let current_step_idx = full_idx >> 1;
+                    // 最低位决定是第一组约束还是第二组约束
                     let selector = (full_idx & 1) == 1;
 
+                    // 根据 Trace 和 Bytecode 实时计算当步的电路输入值
                     let row_inputs =
                         R1CSCycleInputs::from_trace::<F>(preprocess, trace, current_step_idx);
                     let eval = R1CSEval::<F>::from_cycle_inputs(&row_inputs);
                     let w_k = &scaled_w[k];
 
+                    // 根据选择器将评估值累加到对应的累加器中
                     if !selector {
                         eval.fmadd_first_group_at_r(w_k, acc_az_j, acc_bz_first_j);
                     } else {
@@ -712,6 +751,19 @@ impl<F: JoltField> OuterSharedState<F> {
         skip_all,
         name = "OuterSharedState::compute_evaluation_grid_from_trace"
     )]
+    /// 从 Trace 计算评估网格。
+    ///
+    /// 这是 Spartan 协议中 sum-check 的关键步骤。它将 Trace 多项式的评估值扩展到一个稍大的域上，
+    /// 以便计算每轮 sum-check 所需的多项式系数。
+    ///
+    /// # 流程
+    ///
+    /// 1. **准备 Lagrange 权重**: 计算 `scaled_w`，结合了 `lagrange_evals_r` (在 r 点的 lagrange 插值) 和 `r_grid` (当前 sum-check 轮次的随机点组合)。
+    /// 2. **并行处理**: 并行遍历输出变量 (E_out) 的每一项。
+    /// 3. **内部循环与网格扩展**:
+    ///    - 对每个 E_in，调用 `extrapolate_from_binary_grid_to_tertiary_grid` 计算 Az 和 Bz 在网格点上的值。
+    ///    - 使用 `expand_linear_grid_to_multiquadratic` 将线性网格扩展为多二次形式 (Multi-Quadratic)，这对于后续计算乘积和 (inner product sum) 是必要的。
+    /// 4. **组合结果**: 计算 `Az * Bz * E_in` 并在 E_out 上累加，得到最终的 `t_prime` 多项式评估值。
     pub fn compute_evaluation_grid_from_trace(&mut self, window_size: usize) {
         let split_eq = &self.split_eq_poly;
 
@@ -909,6 +961,37 @@ impl<F: JoltField> OuterLinearStage<F> {
         skip_all,
         name = "OuterLinearStage::fused_materialise_polynomials_general_with_multiquadratic"
     )]
+    /// 融合多项式具体化与多二次项扩展（针对通用 Sumcheck 轮次）。
+    ///
+    /// 此函数是线性时间 Sumcheck 的核心优化。它的任务是：
+    /// 1. **具体化 (Materialise)**: 计算 Az 和 Bz 多项式在某一轮绑定后的剩余变量上的值。
+    ///    - 由于 R1CS 矩阵是稀疏的且具有高度结构化（Trace 重复性），我们不存储矩阵，
+    ///      而是通过 `R1CSCycleInputs` 和 `R1CSEval` 实时计算 Az/Bz。
+    ///    - 这些值被保存到 `az_bound` 和 `bz_bound` 中，作为下一轮 DensePolynomial 的输入。
+    ///
+    /// 2. **多二次项扩展 (Multiquadratic Expansion)**:
+    ///    - 为了计算 Sumcheck 的三次项系数，我们需要将线性网格插值扩展到多二次形式。
+    ///    - `expand_linear_grid_to_multiquadratic` 执行这个操作，使得我们能够利用 Karatsuba 乘法或其他快速多项式乘法。
+    ///
+    /// 3. **融合 (Fused)**:
+    ///    - 将上述两个步骤（以及乘积求和 `inner_sum`）融合在一个大循环中。
+    ///    - 这极大地减少了内存带宽需求，因为不需要多次遍历庞大的数据结构。
+    ///    - 数据在 cache 中生成并立即被消费。
+    ///
+    /// # 详细逻辑
+    ///
+    /// - **分块并行**: 使用 `par_chunks_mut` 将输出缓冲区 `az_bound`/`bz_bound` 分块，每个线程通过 `fold` 处理一块数据。
+    /// - **内部循环**:
+    ///   - 遍历 `pair_idx` (代表 x_out 和 x_in 的组合)。
+    ///   - 遍历 `grid_size` (当前窗口大小的所有点)。
+    ///   - 遍历 `num_r_vals` (上一轮挑战点的所有组合，即 `r_grid`)。
+    ///   - 实时调用 `R1CSEval` 计算 Az/Bz 分量，并累加到 `acc_az`/`acc_bz`。
+    /// - **归约与复制**: 使用 Barrett Reduction 将累加器不仅结果归约，并复制到输出缓冲区。
+    /// - **计算内积**: 计算 `buff_a * buff_b` 并累加到 `inner_sum`，用于构建 `t_prime_poly` (即 Sumcheck 消息多项式)。
+    ///
+    /// # 返回值
+    ///
+    /// 返回两个 `DensePolynomial`: `Az` 和 `Bz`，它们被绑定了上一轮的随机数，且准备好用于下一轮的折叠。
     fn fused_materialise_polynomials_general_with_multiquadratic(
         shared: &mut OuterSharedState<F>,
         window_size: usize,
@@ -1004,6 +1087,7 @@ impl<F: JoltField> OuterLinearStage<F> {
                                 let full_idx = base_idx | x_val_shifted | r_idx;
 
                                 let step_idx = full_idx >> 1;
+                                // 同样，根据最低位判断分组
                                 let selector = (full_idx & 1) == 1;
 
                                 let row_inputs = R1CSCycleInputs::from_trace::<F>(
@@ -1029,6 +1113,7 @@ impl<F: JoltField> OuterLinearStage<F> {
                             }
                         }
 
+                        // 归约当前块的结果
                         for x_val in 0..grid_size {
                             az_grid[x_val] = acc_az[x_val].barrett_reduce();
                             bz_grid[x_val] = acc_bz_first[x_val].barrett_reduce()
@@ -1040,6 +1125,7 @@ impl<F: JoltField> OuterLinearStage<F> {
                         az_chunk[buffer_offset..end].copy_from_slice(&az_grid[..grid_size]);
                         bz_chunk[buffer_offset..end].copy_from_slice(&bz_grid[..grid_size]);
 
+                        // 扩展到多二次形式
                         MultiquadraticPolynomial::<F>::expand_linear_grid_to_multiquadratic(
                             &az_grid,
                             &mut buff_a,
@@ -1053,8 +1139,8 @@ impl<F: JoltField> OuterLinearStage<F> {
                             window_size,
                         );
 
+                        // 计算内积并累加
                         let e_in = E_in[x_in_val];
-
                         if window_size == 1 {
                             let prod0 = buff_a[0] * buff_b[0];
                             let prod2 = buff_a[2] * buff_b[2];
@@ -1095,8 +1181,18 @@ impl<F: JoltField> OuterLinearStage<F> {
 
     #[tracing::instrument(
         skip_all,
-        name = "OuterLinearStage::fused_materialise_polynomials_round_zero"
+        name = "OuterSharedState::fused_materialise_polynomials_round_zero"
     )]
+    /// 融合多项式具体化（针对 Sumcheck 第 0 轮）。
+    ///
+    /// 这是 `fused_materialise_polynomials_general_with_multiquadratic` 的特化版本，用于 Sumcheck 的第一步。
+    /// 此时 `num_r_vals` (之前绑定的变量数) 为 0 (或者说 1 个组合)，因为还没有进行任何 Sumcheck 绑定。
+    ///
+    /// # 差异
+    ///
+    /// - 不需要遍历 `r_grid`，因为还没有 `r`。
+    /// - 直接从 `lagrange_evals_r0` (Univariate Skip 阶段产生的 Lagrange 评估) 获取权重。
+    /// - 逻辑简化，但核心思想（分块、实时计算、融合）相同。
     fn fused_materialise_polynomials_round_zero(
         shared: &mut OuterSharedState<F>,
         num_vars: usize,
@@ -1536,3 +1632,51 @@ impl<F: JoltField> LinearSumcheckStage<F> for OuterLinearStage<F> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ark_bn254::Fr;
+    use crate::zkvm::bytecode::BytecodePreprocessing;
+    use tracer::instruction::{Cycle, Instruction};
+    use common::constants::RAM_START_ADDRESS;
+    use tracer::instruction::add::ADD;
+
+    #[test]
+    fn test_compute_univariate_skip_extended_evals() {
+        // 1. Setup Bytecode
+        // We use an ADD instruction with valid address to pass preprocessing validation
+        let add = ADD {
+            address: RAM_START_ADDRESS,
+            ..Default::default()
+        };
+        let bytecode = vec![Instruction::ADD(add)];
+        let bp = BytecodePreprocessing::preprocess(bytecode);
+
+        // 2. Setup Tau
+        // tau represents (group_bit || row_bits)
+        // If we want trace length 32 (2^5), we need 5 bits for rows + 1 bit for group = 6 bits.
+        let num_vars = 6;
+        let trace_len = 1 << (num_vars - 1); // 32
+        let tau = vec![<Fr as JoltField>::Challenge::from(1u128); num_vars];
+
+        // 3. Setup Trace
+        let trace = vec![Cycle::NoOp; trace_len];
+
+        // 4. Call function
+        let evals = OuterUniSkipProver::<Fr>::compute_univariate_skip_extended_evals(
+            &bp,
+            &trace,
+            &tau
+        );
+
+        // 5. Assertions
+        assert_eq!(evals.len(), OUTER_UNIVARIATE_SKIP_DEGREE);
+
+        // Since we used NoOp and dummy tau, the result might be zero or non-zero depending on constraints.
+        // But we mainly check it runs without panic.
+    }
+}
+
+
+

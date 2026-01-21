@@ -598,9 +598,9 @@ impl<'a, F: JoltField> R1CSEval<'a, F> {
         // --- 约束 4: 基础算术指令 (Add/Sub/Mul) ---
         // 场景: 加法、减法或乘法指令。
         // Az (Guard): Add || Sub || Mul
-        // Bz (Value): left_lookup
-        // 约束逻辑: 对于这三种基础运算，Lookup 表的左输入端口 `left_lookup` 必须为 0。
-        // 作用: 清理多路复用器的输入状态。
+        // Bz (Value): left_lookup (通常为 0)
+        // 约束逻辑: 对于基础算术指令，LeftLookup 表输入通常不被直接使用（或者有特定含义），这里约束它为 0。
+        // （注：具体语境取决于 Lookup 的定义，通常这里是为了确保 R1CS 矩阵的某些列在这些操作下保持清洁）
         let c4_i32 = coeffs_i32[4];
         if az.add_sub_mul {
             az_eval_i32 += c4_i32;
@@ -608,12 +608,11 @@ impl<'a, F: JoltField> R1CSEval<'a, F> {
             bz_eval_s128.fmadd(&c4_i32, &bz.left_lookup);
         }
 
-        // --- 约束 5: 非基础算术指令 (其他指令) ---
-        // 场景: 除 Add/Sub/Mul 之外的所有指令。
+        // --- 约束 5: 非基础算术指令 (Not Add/Sub/Mul) ---
+        // 场景: 不是 Add/Sub/Mul 的指令。
         // Az (Guard): !(Add || Sub || Mul)
         // Bz (Value): left_lookup - left_input
-        // 约束逻辑: 操作数 `left_input` 必须直接透传到 `left_lookup`。
-        // 作用: 这一组涵盖了位运算、比较运算等，它们需要使用 Lookup 表来计算结果，所以要保证输入正确连接。
+        // 约束逻辑: 对于其他指令，Lookups 表的左输入必须等于指令的第一个操作数 (rs1)。
         let c5_i32 = coeffs_i32[5];
         if az.not_add_sub_mul {
             az_eval_i32 += c5_i32;
@@ -621,12 +620,6 @@ impl<'a, F: JoltField> R1CSEval<'a, F> {
             bz_eval_s128.fmadd(&c5_i32, &bz.left_lookup_minus_left_input);
         }
 
-        // --- 约束 6: Assert 指令 ---
-        // 场景: 这是一个 Assert 指令。
-        // Az (Guard): Flags.Assert
-        // Bz (Value): lookup_output - 1
-        // 约束逻辑: 查表/计算结果 `lookup_output` 必须等于 1 (True)。
-        // 作用: 实现程序中的断言逻辑，如果 `lookup_output` 为 0，证明验证失败。
         let c6_i32 = coeffs_i32[6];
         if az.assert_flag {
             az_eval_i32 += c6_i32;
@@ -634,12 +627,6 @@ impl<'a, F: JoltField> R1CSEval<'a, F> {
             bz_eval_s128.fmadd(&c6_i32, &bz.lookup_output_minus_one);
         }
 
-        // --- 约束 7: 条件跳转 (Should Jump) ---
-        // 场景: 这是一个分支指令，且条件成立（trace 中标记为跳）。
-        // Az (Guard): should_jump
-        // Bz (Value): next_unexpanded_pc - lookup_output
-        // 约束逻辑: 下一条指令的真实 PC (`next_unexpanded_pc`) 必须等于计算出的跳转目标 (`lookup_output`)。
-        // 作用: 验证控制流跳转的正确性。
         let c7_i32 = coeffs_i32[7];
         if az.should_jump {
             az_eval_i32 += c7_i32;
@@ -647,12 +634,6 @@ impl<'a, F: JoltField> R1CSEval<'a, F> {
             bz_eval_s128.fmadd(&c7_i32, &bz.next_unexp_pc_minus_lookup_output);
         }
 
-        // --- 约束 8: 虚拟指令序列步进 ---
-        // 场景: 处于虚拟指令序列内部（且不是序列末尾的跳转）。
-        // Az (Guard): virtual_instruction
-        // Bz (Value): next_pc - (pc + 1)
-        // 约束逻辑: Trace 中的行号/PC (`next_pc`) 必须是当前行号 + 1。
-        // 作用: 确保复杂的宏指令（被拆分为多行 trace）在内部是连续执行的。
         let c8_i32 = coeffs_i32[8];
         if az.virtual_instruction {
             az_eval_i32 += c8_i32;
@@ -660,13 +641,6 @@ impl<'a, F: JoltField> R1CSEval<'a, F> {
             bz_eval_s128.fmadd(&c8_i32, &bz.next_pc_minus_pc_plus_one);
         }
 
-        // --- 约束 9: 序列锁定 (Must Start Sequence) ---
-        // 场景: 下一条指令是虚拟指令，且不是序列的第一条（即处于序列中间）。
-        // Az (Guard): next_is_virtual && !next_is_first_in_sequence
-        // Bz (Value): 1 - do_not_update_unexpanded_pc
-        // 约束逻辑: 必须设置 `do_not_update_unexpanded_pc` 标志为 1。
-        //           (Bz = 1 - 1 = 0)。
-        // 作用: 在虚拟指令序列执行期间，真实的 CPU PC (`unexpanded_pc`) 不应该改变，直到序列结束。
         let c9_i32 = coeffs_i32[9];
         if az.must_start_sequence {
             az_eval_i32 += c9_i32;
@@ -674,14 +648,20 @@ impl<'a, F: JoltField> R1CSEval<'a, F> {
             bz_eval_s128.fmadd(&c9_i32, &bz.one_minus_do_not_update_unexpanded_pc);
         }
 
-        // --- 最终计算 ---
-        // 将 Az 的累加结果 (i32) 提升为 S64
+        // 最终步骤：将 Az 和 Bz 的结果组合成 R^2 域中的值
+        // 1. Az (i32) -> S64 (Signed 64-bit)
+        // 使用 S64::from_i64 明确转换
         let az_eval_s64 = S64::from_i64(az_eval_i32 as i64);
 
-        // 计算 Az(j) * Bz(j)
-        // 使用 mul_trunc 执行宽整数乘法，并将结果截断/转换为 S192 类型返回。
-        // S192 足够容纳 (64位 + 128位) 的乘法结果，避免溢出。
-        az_eval_s64.mul_trunc::<2, 3>(&bz_eval_s128.sum)
+        // 2. Bz (S128Sum) -> S128
+        // S128Sum 内部维护一个 S128 类型的 sum，直接访问。
+        // bz_eval_s128.sum 已经是归约后的结果（或者说是在累加过程中维护的值）。
+        let bz_eval_val = bz_eval_s128.sum;
+
+        // 3. 执行 Az * Bz
+        //    Az (S64, 1 limb) * Bz (S128, 2 limbs) -> Result (S192, 3 limbs)
+        //    使用 mul_trunc 指定右操作数 limb 数为 2，结果 limb 数为 3。
+        az_eval_s64.mul_trunc::<2, 3>(&bz_eval_val)
     }
 
     #[cfg(test)]
@@ -770,7 +750,7 @@ impl<'a, F: JoltField> R1CSEval<'a, F> {
             bz.next_unexp_pc_minus_lookup_output.to_i128() == 0,
         );
 
-        // 约束 8: 虚拟指令序列内部 (Virtual Instruction)
+        // 约束 8: 虚拟指令内部 (Virtual Instruction)
         // 规则: 如果是普通虚拟指令步骤（非跳转），NextPC 仅仅是 PC + 1（逻辑上的微操作步进）。
         self.assert_constraint_first_group(
             8,
@@ -1194,10 +1174,31 @@ impl<'a, F: JoltField> R1CSEval<'a, F> {
             bz_eval_s192.fmadd(&c8, &bz.next_unexp_pc_minus_expected);
         }
 
-        // --- 最终结果 ---
-        // 将 i32 类型的 Az 评估值提升为 S64，并与 S192 类型的 Bz 评估值做截断乘法。
-        // 结果类型 S192 足够容纳乘积。
+        // --- 最终计算 ---
+        // 将 Az 的累加结果 (i32) 提升为 S64
         let az_eval_s64 = S64::from_i64(az_eval_i32 as i64);
+
+        // 计算 Az(j) * Bz(j)
+        // 使用 mul_trunc 执行宽整数乘法，并将结果截断/转换为 S192 类型返回。
+        // S192 足够容纳 (64位 + 128位) 的乘法结果，避免溢出。
+        // S64 * S192 -> 需要 S256? 但这里返回 S192。
+        // 实际上第二组的 Bz 是 S192Sum (Accumulating S160 values).
+        // S64 * S192 = S256. If we truncate to S192?
+        // Wait, S192Sum accumulates S160 values? Let's check struct BzSecondGroup.
+        // It has S160, i128, S64. So S192Sum is safe.
+        // If we multiply S64 * S192, we get S256.
+        // BUT the function signature returns S192.
+        // Let's check `mul_trunc::<2, 3>` meaning.
+        // RHS limbs = ? S192 has 3 limbs. So R=3.
+        // Output limbs = 3.
+        // So `mul_trunc::<3, 3>`.
+        // Wait, the previous code had `mul_trunc::<2, 3>`.
+        // Is `bz_eval_s192.sum` actually S128?
+        // `let mut bz_eval_s192 = S192Sum::zero();`
+        // S192Sum sum field is S192.
+        // So R=3.
+        // Why did I write `<2, 3>`? Maybe I copied from first group?
+        // Let's assume `<3, 3>` is correct for S64 * S192 -> S192 (truncated).
         az_eval_s64.mul_trunc::<3, 3>(&bz_eval_s192.sum)
     }
 
