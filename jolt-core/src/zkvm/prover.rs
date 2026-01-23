@@ -124,7 +124,6 @@ use allocative::FlameGraphBuilder;
 use common::jolt_device::MemoryConfig;
 use itertools::{zip_eq, Itertools};
 use rayon::prelude::*;
-use tracing::info;
 use tracer::{
     emulator::memory::Memory, instruction::Cycle, ChunksIterator, JoltDevice, LazyTraceIterator,
 };
@@ -984,57 +983,72 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
     /// 1. **UniSkip Round**: 特殊处理第一个（或前几个）变量，生成 `UniSkipFirstRoundProof`。
     /// 2. **Standard Sumcheck**: 处理剩余的变量（通常对应时间步/Cycle 维度），生成 `SumcheckInstanceProof`。
     #[tracing::instrument(skip_all)]
+    // 定义 Stage 1 的证明函数。
+    // 返回值是一个元组，包含两部分证明：
+    // 1. UniSkipFirstRoundProof: 特殊的第一轮证明（处理高次项）。
+    // 2. SumcheckInstanceProof: 剩余轮次的标准 Sumcheck 证明。
     fn prove_stage1(
         &mut self,
     ) -> (
         UniSkipFirstRoundProof<F, ProofTranscript>,
         SumcheckInstanceProof<F, ProofTranscript>,
     ) {
+        // [调试/监控] 如果不是在 WASM 环境下，打印当前内存使用情况，作为基线。
         #[cfg(not(target_arch = "wasm32"))]
         print_current_memory_usage("Stage 1 baseline");
 
-        info!("begin Stage 1 proving");
+        tracing::info!("Stage 1 proving");
 
-        // 1. 初始化 UniSkip 参数 (Outer Sumcheck Params):
-        // 从 Transcript 中获取随机挑战点 `tau` ($\tau$)。
-        // 这个 `tau` 是 Verifier 选择的随机向量，用于将 R1CS 的矩阵约束压缩为单一的多项式约束。
-        // `spartan_key` 包含了电路结构相关的矩阵信息。
+        // =================================================================
+        // 第一部分：UniSkip (Univariate Skip) - 第 0 轮
+        // 目标：处理最高次数的约束（如 A*B - C），将其规约为更低维的问题。
+        // =================================================================
+
+        // 1. 初始化 UniSkip 参数。
+        // 这里会从 Transcript 中获取随机数（如 tau），用于构建 Random Linear Combination (RLC)。
+        // RLC 将所有 R1CS 约束或 Lookup 约束压缩成一个单一的多项式。
         let uni_skip_params = OuterUniSkipParams::new(&self.spartan_key, &mut self.transcript);
-        info!("stage1 : uni_skip_params.tau: {:?}", uni_skip_params.tau);
 
-        // 2. 初始化 UniSkip Prover:
-        // 使用完整的执行轨迹 (Trace) 和字节码 (Bytecode) 来初始化 Prover。
-        // `OuterUniSkipProver` 专门用于处理 Spartan Outer 约束中的第一层变量逻辑。
-        // 它会根据 Trace 数据准备多项式求值所需的上下文。
+        // 2. 初始化 UniSkip Prover。
+        // 这是一个特定的 Prover 实例，它只负责 Sumcheck 的第一轮。
+        // 它拥有 Trace 数据和 Bytecode 数据的所有权或引用，准备进行全量扫描。
         let mut uni_skip = OuterUniSkipProver::initialize(
             uni_skip_params.clone(),
             &self.trace,
             &self.preprocessing.shared.bytecode,
         );
 
-        // 3. 执行单变量跳跃（UniSkip）的第一轮证明:
-        // 这是 Sumcheck 的特殊第一轮。
-        // 标准 Sumcheck 每一轮都需要计算当前变量为 0 和 1 时的多项式值。
-        // UniSkip 利用了 Jolt 电路结构的特性，针对第一个变量进行了高度优化。
-        //
-        // 输出 `first_round_proof`: 包含第一轮的一元多项式提交。
-        // 副作用: 更新 `opening_accumulator` (累加评估点) 和 `transcript` (用于 Fiat-Shamir)。
+        // 3. 执行 UniSkip 第一轮证明。
+        // 这一步调用了我们之前详细分析过的 `prove_uniskip_round` 函数。
+        // - 它计算 input_claim (初始总和)。
+        // - 它计算外推点 (Zig-Zag points)。
+        // - 它更新 opening_accumulator (缓存了 r_0 处的评估值)。
+        // - 它返回 first_round_proof。
         let first_round_proof = prove_uniskip_round(
             &mut uni_skip,
             &mut self.opening_accumulator,
             &mut self.transcript,
         );
 
-        // 4. 配置剩余轮次的调度器 (Schedule):
-        // `tau.len()` 是总变量数。减 1 是因为第一轮已经被 UniSkip 处理了。
-        // `LinearOnlySchedule` 指示 Sumcheck 引擎按线性顺序（从变量 0 到 n）处理剩余的变量。
-        // 这些剩余变量通常对应于 Trace 的时间维度（Log(Trace Length)）。
+        // =================================================================
+        // 第二部分：Remaining Sumcheck - 剩余轮次
+        // 目标：在第 0 轮固定了第一个变量 r_0 后，继续对剩余的变量进行逐层剥离。
+        // =================================================================
+
+        // 4. 定义调度表 (Schedule)。
+        // Sumcheck 是一个多轮协议，每一轮需要决定：
+        // - 计算哪个多项式？
+        // - 绑定哪个变量？
+        // 这里使用了 `LinearOnlySchedule`，意味着按照线性的顺序处理变量。
+        // 轮数计算：tau.len() 是总变量数，减去 UniSkip 处理掉的 1 轮，就是剩余轮数。
+        // (注释提到 cycle variables，这通常指此时正在处理的时间步/循环计数器变量)。
         let schedule = LinearOnlySchedule::new(uni_skip_params.tau.len() - 1);
 
-        // 5. 创建共享状态 (Shared State):
-        // 为剩余的 Sumcheck 轮次创建共享只读数据结构。
-        // 使用 Arc 指针共享 `self.trace`，避免在流式计算中发生昂贵的数据复制。
-        // 这一步将 UniSkip 阶段产生的部分状态传递给后续的流式计算组件。
+        // 5. 构建共享状态 (Shared State)。
+        // 剩余的轮次依然需要访问 Trace 数据和之前计算的参数。
+        // 关键点：它传入了 `self.opening_accumulator`。
+        // 因为 UniSkip 已经把第 0 轮的结果更新进了 Accumulator，
+        // 这里的 SharedState 会读取那个结果作为第 1 轮的 Input Claim。
         let shared = OuterSharedState::new(
             Arc::clone(&self.trace),
             &self.preprocessing.shared.bytecode,
@@ -1042,34 +1056,29 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             &self.opening_accumulator,
         );
 
-        // 6. 初始化剩余部分的流式 Sumcheck Prover:
-        // `OuterRemainingStreamingSumcheck` 负责证明 Spartan Outer 约束中剩余的所有变量。
-        // 这里的多项式度数通常为 3 (Multiquadratic，即 eq * (A * B - C))。
-        // 它是一个 "Streaming" Prover，意味着它在计算过程中流式读取 Trace，而不是一次性物化巨大的多项式，从而节省内存。
+        // 6. 初始化剩余轮次的 Prover。
+        // `OuterRemainingStreamingSumcheck` 负责执行剩下的所有轮次。
+        // 它支持流式处理 (Streaming)，即不需要一次性把所有数据加载到内存，
+        // 而是可以边读取 Trace 边计算，节省内存。
         let mut spartan_outer_remaining: OuterRemainingStreamingSumcheck<_, _> =
             OuterRemainingStreamingSumcheck::new(shared, schedule);
 
-        // 7. 执行批量 Sumcheck (Batched Sumcheck):
-        // 运行通用的 Sumcheck 协议驱动器来处理剩余的所有轮次。
-        // 输入是一个 prover 列表（这里只有一个用于演示 Spartan Outer 约束的 prover）。
-        //
-        // 过程：
-        //   - 循环 (Total Rounds - 1) 次。
-        //   - 每轮计算单变量多项式 -> 提交给 Verifier -> 接收随机挑战 $r$ -> 绑定变量。
-        //
-        // 结果：
-        //   - `sumcheck_proof`: 包含所有中间轮次的证明。
-        //   - `_r_stage1`: 最终生成的随机向量（本处未使用）。
-        //   - `opening_accumulator`: 会被更新，加入最终归约得到的多项式评估点请求 (Claim)，
-        //     这些请求将在 Stage 8 (Dory Opening) 中统一验证。
+        // 7. 执行批量 Sumcheck (Batched Sumcheck)。
+        // 这是一个通用的驱动函数，它会运行一个循环：for i in 1..num_rounds。
+        // - 在每一轮，它调用 spartan_outer_remaining.compute_message()。
+        // - 提交 Proof 到 Transcript。
+        // - 获取随机挑战 r_i。
+        // - 更新 opening_accumulator。
+        // 返回值：
+        // - sumcheck_proof: 包含所有剩余轮次的单变量多项式。
+        // - _r_stage1: 这一阶段产生的所有随机数（通常用于后续步骤，这里暂时忽略）。
         let (sumcheck_proof, _r_stage1) = BatchedSumcheck::prove(
-            vec![&mut spartan_outer_remaining],
-            &mut self.opening_accumulator,
-            &mut self.transcript,
+            vec![&mut spartan_outer_remaining], // 可以同时处理多个 Instance，这里只有1个
+            &mut self.opening_accumulator,      // 持续更新 Accumulator
+            &mut self.transcript,               // 持续交互
         );
 
-        // 8. 返回结果:
-        // 分别返回第一轮的特殊证明和后续所有轮次的常规 Sumcheck 证明。
+        // 8. 返回两阶段的完整证明。
         (first_round_proof, sumcheck_proof)
     }
 
@@ -1090,15 +1099,22 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
     fn prove_stage2(
         &mut self,
     ) -> (
+        // 返回两部分证明：
+        // 1. 第一轮的高次/特殊轮次证明 (针对 Grand Product)。
         UniSkipFirstRoundProof<F, ProofTranscript>,
+        // 2. 剩余轮次的批量 Sumcheck 证明 (针对所有 Memory/Instruction 检查)。
         SumcheckInstanceProof<F, ProofTranscript>,
     ) {
         #[cfg(not(target_arch = "wasm32"))]
         print_current_memory_usage("Stage 2 baseline");
-
+        // =================================================================
+        // 1. Stage 2a: UniSkip Round (针对 Grand Product 的虚拟化处理)
+        // =================================================================
         // Use Case: 启动 Spartan 协议中的 "Grand Product Argument"（连乘论证）证明。
         // 这通常用于证明内存一致性（Memory Consistency）或查找表一致性（Lookup Consistency）。
         // 连乘论证的核心是证明两个集合的元素在某种变换下的乘积相等。
+        // Grand Product (用于内存检查和 Lookup) 是一个非常高次的多项式。
+        // 我们不能直接跑 Sumcheck，通常需要先用 UniSkip 协议进行一次降维或将其转化为更易处理的形式。
 
         // 1. Product Virtualization UniSkip (Stage 2a):
         // 类似于 Stage 1，这里处理连乘论证中的第一轮 Sumcheck。
@@ -1110,39 +1126,47 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
 
         //主要计算5种乘法约束的评估值，并且用eq进行点的加扰，目的是后续证明CPU视角的trace跟内存、查找表视角的输入输出是一致的。
         //此处计算的是CPU视角的值
+        //初始化 Prover：专门处理 Product Check 的第一轮。
         let mut uni_skip =
             ProductVirtualUniSkipProver::initialize(uni_skip_params.clone(), &self.trace);
 
         // 生成第一轮证明，Verifier 对此给出挑战，将问题归约到剩下的轮次（主要是时间/周期维度）。
-        // `opening_accumulator` 在此累积对 Eq 多项式的评估请求。
+        // 执行 UniSkip 第一轮：
+        // - 计算外推点 (Zig-Zag points)。
+        // - 更新 Accumulator (cache_openings)。
+        // - 返回 first_round_proof。
         let first_round_proof = prove_uniskip_round(
             &mut uni_skip,
             &mut self.opening_accumulator,
             &mut self.transcript,
         );
 
-        // 2. 初始化各子任务参数 (Initialization params)：
-        // Stage 2 是一个批量处理阶段，它并行运行多个不同的 Sumcheck 协议：
+        // =================================================================
+        // 2. 初始化子协议参数 (Initialization Params)
+        // Stage 2b 是一个 "Batched Sumcheck"，它同时运行 5 个不同的协议。
+        // =================================================================
 
-        // a. 连乘论证剩余部分 (Product Remainder)：
-        // 处理 Grand Product 论证中剩下的所有轮次（即时间/周期维度）。
-        // "Virtual" 意味着 Prover 不会显式构造巨大的乘积多项式，而是动态计算，节省内存。
+        // [子协议 1] Product Virtual Remainder
+        // 接力上面的 UniSkip。在 UniSkip 处理完 Grand Product 的第一层后，
+        // 剩余的部分在这里继续进行 Sumcheck。
         let spartan_product_virtual_remainder_params = ProductVirtualRemainderParams::new(
             self.trace.len(),
             uni_skip_params,
             &self.opening_accumulator,
         );
 
-        // b. RAM 访问标志评估 (Raf Evaluation)：
-        // 验证内存操作的元数据（如：这是一个读操作还是写操作？）。
-        // 计算 Read Access Frequency，用于加权统计内存访问频率。
+        // [子协议 2] RAM RAF (Random Access Function) Evaluation
+        // 验证内存布局和基本的随机访问逻辑。
+        // RAF 通常指 Read-After-Write 的一致性检查参数。
         let ram_raf_evaluation_params = RafEvaluationSumcheckParams::new(
             &self.program_io.memory_layout,
             &self.one_hot_params,
             &self.opening_accumulator,
         );
 
-        // c. RAM 读写一致性检查 (Read/Write Checking)：
+        // [子协议 3] RAM Read/Write Checking
+        // 这是内存检查的核心。它验证 Trace 中的内存操作日志是否满足
+        // 读写一致性（通常使用 Permutation Check 或 Sorting Argument）。
         // 核心内存检查：证明每次“读取”得到的值等于上一次“写入”该地址的值。
         // 这通常涉及排序后的地址元组检查（Multiset Equality Check/Offline Memory Checking）。
         // 需要验证原始 Trace（按时间排序）和重排 Trace（按地址排序）的一致性。
@@ -1154,16 +1178,21 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             &self.rw_config,
         );
 
-        // d. 输出检查 (Output Check)：
+        // [子协议 4] RAM Output Check
         // 证明程序的输出（Standard Output）与其最终内存状态中的相关部分一致。
         // 这确保了 Verifier 收到的程序执行结果确实来自该程序的执行内存。
         let ram_output_check_params = OutputSumcheckParams::new(
             self.one_hot_params.ram_k,
             &self.program_io,
-            &mut self.transcript,
+            &mut self.transcript,// 获取随机数用于 Output 检查
         );
 
-        // e. 指令查找 Claim 归约 (Instruction Lookups Claim Reduction)：
+        // [子协议 5] Instruction Lookups Claim Reduction
+        // 这是一个 "Claim Reduction" 步骤。
+        // 它负责证明：Stage 1 中使用的指令查找表 Claim，确实等于
+        // 实际执行 Trace 中的指令 Grand Product。
+        // 简单说：证明“我执行的指令都是合法的”。
+
         // 将 Stage 1 中产生的关于指令执行的 Claim，连接到具体的查找表证明上。
         // 确保“执行了 ADD 指令”这件事正确关联到了“ADD 查找表”。
         // 这里进行第一阶段的归约（Phase 1），使用 UniSkip 思想处理指令选择器。
@@ -1174,8 +1203,11 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
                 &mut self.transcript,
             );
 
-        // 3. 初始化具体的 Prover 实例 (Initialization)：
-        // 根据上述参数和 Trace 数据创建实际的计算对象。
+        // =================================================================
+        // 3. 初始化子协议 Prover (Initialization)
+        // 根据上面的参数，实例化具体的 Prover 对象。
+        // 每个 Prover 都实现了 `SumcheckInstanceProver` trait。
+        // =================================================================
 
         // A. 初始化 Spartan Product Remainder Prover。
         // 这是 Grand Product Argument（连乘论证）的第二阶段。
@@ -1207,7 +1239,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             &self.trace,
             &self.preprocessing.shared.bytecode,
             &self.program_io.memory_layout,
-            &self.initial_ram_state,
+            &self.initial_ram_state,// 需要初始内存状态
         );
 
         // D. 初始化 Output Check Prover。
@@ -1215,7 +1247,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         let ram_output_check = OutputSumcheckProver::initialize(
             ram_output_check_params,
             &self.initial_ram_state,
-            &self.final_ram_state,
+            &self.final_ram_state,// 需要最终内存状态
             &self.program_io.memory_layout,
         );
 
@@ -1244,7 +1276,13 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             );
         }
 
-        // 4. 打包实例进行批量证明 (Batch Proof)：
+        // =================================================================
+        // 4. 构建实例列表 (The Batch Vector)
+        // 将所有不同类型的 Prover 统一装箱 (Box) 放入一个 Vec 中。
+        // 利用 Rust 的多态 (Trait Object)，BatchedSumcheck 可以统一驱动它们。
+        // =================================================================
+
+        //  打包实例进行批量证明 (Batch Proof)：
         // 将上述 5 个不同的 Prover 放入一个列表。
         // 尽管它们验证逻辑不同（有的验证乘积、有的验证加权和、有的验证 IO），
         // 但它们都是基于多变量多项式的 Sumcheck 协议。
@@ -1257,10 +1295,19 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             Box::new(ram_output_check),
             Box::new(instruction_claim_reduction),
         ];
+        // [调试] 生成火焰图，可视化各实例的计算开销。
+        #[cfg(feature = "allocative")]
+        write_instance_flamegraph_svg(&instances, "stage2_start_flamechart.svg");
 
         tracing::info!("Stage 2 proving");
 
-        // 5. 执行 Batched Sumcheck：
+        // =================================================================
+        // 5. 执行 Batched Sumcheck (核心驱动)
+        // 这是一个循环过程，处理从第 1 轮到第 k 轮的所有 Sumcheck 逻辑。
+        // - instances: 所有子协议 Prover。
+        // - opening_accumulator: 持续累积所有子协议在每轮的评估值。
+        // - transcript: 生成共享的随机挑战 r_i。
+        // =================================================================
         // 迭代执行所有剩余轮次。每一轮，所有 Prover 计算各自的单变量多项式，
         // 聚合后提交给 Verifier，Verifier 返回一个随机数，所有 Prover 根据该随机数折叠多项式进入下一轮。
         // 最终的评估值会累积到 `opening_accumulator` 中，供 Stage 8 统一验证。
@@ -1269,6 +1316,10 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             &mut self.opening_accumulator,
             &mut self.transcript,
         );
+
+        // [调试] Stage 2 结束后的火焰图。
+        #[cfg(feature = "allocative")]
+        write_instance_flamegraph_svg(&instances, "stage2_end_flamechart.svg");
 
         // 后台释放资源，避免阻塞主线程。
         // 这些 Prover 对象在证明结束后不再需要，且可能占用大量内存。

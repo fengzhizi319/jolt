@@ -4,7 +4,6 @@ use std::sync::Arc;
 use allocative::Allocative;
 use ark_std::Zero;
 use rayon::prelude::*;
-use tracing::info;
 use tracer::instruction::Cycle;
 
 use crate::field::BarrettReduce;

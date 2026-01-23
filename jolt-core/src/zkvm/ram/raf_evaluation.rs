@@ -71,28 +71,49 @@ impl<F: JoltField> RafEvaluationSumcheckParams<F> {
           one_hot_params: &OneHotParams,
           opening_accumulator: &dyn OpeningAccumulator<F>,
       ) -> Self {
-          // 1. 获取 RAM 的起始物理地址。
-          // Jolt 为了优化内存证明，可能将稀疏的内存地址映射到一段连续的空间 (0..K)。
-          // `start_address` 用于后续构建 `Unmap` 多项式，将映射后的索引还原为真实的物理地址。
+          // -------------------------------------------------------------------------
+          // 1. 获取基准物理地址 (Base Address)
+          // -------------------------------------------------------------------------
+          // 背景：Jolt 的内存不是从 0 开始连续使用的。
+          // 真实的物理内存可能分段：代码段在 0x1000，堆在 0x8000 等。
+          // 但为了 ZK 证明的效率，我们在电路内部使用“连续索引” (0, 1, 2...K) 来表示内存操作。
+          //
+          // 这个 start_address 就是 offset。
+          // 关系：Physical_Address = Index + start_address
           let start_address = memory_layout.get_lowest_address();
-  
-          // 2. 计算地址空间的对数大小 (log K)。
-          // 这对应于 Sumcheck 协议需要进行的轮数 (number of rounds)。
+
+          // -------------------------------------------------------------------------
+          // 2. 确定 Sumcheck 的规模 (Log Size)
+          // -------------------------------------------------------------------------
+          // RAM 的证明不是针对整个 64位地址空间，而是针对实际使用到的（或 Padding 后的）
+          // 内存操作次数 K。
+          // log_K 决定了 Sumcheck 多项式有几个变量 (x_0 ... x_{logK-1})。
           let log_K = one_hot_params.ram_k.log_2();
-  
-          // 3. 从 Opening Accumulator 获取挑战点 `r_cycle`。
-          // 在 Spartan Outer Sumcheck 结束时，Verifier 请求了 `RamAddress` 虚拟多项式在随机点 `r_cycle` 处的值。
-          // 当前的 RAF Sumcheck 需要基于同一个 `r_cycle` 来构建其内部的多项式 `ra` (Random Access)。
-          // 这里的 `_` 忽略了评估值 (claim)，因为我们在参数初始化阶段只需要挑战点坐标。
+
+          // -------------------------------------------------------------------------
+          // 3. 核心：获取 Stage 1 的“指纹” (The Linkage)
+          // -------------------------------------------------------------------------
+          // 这一步最关键。
+          //
+          // opening_accumulator: 这是一个记账本，里面存着 Stage 1 结束时的所有数据。
+          // SumcheckId::SpartanOuter: 指的是 Stage 1 (CPU 指令执行阶段)。
+          // VirtualPolynomial::RamAddress: 这是 CPU 在 Stage 1 生成的“地址多项式”。
+          //
+          // get_virtual_polynomial_opening 返回两个值：
+          // 1. r_cycle: Stage 1 结束时生成的随机挑战点（代表了所有指令周期的随机线性组合）。
+          // 2. claim (被忽略的 _): CPU 声称在 r_cycle 点计算出的“加权地址和”。
+          //
+          // 我们这里获取 r_cycle 是为了确保 Stage 2 的 Sumcheck 是在同一个随机点上进行的。
+          // 只有在同一个 r 上，Stage 1 的 P(r) 和 Stage 2 的 Q(r) 才能比较。
           let (r_cycle, _) = opening_accumulator.get_virtual_polynomial_opening(
-              VirtualPolynomial::RamAddress, // 目标虚拟多项式
-              SumcheckId::SpartanOuter,      // 来源阶段 ID
+              VirtualPolynomial::RamAddress, // 这里的含义是：我要验证的目标是“地址”
+              SumcheckId::SpartanOuter,      // 来源是：CPU 执行阶段
           );
-  
+
           Self {
               log_K,
               start_address,
-              r_cycle,
+              r_cycle, // 拿着这个钥匙，去开启 RAM 的 Sumcheck
           }
       }
 }
