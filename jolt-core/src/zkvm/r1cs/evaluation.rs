@@ -502,7 +502,7 @@ impl<'a, F: JoltField> R1CSEval<'a, F> {
     }
 
     /// Product Az·Bz at the j-th extended uniskip target for the first group (uses precomputed weights).
-    /// 计算第一组约束在扩展点 j 处的 Az(j) * Bz(j) 乘积。
+    /// 计算第一组约束在扩展点 j (10,-1,11,-2,12,-3,13,-4,14,-5)处的 Az(j) * Bz(j) 乘积的结果。
     ///
     /// # 数学背景
     /// 我们需要计算两个多项式在点 j 的评估值的乘积：
@@ -1468,7 +1468,7 @@ impl ProductVirtualEval {
         // `c` 是一个数组，包含 5 个系数，对应于将扩展域点 `j` 映射回基础域 0..4 的拉格朗日基函数值。
         let c: &[i32; PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DOMAIN_SIZE] =
             &PRODUCT_VIRTUAL_COEFFS_PER_J[j];
-
+        info!("extended_azbz_product_first_group: j = {}, coeffs_i32 = {:?}", j, c);
         // 初始化加权后的左、右分量数组。
         // 使用 i128 是为了确保中间计算（系数 * 输入）不会溢出。
         let mut left_w: [i128; NUM_PRODUCT_VIRTUAL] = [0; NUM_PRODUCT_VIRTUAL];

@@ -182,34 +182,53 @@ pub fn prove_uniskip_round<F: JoltField, T: Transcript, I: SumcheckInstanceProve
     opening_accumulator: &mut ProverOpeningAccumulator<F>,
     transcript: &mut T,
 ) -> UniSkipFirstRoundProof<F, T> {
-    // 1. 获取实例当前的输入声明（Input Claim）。
-    // 在 Sumcheck 开始时，这通常是 Prover 声称的计算总和（Sum）。
+    // 1. 获取当前轮次的输入声明 (Input Claim)。
+    // 在 Sumcheck 协议开始时，这就是 Prover 声称的整个计算的总和 (Total Sum)。
+    // 如果这是递归步骤的一部分，它可能是上一层协议产生的 claim。
+    // opening_accumulator 负责管理这些声明的累加和验证状态。
     let input_claim = instance.input_claim(opening_accumulator);
     info!("input_claim: {:?}", input_claim);
 
-
-    // 2. 计算第 0 轮（即第一轮）的消息。
-    // Prover 需要在所有布尔超立方体顶点上对多项式进行求和，将其规约为一个单变量多项式 S(X)。
-    // 在 Uni-skip 场景中，这个多项式可能具有特定的度数结构。
+    // 2. 计算当前轮次（UniSkip 轮）的单变量多项式 g(x)。
+    // 核心逻辑：
+    // Sumcheck 协议要求 Prover 将多变量多项式 P(x_1, ..., x_n) 在除 x_1 外的所有变量上求和，
+    // 得到一个单变量多项式 g(x_1) = \sum_{x_2...x_n} P(x_1, ..., x_n)。
+    //
+    // 在 Jolt 的 UniSkip 上下文中：
+    // 这个 g(x) 通常是一个高次多项式（Degree > 1）。
+    // 这里的 `compute_message` 会执行昂贵的“全量扫描”操作：
+    // 它会在特定的点（通常是域外的点，即 Extrapolated Points，如 -1, -2...）上评估 g(x)，
+    // 而不仅仅是计算系数。这利用了 Jolt 的高性能评估算法。
+    // 参数 `0` 通常指示这是 Sumcheck 的第一阶段或特定的 Skip 轮次索引。
     let uni_poly = instance.compute_message(0, input_claim);
 
-    // 3. 将完整的多项式（系数形式）附加到 Transcript 中。
-    // 这一步模拟了 Prover 将多项式发送给 Verifier 的过程。
-    // Transcript 会吸收这些数据以作为生成后续随机挑战的熵源。
+    // 3. 将计算出的单变量多项式 g(x) 提交到 Transcript。
+    // 这一步对应 Sumcheck 协议中 Prover 将 g(x) 发送给 Verifier。
+    // 实际上发送的是多项式在特定点上的评估值（Evaluations），或者是压缩后的系数。
+    // 这一步是 Fiat-Shamir 变换的一部分，用于让 Verifier (或 Transcript) 稍后生成随机挑战。
     uni_poly.append_to_transcript(transcript);
 
-    // 4. 从 Transcript 中确定性地派生出随机挑战点 r_0。
-    // 这是 Fiat-Shamir 启发式应用，代替了交互式协议中 Verifier 发送随机数的一步。
+    // 4. 从 Transcript 中生成随机挑战点 r。
+    // 这是 Fiat-Shamir 启发式：模拟 Verifier 发送一个随机数 r (F::Challenge)。
+    // 这个 r 将被选为多项式第一个变量（或 UniSkip 这一批变量）的固定值。
     let r0: F::Challenge = transcript.challenge_scalar_optimized::<F>();
     info!("r0: {:?}", r0);
 
-    // 5. 将挑战点 r_0 缓存到实例中，并利用它更新内部状态。
-    // 实际上，这里会执行 Partial Evaluation（部分评估）：
-    // 将多变量多项式的第一个变量固定为 r_0，从而将问题规模从 n 个变量减少到 n-1 个变量，
-    // 为下一轮 Sumcheck 做准备。同时也会更新 accumulator 中的声明值。
+    // 5. 更新实例状态：绑定变量并计算新的 Claim。
+    // 这一步非常关键，它完成了 Sumcheck 的状态转移：
+    // 1. Binding (绑定): 将多变量多项式中的对应变量固定为 r0。
+    //    (注意：在 UniSkip 中，这可能意味着一次性绑定了多个原始布尔变量，或者在一个扩展域上进行绑定)。
+    // 2. Evaluate (求值): 计算 g(r0)。
+    //    根据 Sumcheck 协议，g(r0) 将成为下一轮 Sumcheck 的目标声明 (Next Claim)。
+    // 3. Update (更新): 将 accumulator 更新为这个新值，准备进入下一阶段（例如常规的 Sumcheck 轮次或结束）。
+    //
+    // 或者处理高维度的折叠。本质是将问题规模缩小，并将验证责任转移到 g(r0) 上。
     instance.cache_openings(opening_accumulator, transcript, &[r0]);
 
-    // 6. 将生成的单变量多项式封装在证明结构体中返回。
+    // 6. 构造并返回证明结构体。
+    // 这个 Proof 包含了一开始计算出的多项式 g(x)（通常是压缩形式或评估值形式）。
+    // Verifier 随后会利用这个 Proof 来执行自己的检查：
+    // 验证 g(0) + g(1) == input_claim，并计算 g(r0) 以推进验证。
     UniSkipFirstRoundProof::new(uni_poly)
 }
 

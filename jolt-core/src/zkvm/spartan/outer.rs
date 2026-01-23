@@ -155,6 +155,7 @@ impl<F: JoltField> OuterUniSkipProver<F> {
         // 在该随机点 `tau` 上的值 (或者其某种形式的投影/扩展)。得到sum-check矩阵，正常情况下矩阵所有点都为0
         // 这些值是后续进行线性时间 Sumcheck (Linear-time Sumcheck) 的基础。
         // "Univariate Skip" 暗示这里可能涉及对 Trace 中某些行或逻辑的跳过处理，或者是一种基于单变量多项式的优化技术。
+        //计算g1(10)，g1(-1),g1(11),g1(-2),g1(12),g1(-3),g1(13),g1(-4),g1(14),g1(-5),即在扩展点上的值
         let extended = Self::compute_univariate_skip_extended_evals(
             bytecode_preprocessing, // 用于确定每行 Trace 对应的具体计算逻辑（指令行为）
             trace,                  // 实际的 Witness 数据
@@ -192,7 +193,7 @@ impl<F: JoltField> OuterUniSkipProver<F> {
     ///
     /// \sum_{x_in'} eq(tau_in, (x_in', 0)) * Az(x_out, x_in', 0, y) * Bz(x_out, x_in', 0, y)
     ///     + eq(tau_in, (x_in', 1)) * Az(x_out, x_in', 1, y) * Bz(x_out, x_in', 1, y)
-    /// 计算单变量跳跃多项式（univariate skip polynomial）在扩展域上的评估值。
+    /// 计算单变量跳跃多项式（univariate skip polynomial）在扩展域上的评估值。（-1，5，-2，4，-3）
     ///
     /// 目标是计算：
     /// t_1(y) = \sum_{x_out} eq(tau_out, x_out) * \sum_{x_in} eq(tau_in, x_in) * Az(x_out, x_in, y) * Bz(x_out, x_in, y)
@@ -288,17 +289,21 @@ impl<F: JoltField> OuterUniSkipProver<F> {
                     };
 
                     inner_acc[j].fmadd(&e_in_val, &prod_s192);
+                    // info!("inner_acc[j] = {:?}", inner_acc[j]);
                 }
             }
 
             // 归约当前 External 块的结果
             let e_out_val = e_out[x_out];
+            // info!("inner_acc[j] = {:#?}", inner_acc);
             for j in 0..OUTER_UNIVARIATE_SKIP_DEGREE {
                 let reduced = inner_acc[j].montgomery_reduce();
                 // 乘以外部权重 e_out 并累加到总和
                 final_acc[j] += e_out_val * reduced;
             }
+            // info!("final_acc = {:#?}", final_acc);
         }
+
 
         // 4. 最终修正
         final_acc.map(|x| x * outer_scale)
