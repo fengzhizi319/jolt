@@ -72,14 +72,39 @@ impl<F: JoltField> OutputSumcheckParams<F> {
     /// * `ram_K`: RAM 的大小（地址条目数量），必须是 2 的幂。
     /// * `program_io`: Jolt 设备的 I/O 配置信息，包含内存布局。
     /// * `transcript`: 用于生成伪随机数的 Fiat-Shamir Transcript。
-    pub fn new(ram_K: usize, program_io: &JoltDevice, transcript: &mut impl Transcript) -> Self {
-        // 计算地址空间的位数 (log2(K))，并生成对应数量的随机挑战标量。
-        // 这些挑战标量构成了 Sumcheck 验证方程中 eq(r_address, k) 的 r_address 部分。
+    pub fn new(
+        // RAM 的总容量/操作数 K。
+        // log2(K) 决定了地址空间的维度（即地址有多少个比特）。
+        ram_K: usize,
+
+        // JoltDevice 包含了程序的输入和输出数据。
+        // 这里我们主要关心它的 `outputs` 字段，即程序运行结束后应当留在内存中的数据。
+        program_io: &JoltDevice,
+
+        // Transcript 用于生成随机挑战，保证非交互式证明的安全性。
+        transcript: &mut impl Transcript
+    ) -> Self {
+        // =================================================================
+        // 1. 生成随机地址挑战向量 r_address
+        // =================================================================
+        // 目的：
+        // Verifier 无法检查内存中的每一个字节（那样验证成本就不是 O(1) 了）。
+        // 根据 Sum-Check 协议，Verifier 随机选择一个“多维坐标点” r_address。
+        // Prover 必须证明：在 r_address 这个点上，"实际的最终内存多项式" 的值
+        // 等于 "预期的程序输出多项式" 的值。
+        //
+        // 参数 ram_K.log_2()：
+        // 如果 RAM 大小是 K，那么地址需要 log2(K) 个比特表示。
+        // 所以我们需要生成 log2(K) 个随机数，组成向量 r = (r_0, r_1, ...)。
         let r_address = transcript.challenge_vector_optimized::<F>(ram_K.log_2());
+
+        // =================================================================
+        // 2. 构造参数结构体
+        // =================================================================
         Self {
-            K: ram_K,
-            r_address,
-            program_io: program_io.clone(),
+            K: ram_K,           // 记录 RAM 大小，用于后续确定 Sumcheck 轮数
+            r_address,          // 保存Verifier 的随机考题（地址坐标）
+            program_io: program_io.clone(), // 保存预期的输出数据
         }
     }
 }

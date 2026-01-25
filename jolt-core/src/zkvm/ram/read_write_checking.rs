@@ -85,39 +85,76 @@ impl<F: JoltField> RamReadWriteCheckingParams<F> {
     /// * `trace_length`: 执行轨迹的长度 ($T$)。
     /// * `config`: 包含关于求和阶段（Phase 1/2）具体轮数的配置。
     pub fn new(
+        // 1. Opening Accumulator (上一阶段的遗产)
+        // 包含 Stage 1 (CPU 执行) 结束后的所有多项式评估值和挑战点。
         opening_accumulator: &dyn OpeningAccumulator<F>,
+        // 2. Transcript (随机数生成源)
+        // 用于生成 Fiat-Shamir 挑战，确保交互的安全性。
         transcript: &mut impl Transcript,
+        // 3. One-Hot Params (系统参数)
+        // 包含内存大小 K 等配置信息。
         one_hot_params: &OneHotParams,
+        // 4. Trace Length (执行轨迹长度 T)
+        // CPU 执行的总步数（指令数），通常对应时间戳 (Timestamp)。
         trace_length: usize,
+        // 5. Config (读写检查配置)
+        // 定义了 Grand Product 协议的轮数分配 (Phase 1 / Phase 2)。
         config: &ReadWriteConfig,
     ) -> Self {
-        // 1. 从 Transcript 中采样挑战标量 gamma。
-        // 这个值用于混合“读取”和“写入”的约束项。
-        // 根据 Sumcheck 顶部的公式：Target = rv_claim + gamma * wv_claim。
-        // 它实际上将读检查和写检查压缩到了同一个随机线性组合中。
+        // =================================================================
+        // 步骤 A: 生成随机挑战 Gamma (γ)
+        // =================================================================
+        // 这是一个至关重要的随机数，用于 Random Linear Combination (RLC)。
+        //
+        // 背景：
+        // 内存检查需要验证元组 (Address, Value, Timestamp) 的集合一致性。
+        // 为了将这三个数压缩成一个数进行连乘 (Grand Product)，我们需要一个随机权重 γ。
+        //
+        // 压缩公式通常为：
+        // Fingerprint = Address + γ * Value + γ^2 * Timestamp
+        //
+        // 只有当两个集合的连乘积相等时，才能证明内存读写是一致的。
         let gamma = transcript.challenge_scalar();
 
-        // 2. 获取上一阶段 (Spartan Outer Sumcheck) 的挑战点 r_cycle。
-        // 我们通过查询 `RamReadValue` 的 Opening 来获取该点。
-        // 注意：这里我们只需要点坐标 (r_cycle)，不需要具体的评估值 (也就是 tuple 的第二个元素被 _ 丢弃了)。
-        // 这样做是为了确保本阶段 Sumcheck 针对的是与上一阶段相同的一个随机评估点。
+        // =================================================================
+        // 步骤 B: 获取 Stage 1 的绑定点 r_cycle
+        // =================================================================
+        // 这里的 get_virtual_polynomial_opening 并不是为了获取“值”，
+        // 而是为了获取 CPU 阶段结束时锁定的那个随机点坐标 `r_cycle`。
+        //
+        // 为什么需要它？
+        // 1. Stage 1 (SpartanOuter) 证明了指令的执行，生成了关于 RamReadValue 的多项式承诺。
+        // 2. Stage 2 (本阶段) 要证明这些 ReadValue 是合法的（符合读写逻辑）。
+        // 3. 必须确保 Stage 2 检查的多项式，和 Stage 1 使用的多项式是“同一个”。
+        // 4. 通过共享同一个评估点 `r_cycle`，我们将两个独立的 Sum-check 协议“胶合”在了一起。
+        //
+        // VirtualPolynomial::RamReadValue: 指明我们要关联的是“内存读数值”这一列。
         let (r_cycle, _) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::RamReadValue,
             SumcheckId::SpartanOuter,
         );
 
-        // 3. 设置问题规模参数。
-        // K: RAM 地址空间大小 (由参数配置决定)。
-        // T: 执行轨迹长度 (时间步数)。
+        // =================================================================
+        // 步骤 C: 提取系统规模参数
+        // =================================================================
+
+        // K: 内存操作的总容量 (RAM Size / Operations)。
+        // 这通常是按地址排序后的 Trace 长度 (Sorted Trace)。
         let K = one_hot_params.ram_k;
+
+        // T: CPU 执行的时间步总数 (Time Steps)。
+        // 这是按时间顺序的 Trace 长度 (Execution Trace)。
+        // 在 Jolt 中，通常 K >= T，因为可能会有 Padding。
         let T = trace_length;
 
-        // 4. 构建并返回参数结构体。
+        // =================================================================
+        // 步骤 D: 构造参数结构体
+        // =================================================================
         RamReadWriteCheckingParams {
             K,
             T,
-            gamma,
-            r_cycle,
+            gamma,// 用于 RLC 压缩指纹
+            r_cycle,// 用于与 CPU 阶段绑定
             // 从配置中加载 Phase 1 (Cycle 也就是时间维度) 和 Phase 2 (Address 也就是空间维度) 的绑定轮数。
             // 这通常是为了优化 Proof 的生成性能，允许部分变量先绑定，分阶段处理。
             phase1_num_rounds: config.ram_rw_phase1_num_rounds as usize,

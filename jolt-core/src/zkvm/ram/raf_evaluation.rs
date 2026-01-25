@@ -87,8 +87,8 @@ impl<F: JoltField> RafEvaluationSumcheckParams<F> {
           // -------------------------------------------------------------------------
           // RAM 的证明不是针对整个 64位地址空间，而是针对实际使用到的（或 Padding 后的）
           // 内存操作次数 K。
-          // log_K 决定了 Sumcheck 多项式有几个变量 (x_0 ... x_{logK-1})。
-          let log_K = one_hot_params.ram_k.log_2();
+          // log_K 决定了 Sumcheck 多项式有几个变量 (x_0 ... x_{logK-1})。ram_k是使用到的RAM空间大小
+          let log_K = one_hot_params.ram_k.log_2();//ram_k=8192,log_K=13
 
           // -------------------------------------------------------------------------
           // 3. 核心：获取 Stage 1 的“指纹” (The Linkage)

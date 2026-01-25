@@ -124,6 +124,7 @@ use allocative::FlameGraphBuilder;
 use common::jolt_device::MemoryConfig;
 use itertools::{zip_eq, Itertools};
 use rayon::prelude::*;
+use tracing::info;
 use tracer::{
     emulator::memory::Memory, instruction::Cycle, ChunksIterator, JoltDevice, LazyTraceIterator,
 };
@@ -1123,6 +1124,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         let uni_skip_params =
             ProductVirtualUniSkipParams::new(&self.opening_accumulator, &mut self.transcript);
         println!("stage2 : uni_skip_params.tau: {:?}", uni_skip_params.tau);
+        info!("stage2 2a:  self.opening_accumulator: {:?}", self.opening_accumulator.openings);
 
         //主要计算5种乘法约束的评估值，并且用eq进行点的加扰，目的是后续证明CPU视角的trace跟内存、查找表视角的输入输出是一致的。
         //此处计算的是CPU视角的值
@@ -1140,6 +1142,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             &mut self.opening_accumulator,
             &mut self.transcript,
         );
+        info!("stage2 2a: self.opening_accumulator: {:?}", self.opening_accumulator.openings);
 
         // =================================================================
         // 2. 初始化子协议参数 (Initialization Params)
@@ -1154,15 +1157,20 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             uni_skip_params,
             &self.opening_accumulator,
         );
+        info!("stage2 2.1: self.opening_accumulator: {:?}", self.opening_accumulator.openings);
 
         // [子协议 2] RAM RAF (Random Access Function) Evaluation
         // 验证内存布局和基本的随机访问逻辑。
         // RAF 通常指 Read-After-Write 的一致性检查参数。
+        //one_hot_params是在JoltCpuProver::gen_from_elf方法中初始化JoltCpuProver结构体实例时赋值的，
+        // 此时会根据执行轨迹的长度和其他相关参数创建适当的OneHotParams实例，
+        // 用于后续的证明生成过程中的One-Hot编码操作。
         let ram_raf_evaluation_params = RafEvaluationSumcheckParams::new(
             &self.program_io.memory_layout,
             &self.one_hot_params,
             &self.opening_accumulator,
         );
+        info!("stage2 2.2: self.opening_accumulator: {:?}", self.opening_accumulator.openings);
 
         // [子协议 3] RAM Read/Write Checking
         // 这是内存检查的核心。它验证 Trace 中的内存操作日志是否满足
@@ -1177,6 +1185,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             self.trace.len(),
             &self.rw_config,
         );
+        info!("stage2 2.3: self.opening_accumulator: {:?}", self.opening_accumulator.openings);
 
         // [子协议 4] RAM Output Check
         // 证明程序的输出（Standard Output）与其最终内存状态中的相关部分一致。
@@ -1202,6 +1211,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
                 &self.opening_accumulator,
                 &mut self.transcript,
             );
+        info!("stage2 2.5: self.opening_accumulator: {:?}", self.opening_accumulator.openings);
 
         // =================================================================
         // 3. 初始化子协议 Prover (Initialization)
