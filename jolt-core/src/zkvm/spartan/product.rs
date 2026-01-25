@@ -601,57 +601,81 @@ impl<F: JoltField> ProductVirtualRemainderProver<F> {
     ///    * 同时计算当前 Sumcheck 首轮多项式的评估值 $t(0)$ 和 $t(inf)$，用于构造 Prover Message。
     #[tracing::instrument(skip_all, name = "ProductVirtualRemainderProver::initialize")]
     pub fn initialize(params: ProductVirtualRemainderParams<F>, trace: Arc<Vec<Cycle>>) -> Self {
-        // 1. 计算权重向量 w，其中 w[i] = L_i(r0)。
-        // 这里的 r0 是来自 Univariate Skip 阶段的随机点 (challenge)。
-        // 这些权重用于将 5 个独立的乘法约束项融合成一组 Left 和 Right 多项式。
+        // -----------------------------------------------------------------------
+        // 1. 预计算 Lagrange 基函数在 r0 处的评估值
+        // -----------------------------------------------------------------------
+        // params.r0 是上一轮 (UniSkip) 结束时产生的随机挑战点。
+        // 在本轮 Sumcheck 中，我们需要在这个点 r0 上维持一致性。
+        // 这里预先计算 r0 在 "UniSkip Domain" (通常是 Zig-Zag 域或小整数域) 上的 Lagrange 插值基函数值。
+        // 这些值后续用于将高维数据投影到 r0 这个点上。
         let lagrange_evals_r = LagrangePolynomial::<F>::evals::<
             F::Challenge,
-            PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DOMAIN_SIZE,
+            PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DOMAIN_SIZE, // 域大小，通常对应 UniSkip 的度数
         >(&params.r0);
 
-        // 2. 分解挑战向量 tau。
-        // tau 是从 Spartan Outer 传下来的，包含了所有变量的随机挑战。
-        // tau_high: Univariate Skip 维度的挑战点 (最后一项)。
-        // tau_low: Cycle 维度的挑战点向量 (其余项)。
+        // -----------------------------------------------------------------------
+        // 2. 拆分 EQ 多项式的随机挑战点 tau (Split Tau)
+        // -----------------------------------------------------------------------
+        // Grand Product 协议本质上在验证 sum( eq(tau, x) * polynomial(x) )。
+        // 这里将随机向量 tau 拆分为两部分：
+        // - tau_high: 最高维度的随机数 (Most Significant Bit, MSB)。
+        // - tau_low:  剩余维度的随机向量。
+        // 这种拆分是为了配合 GKR 的分层结构（每次将规模减半，即剥离一个变量）。
         let tau_high = params.tau[params.tau.len() - 1];
         let tau_low = &params.tau[..params.tau.len() - 1];
 
-        // 3. 计算高位缩放因子 scalar = L(tau_high, r0)。
-        // 完整的 Eq(\tau, x) 可以分解为 Eq(\tau_low, x_cycle) * Eq(\tau_high, r0)。
-        // 对于 Univariate Skip 这样的小域，Eq 实际上就是 Lagrange 插值核。
-        // 这个因子将在后续计算中一直伴随，确保验证等式两边的一致性。
+        // -----------------------------------------------------------------------
+        // 3. 计算 EQ 多项式的高位权重 (Kernel Evaluation)
+        // -----------------------------------------------------------------------
+        // 计算 eq(tau_high, r0_high) 相关的缩放因子。
+        // 由于我们正在处理 "Remainder"，我们需要将 eq 多项式的高位贡献
+        // 与上一轮的挑战 r0 结合起来。
+        // lagrange_kernel 计算的是插值核函数，本质上是计算高位变量对最终值的权重贡献。
         let lagrange_tau_r0 = LagrangePolynomial::<F>::lagrange_kernel::<
             F::Challenge,
             PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DOMAIN_SIZE,
         >(&tau_high, &params.r0);
 
-        // 4. 初始化 Split-Eq 多项式。
-        // 传入 scalar (lagrange_tau_r0) 作为初始缩放因子。
-        // 使得该多项式后续吐出的系数实际上是 Eq(tau_low, x) * scalar。
+        // -----------------------------------------------------------------------
+        // 4. 初始化优化的 EQ 多项式 (Gruen's Split Eq)
+        // -----------------------------------------------------------------------
+        // 为了加速 Sumcheck，Jolt 使用了 Gruen 优化算法。
+        // 我们不需要每次都重新计算完整的 eq(tau, x)。
+        // 这里创建了一个 "Split Eq Poly"，它只关注 tau_low (低位变量)，
+        // 但所有的值都已经被 lagrange_tau_r0 (高位权重) 缩放过了。
+        // 这相当于固定了高位，准备对低位进行求和。
         let split_eq_poly: GruenSplitEqPolynomial<F> =
             GruenSplitEqPolynomial::<F>::new_with_scaling(
-                tau_low,
-                BindingOrder::LowToHigh,
-                Some(lagrange_tau_r0),
+                tau_low,                // 低位随机数
+                BindingOrder::LowToHigh,// 变量绑定顺序
+                Some(lagrange_tau_r0),  // 高位带来的缩放因子
             );
 
-        // 5. 核心计算：生成首轮多项式评估点和绑定后的密集多项式。
-        // 这一步会扫描 Trace，利用权重 lagrange_evals_r 将多列数据融合，
-        // 生成 Left 和 Right 向量，并同时计算出 Sumcheck 第一轮所需的 t0 和 t_inf。
-        // 这个函数完成了从“原始执行轨迹”到“Sumcheck 密集多项式”的转换。
+        // -----------------------------------------------------------------------
+        // 5. 核心计算：生成子节点值和首轮评估 (Heavy Lifting)
+        // -----------------------------------------------------------------------
+        // 这是最耗时的一步。
+        // 扫描 Trace 数据，执行以下操作：
+        // a. 计算 GKR 协议所需的左右子节点值 (Left/Right Bounds)。
+        //    对于 Grand Product，Parent = Left * Right。
+        // b. 计算当前 Sumcheck 轮次所需的初始评估点 t(0) 和 t(inf)。
+        //    这些点用于构造证明多项式。
         let (t0, t_inf, left_bound, right_bound) =
             Self::compute_first_quadratic_evals_and_bound_polys(
-                &trace,
-                &lagrange_evals_r,
-                &split_eq_poly,
+                &trace,             // 执行痕迹
+                &lagrange_evals_r,  // r0 的投影系数
+                &split_eq_poly,     // 准备好的 Eq 多项式
             );
 
+        // -----------------------------------------------------------------------
+        // 6. 构造 Prover 实例
+        // -----------------------------------------------------------------------
         Self {
             split_eq_poly,
             trace,
-            left: left_bound,   // 存储融合后的密集 Left 多项式 (用于后续 rounds 绑定)
-            right: right_bound, // 存储融合后的密集 Right 多项式 (用于后续 rounds 绑定)
-            first_round_evals: (t0, t_inf), // 第一轮 Sumcheck 消息所需的点值
+            left: left_bound,   // 保存左子树累积多项式
+            right: right_bound, // 保存右子树累积多项式
+            first_round_evals: (t0, t_inf), // 保存首轮 Sumcheck 声明
             params,
         }
     }
