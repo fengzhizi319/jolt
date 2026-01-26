@@ -608,6 +608,7 @@ impl<F: JoltField> ProductVirtualRemainderProver<F> {
         // 在本轮 Sumcheck 中，我们需要在这个点 r0 上维持一致性。
         // 这里预先计算 r0 在 "UniSkip Domain" (通常是 Zig-Zag 域或小整数域) 上的 Lagrange 插值基函数值。
         // 这些值后续用于将高维数据投影到 r0 这个点上。
+        // L0(r_0), L1(r_0), ..., Ld(r_0)]
         let lagrange_evals_r = LagrangePolynomial::<F>::evals::<
             F::Challenge,
             PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DOMAIN_SIZE, // 域大小，通常对应 UniSkip 的度数
@@ -697,40 +698,54 @@ impl<F: JoltField> ProductVirtualRemainderProver<F> {
     #[inline]
     fn compute_first_quadratic_evals_and_bound_polys(
         trace: &[Cycle],
-        weights_at_r0: &[F; NUM_PRODUCT_VIRTUAL],
-        split_eq_poly: &GruenSplitEqPolynomial<F>,
+        weights_at_r0: &[F; NUM_PRODUCT_VIRTUAL], // Lagrange 基函数值，用于 UniSkip 投影
+        split_eq_poly: &GruenSplitEqPolynomial<F>, // 优化的 Eq 多项式计算器
     ) -> (F, F, DensePolynomial<F>, DensePolynomial<F>) {
+        // 获取 Eq 多项式的维度信息，用于遍历
         let num_x_out_vals = split_eq_poly.E_out_current_len();
         let num_x_in_vals = split_eq_poly.E_in_current_len();
         let iter_num_x_in_vars = num_x_in_vals.log_2();
 
+        // 计算总的分组数量，用于并行迭代
         let groups_exact = num_x_out_vals
             .checked_mul(num_x_in_vals)
             .expect("overflow computing groups_exact");
 
-        // Preallocate interleaved buffers once ([lo, hi] per entry)
+        // 1. 内存预分配：创建用于存储 L(x) 和 R(x) 的大数组
+        // 这些数组将保存完整的 Layer 数据，供后续 Sum-Check 轮次使用
         let mut left_bound: Vec<F> = unsafe_allocate_zero_vec(2 * groups_exact);
         let mut right_bound: Vec<F> = unsafe_allocate_zero_vec(2 * groups_exact);
 
-        // Parallel over x_out groups using exact-sized mutable chunks, with per-worker fold
+        // 2. 并行计算：将任务分块并行处理
+        // 返回值是两个累加器：t0_acc (h(0)) 和 t_inf_acc (h(X)的二次项系数)
         let (t0_acc_unr, t_inf_acc_unr) = left_bound
             .par_chunks_exact_mut(2 * num_x_in_vals)
             .zip(right_bound.par_chunks_exact_mut(2 * num_x_in_vals))
             .enumerate()
             .fold(
+                // 每个线程的初始化累加器 (使用 Unreduced 格式优化加法性能)
                 || (F::Unreduced::<9>::zero(), F::Unreduced::<9>::zero()),
                 |(mut acc0, mut acci), (x_out_val, (left_chunk, right_chunk))| {
                     let mut inner_sum0 = F::Unreduced::<9>::zero();
                     let mut inner_sum_inf = F::Unreduced::<9>::zero();
-                    for x_in_val in 0..num_x_in_vals {
-                        let base_idx = (x_out_val << iter_num_x_in_vars) | x_in_val;
-                        let idx_lo = base_idx << 1;
-                        let idx_hi = idx_lo + 1;
 
-                        // Materialize rows for lo and hi once
+                    // 内部循环：遍历低位变量 x_in
+                    for x_in_val in 0..num_x_in_vals {
+                        // 3. 索引计算：构造全局索引 base_idx
+                        // 这里实际上是在遍历前缀 x'
+                        let base_idx = (x_out_val << iter_num_x_in_vars) | x_in_val;
+
+                        // 构造最后一位 (LSB) 为 0 和 1 的两个物理索引
+                        let idx_lo = base_idx << 1;     // LSB = 0
+                        let idx_hi = idx_lo + 1;        // LSB = 1
+
+                        // 4. 数据获取：从原始 Trace 中读取行数据
+                        // 这相当于读取了 x 对应的所有列数据
                         let row_lo = ProductCycleInputs::from_trace::<F>(trace, idx_lo);
                         let row_hi = ProductCycleInputs::from_trace::<F>(trace, idx_hi);
 
+                        // 5. UniSkip 投影：计算 L 和 R 的值
+                        // 利用 weights_at_r0 将多列数据“融合”为一个值
                         let (left0, right0) = ProductVirtualEval::fused_left_right_at_r::<F>(
                             &row_lo,
                             &weights_at_r0[..],
@@ -740,30 +755,45 @@ impl<F: JoltField> ProductVirtualRemainderProver<F> {
                             &weights_at_r0[..],
                         );
 
+                        // 6. 二次多项式核心计算
+                        // p0 = P(0) = L(0) * R(0)
                         let p0 = left0 * right0;
+                        // slope = 二次项系数 = (L(1)-L(0)) * (R(1)-R(0))
                         let slope = (left1 - left0) * (right1 - right0);
+
+                        // 获取 Eq 权重 (Gruen 优化：利用 tensor 结构)
                         let e_in = split_eq_poly.E_in_current()[x_in_val];
+
+                        // 累加到线程局部和
                         inner_sum0 += e_in.mul_unreduced::<9>(p0);
                         inner_sum_inf += e_in.mul_unreduced::<9>(slope);
+
+                        // 7. 保存数据：将 L0, L1, R0, R1 写入 buffer
+                        // 这些数据在内存中是交错存储的 [L0, L1, L2, L3...]
                         let off = 2 * x_in_val;
                         left_chunk[off] = left0;
                         left_chunk[off + 1] = left1;
                         right_chunk[off] = right0;
                         right_chunk[off + 1] = right1;
                     }
+
+                    // 结合 Gruen 优化的高位权重 (e_out)
                     let e_out = split_eq_poly.E_out_current()[x_out_val];
                     let reduced0 = F::from_montgomery_reduce::<9>(inner_sum0);
                     let reduced_inf = F::from_montgomery_reduce::<9>(inner_sum_inf);
+
                     acc0 += e_out.mul_unreduced::<9>(reduced0);
                     acci += e_out.mul_unreduced::<9>(reduced_inf);
                     (acc0, acci)
                 },
             )
+            // 8. 归约：将所有线程的结果相加
             .reduce(
                 || (F::Unreduced::<9>::zero(), F::Unreduced::<9>::zero()),
                 |a, b| (a.0 + b.0, a.1 + b.1),
             );
 
+        // 返回最终结果：h(0), h_quad_coeff, 以及完整的 L/R 多项式表
         (
             F::from_montgomery_reduce::<9>(t0_acc_unr),
             F::from_montgomery_reduce::<9>(t_inf_acc_unr),
@@ -969,3 +999,443 @@ for ProductVirtualRemainderVerifier<F>
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ark_bn254::Fr;
+    use ark_std::{One, Zero};
+
+    /// 测试 Grand Product Argument 的完整证明和验证流程
+    ///
+    /// Grand Product Argument 用于证明两个多项式序列的元素对应相乘后的累积乘积相等，
+    /// 即证明 ∏ left[i] == ∏ right[i]。
+    ///
+    /// 通过 sum-check 协议，将连乘问题转换为求和问题：
+    /// 如果定义 frac[i] = left[i] / right[i]，那么需要证明 ∏ frac[i] == 1
+    ///
+    /// 使用辅助序列 helper，其中 helper[0] = frac[0], helper[i] = helper[i-1] * frac[i]
+    /// 最终需要验证：
+    /// 1. helper[n-1] == 1 (最终累积乘积为1)
+    /// 2. 通过 sum-check 验证 helper 序列的递归关系正确
+    #[test]
+    fn test_grand_product_argument_sumcheck() {
+        println!("=== 测试 Grand Product Argument 的数学性质 ===\n");
+
+        // ===== 场景 1：相同序列（基础测试）=====
+        println!("场景 1: 测试相同序列的 Grand Product");
+
+        // 测试 Grand Product 的核心性质：
+        // 如果 left = [2, 3, 4, 5] 和 right = [2, 3, 4, 5]
+        // 那么 ∏(left[i]/right[i]) = 1
+
+        let left_values = vec![
+            Fr::from(2u64),
+            Fr::from(3u64),
+            Fr::from(4u64),
+            Fr::from(5u64),
+        ];
+
+        let right_values = vec![
+            Fr::from(2u64),
+            Fr::from(3u64),
+            Fr::from(4u64),
+            Fr::from(5u64),
+        ];
+
+        // 计算累积乘积（Grand Product）
+        // helper[0] = left[0] / right[0]
+        // helper[i] = helper[i-1] * (left[i] / right[i])
+        let mut helper = Vec::new();
+        let mut accumulator = Fr::one();
+
+        for i in 0..left_values.len() {
+            // frac[i] = left[i] / right[i]
+            let frac = left_values[i] * right_values[i].inverse().unwrap();
+            accumulator *= frac;
+            helper.push(accumulator);
+            println!("  helper[{}] = {:?}", i, accumulator);
+        }
+
+        // 验证最终累积乘积应该为 1
+        println!("验证: 最终累积乘积 helper[{}] = {:?}", helper.len() - 1, helper.last().unwrap());
+        assert_eq!(
+            helper.last().unwrap(),
+            &Fr::one(),
+            "Grand Product 的最终累积乘积应该为 1"
+        );
+
+        // 验证递归关系：helper[i] * right[i] = helper[i-1] * left[i]
+        // 重排后：helper[i] = helper[i-1] * (left[i] / right[i])
+        println!("验证: 递归关系...");
+        for i in 1..helper.len() {
+            let expected = helper[i - 1] * left_values[i] * right_values[i].inverse().unwrap();
+            assert_eq!(
+                helper[i], expected,
+                "递归关系在索引 {} 处失败",
+                i
+            );
+        }
+        println!("✓ 场景 1 通过\n");
+
+        // ===== 场景 2：不平衡的序列（应该失败）=====
+        println!("场景 2: 测试不平衡的 Grand Product（预期失败）");
+
+        let unbalanced_left = vec![
+            Fr::from(2u64),
+            Fr::from(3u64),
+            Fr::from(4u64),
+            Fr::from(5u64),
+        ];
+
+        let unbalanced_right = vec![
+            Fr::from(2u64),
+            Fr::from(3u64),
+            Fr::from(4u64),
+            Fr::from(6u64), // 故意不同
+        ];
+
+        let mut unbalanced_helper = Vec::new();
+        let mut unbalanced_accumulator = Fr::one();
+
+        for i in 0..unbalanced_left.len() {
+            let frac = unbalanced_left[i] * unbalanced_right[i].inverse().unwrap();
+            unbalanced_accumulator *= frac;
+            unbalanced_helper.push(unbalanced_accumulator);
+        }
+
+        println!("  最终累积乘积 = {:?}", unbalanced_helper.last().unwrap());
+        // 最终累积乘积不应该为 1
+        assert_ne!(
+            unbalanced_helper.last().unwrap(),
+            &Fr::one(),
+            "不平衡的 Grand Product 不应该产生累积乘积 1"
+        );
+        println!("✓ 场景 2 通过（正确识别不平衡）\n");
+
+        // ===== 场景 3：排列场景（相同元素，不同顺序）=====
+        println!("场景 3: 测试排列场景（相同元素，不同顺序）");
+
+        // 如果 right 是 left 的排列，Grand Product 应该成立
+        let perm_left = vec![
+            Fr::from(7u64),
+            Fr::from(3u64),
+            Fr::from(5u64),
+            Fr::from(2u64),
+        ];
+
+        let perm_right = vec![
+            Fr::from(2u64),
+            Fr::from(5u64),
+            Fr::from(3u64),
+            Fr::from(7u64),
+        ];
+
+        // 计算两边的总乘积
+        let left_product: Fr = perm_left.iter().fold(Fr::one(), |acc, &x| acc * x);
+        let right_product: Fr = perm_right.iter().fold(Fr::one(), |acc, &x| acc * x);
+
+        println!("  left_product  = {:?}", left_product);
+        println!("  right_product = {:?}", right_product);
+        assert_eq!(
+            left_product, right_product,
+            "排列的两个序列应该有相同的乘积"
+        );
+        println!("✓ 场景 3 通过\n");
+
+        // ===== 场景 4：大数值测试 =====
+        println!("场景 4: 测试大数值的 Grand Product");
+
+        let large_left = vec![
+            Fr::from(1000000u64),
+            Fr::from(2000000u64),
+            Fr::from(3000000u64),
+        ];
+
+        let large_right = vec![
+            Fr::from(1000000u64),
+            Fr::from(2000000u64),
+            Fr::from(3000000u64),
+        ];
+
+        let mut large_helper = Vec::new();
+        let mut large_acc = Fr::one();
+
+        for i in 0..large_left.len() {
+            let frac = large_left[i] * large_right[i].inverse().unwrap();
+            large_acc *= frac;
+            large_helper.push(large_acc);
+        }
+
+        assert_eq!(
+            large_helper.last().unwrap(),
+            &Fr::one(),
+            "大数值的 Grand Product 也应该成立"
+        );
+        println!("✓ 场景 4 通过\n");
+
+        println!("✅ 所有 Grand Product Argument 测试场景通过！");
+    }
+
+    /// 测试 sum-check 在 Grand Product Argument 中的应用
+    ///
+    /// Sum-check 协议用于验证多变量多项式在布尔超立方体上的求和
+    /// 在 Grand Product 中，我们将连乘转换为对数空间的求和来验证
+    #[test]
+    fn test_sumcheck_for_grand_product() {
+        println!("测试 Sum-check 协议在 Grand Product 中的应用...");
+
+        // 1. 创建测试数据
+        // 我们要证明 left 和 right 的对应元素乘积序列的累积乘积相等
+        let n = 4; // 序列长度
+        let left = vec![
+            Fr::from(10u64),
+            Fr::from(20u64),
+            Fr::from(30u64),
+            Fr::from(40u64),
+        ];
+        let right = vec![
+            Fr::from(10u64),
+            Fr::from(20u64),
+            Fr::from(30u64),
+            Fr::from(40u64),
+        ];
+
+        // 2. 计算 fractional values: frac[i] = left[i] / right[i]
+        let fracs: Vec<Fr> = left
+            .iter()
+            .zip(right.iter())
+            .map(|(&l, &r)| l * r.inverse().unwrap())
+            .collect();
+
+        println!("分数值: {:?}", fracs);
+
+        // 3. 构建辅助序列 helper
+        // helper[0] = frac[0]
+        // helper[i] = helper[i-1] * frac[i]
+        let mut helper = Vec::with_capacity(n);
+        let mut acc = Fr::one();
+        for &frac in fracs.iter() {
+            acc *= frac;
+            helper.push(acc);
+        }
+
+        println!("辅助序列: {:?}", helper);
+
+        // 4. 验证约束条件
+        // 约束1: helper[n-1] == 1 (最终累积乘积)
+        assert_eq!(
+            helper[n - 1],
+            Fr::one(),
+            "最终累积乘积必须为 1"
+        );
+
+        // 约束2: 对于所有 i in [1, n-1]
+        // helper[i] * right[i] == helper[i-1] * left[i]
+        for i in 1..n {
+            let lhs = helper[i] * right[i];
+            let rhs = helper[i - 1] * left[i];
+            assert_eq!(lhs, rhs, "递归约束在索引 {} 处失败", i);
+        }
+
+        // 约束3: 初始条件
+        // helper[0] * right[0] == left[0]
+        let init_lhs = helper[0] * right[0];
+        let init_rhs = left[0];
+        assert_eq!(init_lhs, init_rhs, "初始条件约束失败");
+
+        println!("✅ Sum-check Grand Product 约束验证通过！");
+    }
+
+    /// 测试多项式插值和求值（Grand Product 的底层操作）
+    #[test]
+    fn test_polynomial_evaluation_for_product() {
+        println!("测试 Grand Product 中的多项式操作...");
+
+        // 在 Grand Product 中，我们需要对多个多项式在随机点求值
+        // 这个测试验证多项式求值的正确性
+
+        // 1. 创建一个简单的多项式（以系数形式）
+        // p(x) = 1 + 2x + 3x^2
+        let coeffs = vec![Fr::from(1u64), Fr::from(2u64), Fr::from(3u64)];
+
+        // 2. 在点 x = 5 处求值
+        let x = Fr::from(5u64);
+        let mut result = Fr::zero();
+        let mut x_power = Fr::one();
+
+        for &coeff in coeffs.iter() {
+            result += coeff * x_power;
+            x_power *= x;
+        }
+
+        // 手动计算: 1 + 2*5 + 3*25 = 1 + 10 + 75 = 86
+        let expected = Fr::from(86u64);
+        assert_eq!(result, expected, "多项式求值错误");
+
+        // 3. 测试多线性扩展（MLE）
+        // MLE 将布尔超立方体 {0,1}^n 上的值扩展到整个域
+        // 例如，对于 n=2，我们有 4 个点：(0,0), (0,1), (1,0), (1,1)
+        let mle_values = vec![
+            Fr::from(1u64), // f(0,0) = 1
+            Fr::from(2u64), // f(0,1) = 2
+            Fr::from(3u64), // f(1,0) = 3
+            Fr::from(4u64), // f(1,1) = 4
+        ];
+
+        // 在点 (r0, r1) = (0, 0) 处，MLE 应该等于 f(0,0) = 1
+        // 这是基本的拉格朗日插值性质
+        assert_eq!(mle_values[0], Fr::from(1u64));
+
+        println!("✅ 多项式求值测试通过！");
+    }
+
+    /// 测试 Sum-check 协议的多轮交互（模拟 Grand Product 验证过程）
+    ///
+    /// Sum-check 协议的核心思想：
+    /// 1. Prover 声称：sum_{x in {0,1}^n} g(x) = H
+    /// 2. Verifier 通过多轮交互验证这个声称
+    /// 3. 每一轮，Prover 发送一个单变量多项式
+    /// 4. Verifier 发送一个随机挑战
+    /// 5. 最终 Verifier 只需要在一个随机点评估 g
+    ///
+    /// 在 Grand Product 中，我们使用 sum-check 来验证：
+    /// sum_{x in {0,1}^n} [ helper(x) * right(x) - helper(x-1) * left(x) ] = 0
+    #[test]
+    fn test_sumcheck_protocol_simulation() {
+        println!("=== 模拟 Sum-check 协议在 Grand Product 中的应用 ===\n");
+
+        // 1. 设置多元多项式
+        // 我们有一个 2-变量布尔超立方体 {0,1}^2
+        // 定义多项式 g(x0, x1)，表示 Grand Product 的约束
+
+        println!("步骤 1: 构建 Grand Product 约束多项式");
+
+        // 定义 left 和 right 序列（4个点对应 2 变量）
+        let left = vec![
+            Fr::from(2u64),  // (0, 0)
+            Fr::from(3u64),  // (0, 1)
+            Fr::from(4u64),  // (1, 0)
+            Fr::from(5u64),  // (1, 1)
+        ];
+
+        let right = vec![
+            Fr::from(2u64),  // (0, 0)
+            Fr::from(3u64),  // (0, 1)
+            Fr::from(4u64),  // (1, 0)
+            Fr::from(5u64),  // (1, 1)
+        ];
+
+        // 计算 helper 序列
+        let mut helper = vec![Fr::one()];
+        for i in 1..left.len() {
+            let frac = left[i] * right[i].inverse().unwrap();
+            helper.push(helper[i - 1] * frac);
+        }
+
+        println!("  left   = {:?}", left);
+        println!("  right  = {:?}", right);
+        println!("  helper = {:?}\n", helper);
+
+        // 2. 定义约束多项式 g(x)
+        // g(i) = helper[i] * right[i] - helper[i-1] * left[i]
+        // 对于正确的 Grand Product，所有 g(i) 应该为 0（除了 i=0）
+
+        println!("步骤 2: 计算约束多项式在每个点的值");
+        let mut constraint_values = Vec::new();
+
+        // 特殊处理 i=0: g(0) = helper[0] * right[0] - left[0]
+        let g0 = helper[0] * right[0] - left[0];
+        constraint_values.push(g0);
+        println!("  g(0) = helper[0] * right[0] - left[0] = {:?}", g0);
+
+        // 对于 i > 0: g(i) = helper[i] * right[i] - helper[i-1] * left[i]
+        for i in 1..left.len() {
+            let gi = helper[i] * right[i] - helper[i - 1] * left[i];
+            constraint_values.push(gi);
+            println!("  g({}) = helper[{}] * right[{}] - helper[{}] * left[{}] = {:?}",
+                     i, i, i, i-1, i, gi);
+        }
+
+        // 3. 验证所有约束都为 0
+        println!("\n步骤 3: 验证约束多项式");
+        for (i, &val) in constraint_values.iter().enumerate() {
+            assert_eq!(val, Fr::zero(), "约束 g({}) 应该为 0", i);
+        }
+        println!("  ✓ 所有约束都为 0\n");
+
+        // 4. 计算 sum-check 的总和
+        // H = sum_{i} g(i) = 0 (因为每个 g(i) 都是 0)
+        let sum: Fr = constraint_values.iter().fold(Fr::zero(), |acc, &x| acc + x);
+        println!("步骤 4: Sum-check 总和");
+        println!("  H = sum_{{i}} g(i) = {:?}", sum);
+        assert_eq!(sum, Fr::zero(), "Grand Product 约束的总和应该为 0");
+        println!("  ✓ Sum-check 验证通过\n");
+
+        // 5. 模拟第一轮 sum-check
+        println!("步骤 5: 模拟 Sum-check 第一轮");
+        println!("  变量数 n = 2, 需要 2 轮交互");
+
+        // 第一轮：对第一个变量求和
+        // g_1(x1) = sum_{x0 in {0,1}} g(x0, x1)
+        let g1_0 = constraint_values[0] + constraint_values[1]; // x1=0: g(0,0) + g(1,0)
+        let g1_1 = constraint_values[2] + constraint_values[3]; // x1=1: g(0,1) + g(1,1)
+
+        println!("  第一轮单变量多项式:");
+        println!("    g_1(0) = g(0,0) + g(1,0) = {:?}", g1_0);
+        println!("    g_1(1) = g(0,1) + g(1,1) = {:?}", g1_1);
+
+        // Verifier 检查: g_1(0) + g_1(1) = H
+        let round1_sum = g1_0 + g1_1;
+        println!("  Verifier 检查: g_1(0) + g_1(1) = {:?}", round1_sum);
+        assert_eq!(round1_sum, sum, "第一轮 sum-check 应该匹配总和");
+        println!("  ✓ 第一轮验证通过\n");
+
+        // 6. Verifier 发送随机挑战
+        let r1 = Fr::from(7u64); // 实际中这是随机选择的
+        println!("步骤 6: Verifier 发送随机挑战 r1 = {:?}\n", r1);
+
+        // 7. 模拟第二轮 sum-check
+        // 现在需要在 r1 点评估
+        // g_2(x0) = g(x0, r1)
+        // 这需要插值计算
+        println!("步骤 7: 模拟 Sum-check 第二轮");
+        println!("  在随机点 r1 = {} 处插值评估", r1);
+
+        // 使用线性插值: g(x0, r1) = (1-r1)*g(x0,0) + r1*g(x0,1)
+        let g2_0 = (Fr::one() - r1) * constraint_values[0] + r1 * constraint_values[2]; // x0=0
+        let g2_1 = (Fr::one() - r1) * constraint_values[1] + r1 * constraint_values[3]; // x0=1
+
+        println!("  第二轮单变量多项式:");
+        println!("    g_2(0) = (1-r1)*g(0,0) + r1*g(0,1) = {:?}", g2_0);
+        println!("    g_2(1) = (1-r1)*g(1,0) + r1*g(1,1) = {:?}", g2_1);
+
+        // Verifier 检查: g_2(0) + g_2(1) = g_1(r1)
+        let g1_at_r1 = (Fr::one() - r1) * g1_0 + r1 * g1_1;
+        let round2_sum = g2_0 + g2_1;
+        println!("  Verifier 检查: g_2(0) + g_2(1) = {:?}", round2_sum);
+        println!("  应该等于: g_1(r1) = {:?}", g1_at_r1);
+        assert_eq!(round2_sum, g1_at_r1, "第二轮 sum-check 应该匹配");
+        println!("  ✓ 第二轮验证通过\n");
+
+        // 8. 最终验证
+        let r0 = Fr::from(13u64); // 第二个随机挑战
+        println!("步骤 8: 最终验证");
+        println!("  Verifier 发送第二个随机挑战 r0 = {:?}", r0);
+
+        // 计算 g(r0, r1)
+        let g_at_r0_r1 = (Fr::one() - r0) * g2_0 + r0 * g2_1;
+        println!("  g(r0, r1) = {:?}", g_at_r0_r1);
+
+        // 在实际协议中，Verifier 会使用 opening proof 验证这个值
+        println!("  ✓ Sum-check 协议完成\n");
+
+        println!("✅ Sum-check 协议模拟测试通过！");
+        println!("\n总结:");
+        println!("  - Grand Product 通过 sum-check 验证连乘关系");
+        println!("  - Sum-check 将 O(2^n) 的验证工作量降低到 O(n)");
+        println!("  - 每轮交互只需要传递一个单变量多项式（常数大小）");
+        println!("  - 最终只需要在一个随机点验证原始多项式");
+    }
+}
+

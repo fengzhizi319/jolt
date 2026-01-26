@@ -1142,7 +1142,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             &mut self.opening_accumulator,
             &mut self.transcript,
         );
-        info!("stage2 2a: self.opening_accumulator: {:?}", self.opening_accumulator.openings);
+        // info!("stage2 2a: self.opening_accumulator: {:?}", self.opening_accumulator.openings);
 
         // =================================================================
         // 2. 初始化子协议参数 (Initialization Params)
@@ -1157,7 +1157,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             uni_skip_params,
             &self.opening_accumulator,
         );
-        info!("stage2 2.1: self.opening_accumulator: {:?}", self.opening_accumulator.openings);
+        // info!("stage2 2.1: self.opening_accumulator: {:?}", self.opening_accumulator.openings);
 
         // [子协议 2] RAM RAF (Random Access Function) Evaluation
         // 验证内存布局和基本的随机访问逻辑。
@@ -1170,7 +1170,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             &self.one_hot_params,
             &self.opening_accumulator,
         );
-        info!("stage2 2.2: self.opening_accumulator: {:?}", self.opening_accumulator.openings);
+        // info!("stage2 2.2: self.opening_accumulator: {:?}", self.opening_accumulator.openings);
 
         // [子协议 3] RAM Read/Write Checking
         // 这是内存检查的核心。它验证 Trace 中的内存操作日志是否满足
@@ -1185,7 +1185,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             self.trace.len(),
             &self.rw_config,
         );
-        info!("stage2 2.3: self.opening_accumulator: {:?}", self.opening_accumulator.openings);
+        // info!("stage2 2.3: self.opening_accumulator: {:?}", self.opening_accumulator.openings);
 
         // [子协议 4] RAM Output Check
         // 证明程序的输出（Standard Output）与其最终内存状态中的相关部分一致。
@@ -1211,7 +1211,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
                 &self.opening_accumulator,
                 &mut self.transcript,
             );
-        info!("stage2 2.5: self.opening_accumulator: {:?}", self.opening_accumulator.openings);
+        // info!("stage2 2.5: self.opening_accumulator: {:?}", self.opening_accumulator.openings);
 
         // =================================================================
         // 3. 初始化子协议 Prover (Initialization)

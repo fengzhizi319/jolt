@@ -582,49 +582,66 @@ pub struct ProductCycleInputs {
 }
 
 impl ProductCycleInputs {
-    /// Build from trace and preprocessing, mirroring the semantics used by
-    /// product-virtualization witness generation.
+    /// 从执行痕迹 (Trace) 构建电路输入。
+    /// 这个函数镜像了 "Product-Virtualization" 见证生成过程中的语义。
+    /// 即：Prover 在生成证明时，需要用同样的方式看待数据。
     pub fn from_trace<F>(trace: &[Cycle], t: usize) -> Self
     where
         F: JoltField,
     {
-        let len = trace.len();
-        let cycle = &trace[t];
-        let instr = cycle.instruction();
+        // 1. 获取上下文信息
+        let len = trace.len();      // 总步数
+        let cycle = &trace[t];      // 当前时间步 t 的 CPU 状态
+        let instr = cycle.instruction(); // 获取当前执行的指令信息
+
+        // 2. 提取指令标志位 (Flags)
+        // flags_view: 对应电路层面的标志 (如 Jump, WriteToRD)
         let flags_view = instr.circuit_flags();
+        // instruction_flags: 对应指令语义的标志 (如 Branch, IsNoop, IsRdNotZero)
         let instruction_flags = instr.instruction_flags();
 
-        // Instruction inputs
+        // 3. 提取指令操作数 (Inputs)
+        // 对应数学公式中的 input_x, input_y (即 RS1, RS2 的值)
         let (left_input, right_input) = LookupQuery::<XLEN>::to_instruction_inputs(cycle);
 
-        // Lookup output
+        // 4. 提取 Lookup 输出
+        // 如果是分支指令，这可能是分支偏移量；如果是计算指令，这是计算结果
         let lookup_output = LookupQuery::<XLEN>::to_lookup_output(cycle);
 
-        // Jump and Branch flags
+        // 5. 提取控制流标志
+        // Jump: 无条件跳转标志 (JAL, JALR)
         let jump_flag = flags_view[CircuitFlags::Jump];
+        // Branch: 条件分支标志 (BEQ, BNE 等)
         let branch_flag = instruction_flags[InstructionFlags::Branch];
 
-        // Next-is-noop and its complement (1 - NextIsNoop)
+        // 6. 计算 "下一条不是空指令" (Not Next Noop)
+        // 这是为了处理 Shift Sum-check (移位校验) 的边界情况。
+        // 我们需要知道 t+1 时刻是否是有效的，以决定是否检查 t 到 t+1 的状态转换。
         let not_next_noop = {
             if t + 1 < len {
+                // 如果还有下一条指令，检查它是否为 Noop，并取反
                 !trace[t + 1].instruction().instruction_flags()[InstructionFlags::IsNoop]
             } else {
-                // Needs final not_next_noop to be false for the shift sumcheck
-                // (since EqPlusOne does not do overflow)
+                // 边界条件：如果是最后一步，强制视为 false。
+                // 这防止了 EqPlusOne (t 与 t+1 比较) 在溢出 trace 长度时出错。
                 false
             }
         };
 
+        // 7. 提取目标寄存器非零检查
+        // 用于防止写入 x0 寄存器 (RISC-V 中 x0 恒为 0)
         let is_rd_not_zero = instruction_flags[InstructionFlags::IsRdNotZero];
 
-        // WriteLookupOutputToRD flag
+        // 8. 提取写入使能标志
+        // 决定 lookup_output 是否应该被写回 RD 寄存器
         let write_lookup_output_to_rd_flag = flags_view[CircuitFlags::WriteLookupOutputToRD];
 
+        // 9. 构造结构体返回
         Self {
             instruction_left_input: left_input,
             instruction_right_input: right_input,
             write_lookup_output_to_rd_flag,
-            should_branch_lookup_output: lookup_output,
+            should_branch_lookup_output: lookup_output, // 分支判断依据或结果
             should_branch_flag: branch_flag,
             jump_flag,
             not_next_noop,
@@ -632,6 +649,7 @@ impl ProductCycleInputs {
         }
     }
 }
+
 
 /// State extracted from a cycle for use in shift sumcheck
 pub struct ShiftSumcheckCycleState {

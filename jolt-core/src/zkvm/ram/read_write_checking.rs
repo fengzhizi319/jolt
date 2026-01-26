@@ -157,8 +157,8 @@ impl<F: JoltField> RamReadWriteCheckingParams<F> {
             r_cycle,// 用于与 CPU 阶段绑定
             // 从配置中加载 Phase 1 (Cycle 也就是时间维度) 和 Phase 2 (Address 也就是空间维度) 的绑定轮数。
             // 这通常是为了优化 Proof 的生成性能，允许部分变量先绑定，分阶段处理。
-            phase1_num_rounds: config.ram_rw_phase1_num_rounds as usize,
-            phase2_num_rounds: config.ram_rw_phase2_num_rounds as usize,
+            phase1_num_rounds: config.ram_rw_phase1_num_rounds as usize,//9
+            phase2_num_rounds: config.ram_rw_phase2_num_rounds as usize,//13
         }
     }
 }
