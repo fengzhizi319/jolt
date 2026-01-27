@@ -36,7 +36,6 @@ use crate::zkvm::r1cs::constraints::{
 use crate::zkvm::r1cs::evaluation::ProductVirtualEval;
 use crate::zkvm::r1cs::inputs::{ProductCycleInputs, PRODUCT_UNIQUE_FACTOR_VIRTUALS};
 use crate::zkvm::witness::VirtualPolynomial;
-use rayon::prelude::*;
 use tracer::instruction::Cycle;
 
 // Product virtualization with univariate skip
@@ -681,6 +680,184 @@ impl<F: JoltField> ProductVirtualRemainderProver<F> {
         }
     }
 
+    /// 辅助函数 1: 计算 Trace 索引
+    ///
+    /// 给定高位索引 x_out 和低位索引 x_in，计算对应的两个物理索引（LSB=0 和 LSB=1）
+    ///
+    /// # 参数
+    /// - `x_out_val`: 高位变量的值
+    /// - `x_in_val`: 低位变量的值
+    /// - `iter_num_x_in_vars`: 低位变量的比特数
+    ///
+    /// # 返回
+    /// (idx_lo, idx_hi): 最后一位分别为 0 和 1 的两个索引
+    #[inline(always)]
+    fn compute_trace_indices(
+        x_out_val: usize,
+        x_in_val: usize,
+        iter_num_x_in_vars: usize,
+    ) -> (usize, usize) {
+        // 构造基础索引：高位 || 低位
+        let base_idx = (x_out_val << iter_num_x_in_vars) | x_in_val;
+
+        // 构造最后一位 (LSB) 为 0 和 1 的两个物理索引
+        let idx_lo = base_idx << 1;     // LSB = 0
+        let idx_hi = idx_lo + 1;        // LSB = 1
+
+        (idx_lo, idx_hi)
+    }
+
+    /// 辅助函数 2: 从 Trace 中获取行数据
+    ///
+    /// # 参数
+    /// - `trace`: 执行轨迹
+    /// - `idx_lo`: 低索引（LSB=0）
+    /// - `idx_hi`: 高索引（LSB=1）
+    ///
+    /// # 返回
+    /// (row_lo, row_hi): 两个索引对应的行数据
+    #[inline(always)]
+    fn fetch_trace_rows(
+        trace: &[Cycle],
+        idx_lo: usize,
+        idx_hi: usize,
+    ) -> (ProductCycleInputs, ProductCycleInputs) {
+        let row_lo = ProductCycleInputs::from_trace::<F>(trace, idx_lo);
+        let row_hi = ProductCycleInputs::from_trace::<F>(trace, idx_hi);
+        (row_lo, row_hi)
+    }
+
+    /// 辅助函数 3: 计算融合的左右多项式值
+    ///
+    /// 使用 UniSkip 投影，利用 weights_at_r0 将多列数据"融合"为单个值
+    ///
+    /// # 参数
+    /// - `row_lo`: LSB=0 的行数据
+    /// - `row_hi`: LSB=1 的行数据
+    /// - `weights_at_r0`: Lagrange 基函数权重
+    ///
+    /// # 返回
+    /// ((left0, right0), (left1, right1)): 在两个点处的左右多项式值
+    #[inline(always)]
+    fn compute_fused_left_right(
+        row_lo: &ProductCycleInputs,
+        row_hi: &ProductCycleInputs,
+        weights_at_r0: &[F],
+    ) -> ((F, F), (F, F)) {
+        let (left0, right0) = ProductVirtualEval::fused_left_right_at_r::<F>(
+            row_lo,
+            weights_at_r0,
+        );
+        let (left1, right1) = ProductVirtualEval::fused_left_right_at_r::<F>(
+            row_hi,
+            weights_at_r0,
+        );
+
+        ((left0, right0), (left1, right1))
+    }
+
+    /// 辅助函数 4: 计算二次多项式的关键系数
+    ///
+    /// 对于二次多项式 P(X) = L(X) * R(X)，计算：
+    /// - p0: P(0) = L(0) * R(0)
+    /// - slope: 二次项系数 = (L(1) - L(0)) * (R(1) - R(0))
+    ///
+    /// # 参数
+    /// - `left0, left1`: 左多项式在 0 和 1 处的值
+    /// - `right0, right1`: 右多项式在 0 和 1 处的值
+    ///
+    /// # 返回
+    /// (p0, slope): 常数项和二次项系数
+    #[inline(always)]
+    fn compute_quadratic_coefficients(
+        left0: F,
+        left1: F,
+        right0: F,
+        right1: F,
+    ) -> (F, F) {
+        // p0 = P(0) = L(0) * R(0)
+        let p0 = left0 * right0;
+
+        // slope = 二次项系数 = (L(1)-L(0)) * (R(1)-R(0))
+        let slope = (left1 - left0) * (right1 - right0);
+
+        (p0, slope)
+    }
+
+    /// 辅助函数 5: 累加到内循环累加器
+    ///
+    /// 将当前点的贡献乘以 Eq 权重后累加
+    ///
+    /// # 参数
+    /// - `inner_sum0`: 常数项累加器（可变引用）
+    /// - `inner_sum_inf`: 二次项累加器（可变引用）
+    /// - `e_in`: Eq 多项式的权重
+    /// - `p0`: 常数项值
+    /// - `slope`: 二次项值
+    #[inline(always)]
+    fn accumulate_inner_sums(
+        inner_sum0: &mut F::Unreduced<9>,
+        inner_sum_inf: &mut F::Unreduced<9>,
+        e_in: F,
+        p0: F,
+        slope: F,
+    ) {
+        *inner_sum0 += e_in.mul_unreduced::<9>(p0);
+        *inner_sum_inf += e_in.mul_unreduced::<9>(slope);
+    }
+
+    /// 辅助函数 6: 保存边界值到缓冲区
+    ///
+    /// 将 L0, L1, R0, R1 以交错方式存储到 left_chunk 和 right_chunk
+    ///
+    /// # 参数
+    /// - `left_chunk`: 左多项式缓冲区
+    /// - `right_chunk`: 右多项式缓冲区
+    /// - `x_in_val`: 当前低位索引
+    /// - `left0, left1`: 左多项式的两个值
+    /// - `right0, right1`: 右多项式的两个值
+    #[inline(always)]
+    fn store_bound_values(
+        left_chunk: &mut [F],
+        right_chunk: &mut [F],
+        x_in_val: usize,
+        left0: F,
+        left1: F,
+        right0: F,
+        right1: F,
+    ) {
+        let off = 2 * x_in_val;
+        left_chunk[off] = left0;
+        left_chunk[off + 1] = left1;
+        right_chunk[off] = right0;
+        right_chunk[off + 1] = right1;
+    }
+
+    /// 辅助函数 7: 累加到外循环累加器
+    ///
+    /// 将内循环的结果乘以外循环的 Eq 权重后累加到全局累加器
+    ///
+    /// # 参数
+    /// - `t0_acc_unr`: 全局常数项累加器（可变引用）
+    /// - `t_inf_acc_unr`: 全局二次项累加器（可变引用）
+    /// - `e_out`: 外循环的 Eq 权重
+    /// - `inner_sum0`: 内循环的常数项和
+    /// - `inner_sum_inf`: 内循环的二次项和
+    #[inline(always)]
+    fn accumulate_outer_sums(
+        t0_acc_unr: &mut F::Unreduced<9>,
+        t_inf_acc_unr: &mut F::Unreduced<9>,
+        e_out: F,
+        inner_sum0: F::Unreduced<9>,
+        inner_sum_inf: F::Unreduced<9>,
+    ) {
+        let reduced0 = F::from_montgomery_reduce::<9>(inner_sum0);
+        let reduced_inf = F::from_montgomery_reduce::<9>(inner_sum_inf);
+
+        *t0_acc_unr += e_out.mul_unreduced::<9>(reduced0);
+        *t_inf_acc_unr += e_out.mul_unreduced::<9>(reduced_inf);
+    }
+
     /// Compute the quadratic evaluations for the streaming round (right after univariate skip).
     ///
     /// After binding the univariate-skip variable at r0, we must
@@ -698,105 +875,139 @@ impl<F: JoltField> ProductVirtualRemainderProver<F> {
     #[inline]
     fn compute_first_quadratic_evals_and_bound_polys(
         trace: &[Cycle],
-        weights_at_r0: &[F; NUM_PRODUCT_VIRTUAL], // Lagrange 基函数值，用于 UniSkip 投影
-        split_eq_poly: &GruenSplitEqPolynomial<F>, // 优化的 Eq 多项式计算器
+        // 投影向量：来自上一层 UniSkip 的 Challenge r0 的拉格朗日基函数值。
+        // 作用是将 Trace 中一行的多个字段“压缩”成一个数值。
+        weights_at_r0: &[F; NUM_PRODUCT_VIRTUAL],
+        // Gruen 优化的 Eq 多项式：预先计算好的 tensor product 结构的权重。
+        split_eq_poly: &GruenSplitEqPolynomial<F>,
     ) -> (F, F, DensePolynomial<F>, DensePolynomial<F>) {
-        // 获取 Eq 多项式的维度信息，用于遍历
-        let num_x_out_vals = split_eq_poly.E_out_current_len();
-        let num_x_in_vals = split_eq_poly.E_in_current_len();
-        let iter_num_x_in_vars = num_x_in_vals.log_2();
 
-        // 计算总的分组数量，用于并行迭代
+        // -----------------------------------------------------------------------
+        // A. 维度准备
+        // -----------------------------------------------------------------------
+        // split_eq_poly 将变量分为了高位 (out/outer) 和低位 (in/inner)。
+        // 例如：总变量数 n=10，split 可能将前 5 位作为 out，后 5 位作为 in。
+        let num_x_out_vals = split_eq_poly.E_out_current_len(); // 高位组合数 (如 2^5)
+        let num_x_in_vals = split_eq_poly.E_in_current_len();   // 低位组合数 (如 2^5)
+        let iter_num_x_in_vars = num_x_in_vals.log_2();         // 低位变量个数 (如 5)
+
+        // 总任务数 = 2^n。checked_mul 防止溢出。//256
         let groups_exact = num_x_out_vals
             .checked_mul(num_x_in_vals)
             .expect("overflow computing groups_exact");
 
-        // 1. 内存预分配：创建用于存储 L(x) 和 R(x) 的大数组
-        // 这些数组将保存完整的 Layer 数据，供后续 Sum-Check 轮次使用
-        let mut left_bound: Vec<F> = unsafe_allocate_zero_vec(2 * groups_exact);
-        let mut right_bound: Vec<F> = unsafe_allocate_zero_vec(2 * groups_exact);
+        // -----------------------------------------------------------------------
+        // B. 内存预分配
+        // -----------------------------------------------------------------------
+        // 创建用于存储下一层 L(x) 和 R(x) 的大数组。
+        // 这两个数组将在 Sum-Check 的后续轮次中作为输入数据。
+        // 大小为 2 * groups_exact 是因为每一项包含 sum-check 变量为 0 和 1 的两个点。
+        let mut left_bound: Vec<F> = unsafe_allocate_zero_vec(2 * groups_exact);//512
+        let mut right_bound: Vec<F> = unsafe_allocate_zero_vec(2 * groups_exact);//512
 
-        // 2. 并行计算：将任务分块并行处理
-        // 返回值是两个累加器：t0_acc (h(0)) 和 t_inf_acc (h(X)的二次项系数)
-        let (t0_acc_unr, t_inf_acc_unr) = left_bound
-            .par_chunks_exact_mut(2 * num_x_in_vals)
-            .zip(right_bound.par_chunks_exact_mut(2 * num_x_in_vals))
+        // -----------------------------------------------------------------------
+        // C. 初始化全局累加器
+        // -----------------------------------------------------------------------
+        // t0: 对应 Sum-Check 多项式 h(0) 的值
+        // t_inf: 对应 Sum-Check 多项式 h(X) 的二次项系数 (用于确定抛物线形状)
+        // 使用 Unreduced 类型是为了延迟取模，提高大量加法运算的性能。
+        let mut t0_acc_unr = F::Unreduced::<9>::zero();
+        let mut t_inf_acc_unr = F::Unreduced::<9>::zero();
+
+        // -----------------------------------------------------------------------
+        // D. 双层循环遍历 (Gruen 优化结构)
+        // -----------------------------------------------------------------------
+        // 外层循环：遍历高位变量 (Tensor Product 的第一部分)
+        // zip 操作让我们同时拿到 left_bound 和 right_bound 对应的内存块进行写入
+        //将 left_bound 和 right_bound 分别切分成固定大小的可变块。并组合起来，加上索引，(0, (left_chunk_0, right_chunk_0)), (1, (left_chunk_1, right_chunk_1)), ...
+        for (x_out_val, (left_chunk, right_chunk)) in left_bound
+            .chunks_exact_mut(2 * num_x_in_vals)
+            .zip(right_bound.chunks_exact_mut(2 * num_x_in_vals))
             .enumerate()
-            .fold(
-                // 每个线程的初始化累加器 (使用 Unreduced 格式优化加法性能)
-                || (F::Unreduced::<9>::zero(), F::Unreduced::<9>::zero()),
-                |(mut acc0, mut acci), (x_out_val, (left_chunk, right_chunk))| {
-                    let mut inner_sum0 = F::Unreduced::<9>::zero();
-                    let mut inner_sum_inf = F::Unreduced::<9>::zero();
+        {
+            // 初始化内层循环的局部累加器
+            let mut inner_sum0 = F::Unreduced::<9>::zero();
+            let mut inner_sum_inf = F::Unreduced::<9>::zero();
 
-                    // 内部循环：遍历低位变量 x_in
-                    for x_in_val in 0..num_x_in_vals {
-                        // 3. 索引计算：构造全局索引 base_idx
-                        // 这里实际上是在遍历前缀 x'
-                        let base_idx = (x_out_val << iter_num_x_in_vars) | x_in_val;
+            // 内层循环：遍历低位变量
+            for x_in_val in 0..num_x_in_vals {
+                // 步骤 1: 计算 Trace 中的物理索引
+                // base_idx 是当前 sum-check 这一轮之前的路径索引。
+                // 每一个 base_idx 对应 sum-check 变量 X 的两个取值：0 (lo) 和 1 (hi)。
+                // 相当于二叉树的左子节点和右子节点。
+                let base_idx = (x_out_val << iter_num_x_in_vars) | x_in_val;
+                let idx_lo = base_idx << 1;
+                let idx_hi = idx_lo + 1;
 
-                        // 构造最后一位 (LSB) 为 0 和 1 的两个物理索引
-                        let idx_lo = base_idx << 1;     // LSB = 0
-                        let idx_hi = idx_lo + 1;        // LSB = 1
+                // 步骤 2: 从 Trace 中获取原始数据行
+                // row_lo 对应 X=0 的情况，row_hi 对应 X=1 的情况
+                let row_lo = ProductCycleInputs::from_trace::<F>(trace, idx_lo);
+                let row_hi = ProductCycleInputs::from_trace::<F>(trace, idx_hi);
 
-                        // 4. 数据获取：从原始 Trace 中读取行数据
-                        // 这相当于读取了 x 对应的所有列数据
-                        let row_lo = ProductCycleInputs::from_trace::<F>(trace, idx_lo);
-                        let row_hi = ProductCycleInputs::from_trace::<F>(trace, idx_hi);
+                // 步骤 3: UniSkip 投影 (Fusion)
+                // 将 Trace Row 中的多个字段，结合 weights_at_r0 压缩成单一数值。
+                // left0, right0 是 X=0 时下一层的左右输入值。
+                // left1, right1 是 X=1 时下一层的左右输入值。
+                let (left0, right0) = ProductVirtualEval::fused_left_right_at_r::<F>(
+                    &row_lo,
+                    &weights_at_r0[..],
+                );
+                let (left1, right1) = ProductVirtualEval::fused_left_right_at_r::<F>(
+                    &row_hi,
+                    &weights_at_r0[..],
+                );
 
-                        // 5. UniSkip 投影：计算 L 和 R 的值
-                        // 利用 weights_at_r0 将多列数据“融合”为一个值
-                        let (left0, right0) = ProductVirtualEval::fused_left_right_at_r::<F>(
-                            &row_lo,
-                            &weights_at_r0[..],
-                        );
-                        let (left1, right1) = ProductVirtualEval::fused_left_right_at_r::<F>(
-                            &row_hi,
-                            &weights_at_r0[..],
-                        );
+                // 步骤 4: 构造二次多项式 P(X) = L(X) * R(X)
+                // 我们需要求 sum( Eq(x) * P(x) )。
 
-                        // 6. 二次多项式核心计算
-                        // p0 = P(0) = L(0) * R(0)
-                        let p0 = left0 * right0;
-                        // slope = 二次项系数 = (L(1)-L(0)) * (R(1)-R(0))
-                        let slope = (left1 - left0) * (right1 - right0);
+                // 计算 P(0): 当 X=0 时的乘积
+                let p0 = left0 * right0;
 
-                        // 获取 Eq 权重 (Gruen 优化：利用 tensor 结构)
-                        let e_in = split_eq_poly.E_in_current()[x_in_val];
+                // 计算二次项系数 (slope/coefficient of X^2):
+                // 设 L(X) = A + BX, R(X) = C + DX
+                // P(X) 的二次项系数就是 B*D = (L(1)-L(0)) * (R(1)-R(0))
+                let slope = (left1 - left0) * (right1 - right0);
 
-                        // 累加到线程局部和
-                        inner_sum0 += e_in.mul_unreduced::<9>(p0);
-                        inner_sum_inf += e_in.mul_unreduced::<9>(slope);
+                // 步骤 5: 获取低位 Eq 权重
+                let e_in = split_eq_poly.E_in_current()[x_in_val];
 
-                        // 7. 保存数据：将 L0, L1, R0, R1 写入 buffer
-                        // 这些数据在内存中是交错存储的 [L0, L1, L2, L3...]
-                        let off = 2 * x_in_val;
-                        left_chunk[off] = left0;
-                        left_chunk[off + 1] = left1;
-                        right_chunk[off] = right0;
-                        right_chunk[off + 1] = right1;
-                    }
+                // 步骤 6: 累加到局部和
+                // inner_sum0 += Eq_in * P(0)
+                inner_sum0 += e_in.mul_unreduced::<9>(p0);
+                // inner_sum_inf += Eq_in * Slope
+                inner_sum_inf += e_in.mul_unreduced::<9>(slope);
 
-                    // 结合 Gruen 优化的高位权重 (e_out)
-                    let e_out = split_eq_poly.E_out_current()[x_out_val];
-                    let reduced0 = F::from_montgomery_reduce::<9>(inner_sum0);
-                    let reduced_inf = F::from_montgomery_reduce::<9>(inner_sum_inf);
+                // 步骤 7: 填充下一层的数据多项式
+                // 将计算出的 left/right 值存入内存，供 Sum-Check 后续轮次使用
+                let off = 2 * x_in_val;
+                left_chunk[off] = left0;
+                left_chunk[off + 1] = left1;
+                right_chunk[off] = right0;
+                right_chunk[off + 1] = right1;
+            }
 
-                    acc0 += e_out.mul_unreduced::<9>(reduced0);
-                    acci += e_out.mul_unreduced::<9>(reduced_inf);
-                    (acc0, acci)
-                },
-            )
-            // 8. 归约：将所有线程的结果相加
-            .reduce(
-                || (F::Unreduced::<9>::zero(), F::Unreduced::<9>::zero()),
-                |a, b| (a.0 + b.0, a.1 + b.1),
-            );
+            // 步骤 8: 结合高位 Eq 权重，汇总到全局累加器
+            // Sum = sum_out ( Eq_out * sum_in ( Eq_in * Term ) )
+            let e_out = split_eq_poly.E_out_current()[x_out_val];
 
-        // 返回最终结果：h(0), h_quad_coeff, 以及完整的 L/R 多项式表
+            // 先将 Unreduced 类型转回 Field 元素 (取模)
+            let reduced0 = F::from_montgomery_reduce::<9>(inner_sum0);
+            let reduced_inf = F::from_montgomery_reduce::<9>(inner_sum_inf);
+
+            // 全局累加
+            t0_acc_unr += e_out.mul_unreduced::<9>(reduced0);
+            t_inf_acc_unr += e_out.mul_unreduced::<9>(reduced_inf);
+        }
+
+        // -----------------------------------------------------------------------
+        // E. 返回结果
+        // -----------------------------------------------------------------------
         (
+            // h(0): 第一轮 Sum-Check 多项式在 0 处的值
             F::from_montgomery_reduce::<9>(t0_acc_unr),
+            // h_coeff: 第一轮 Sum-Check 多项式的二次项系数 (相当于 h(inf) 的一部分)
             F::from_montgomery_reduce::<9>(t_inf_acc_unr),
+            // 完整的左/右子节点多项式 (密集形式)
             DensePolynomial::new(left_bound),
             DensePolynomial::new(right_bound),
         )
