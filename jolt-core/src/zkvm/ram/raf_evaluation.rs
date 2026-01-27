@@ -174,78 +174,91 @@ impl<F: JoltField> RafEvaluationSumcheckProver<F> {
     /// 4. **构建多项式**: 将结果封装为 `MultilinearPolynomial`，并初始化辅助的 `unmap` 多项式。
     #[tracing::instrument(skip_all, name = "RamRafEvaluationSumcheckProver::initialize")]
     pub fn initialize(
-        params: RafEvaluationSumcheckParams<F>,
-        trace: &[Cycle],
-        memory_layout: &MemoryLayout,
+        params: RafEvaluationSumcheckParams<F>, // 包含 Verifier 的随机挑战点 r_cycle
+        trace: &[Cycle],                        // CPU 执行痕迹，包含每一步的内存操作
+        memory_layout: &MemoryLayout,           // 内存地址布局，用于物理地址到密集索引的映射
     ) -> Self {
-        let T = trace.len();
-        let K = 1 << params.log_K;
+        let T = trace.len();                    // 总时间步数 (Trace 长度)
+        let K = 1 << params.log_K;              // 内存空间大小 (2^log_K)
 
-        // Split-Eq (分块 Eq) 优化：
-        // EqPolynomial::evals 使用大端序：r_cycle[0] 是最高位 (MSB)。
-        // 为了在循环中获得连续的 Cycle 索引访问模式，我们将 r_cycle 拆分为高位和低位两部分。
-        // 后缀（低位）作为内层循环 E_lo，前缀（高位）作为外层并行循环 E_hi。
+        // -----------------------------------------------------------------------
+        // 1. Split-Eq 准备阶段
+        // -----------------------------------------------------------------------
+        // 将随机向量 r_cycle 拆分为高位 (hi) 和低位 (lo) 两部分。
+        // 这种拆分是为了优化计算性能，利用 eq 函数的 tensor product 性质。
         let r_cycle = &params.r_cycle.r;
         let log_T = r_cycle.len();
-        let lo_bits = log_T / 2;
-        let hi_bits = log_T - lo_bits;
-        // split_at: 将 challenge 向量切分为 r_hi 和 r_lo
+        let lo_bits = log_T / 2;             // 低位比特数，例如 log_T=20 -> lo=10
+        let hi_bits = log_T - lo_bits;       // 高位比特数，例如 hi=10
         let (r_hi, r_lo) = r_cycle.split_at(hi_bits);
 
-        // 并行预计算 Eq 表：
-        // E_hi: 大小为 2^hi_bits，对应时间步的高位部分
-        // E_lo: 大小为 2^lo_bits，对应时间步的低位部分
+        // 并行计算两个小的 Eq 表。
+        // E_hi[i] 存储 eq(r_hi, i) 的值。
+        // E_lo[j] 存储 eq(r_lo, j) 的值。
+        // 最终的时间权重 eq(r, t) = E_hi[t_hi] * E_lo[t_lo]
         let (E_hi, E_lo) = rayon::join(
             || EqPolynomial::<F>::evals(r_hi),
             || EqPolynomial::<F>::evals(r_lo),
         );
 
-        let in_len = E_lo.len(); // 内层循环长度 = 2^lo_bits
+        let in_len = E_lo.len(); // 内层循环的步长 (2^lo_bits)
 
-        // 确定并行度：将 E_hi 分块给不同的线程处理
+        // -----------------------------------------------------------------------
+        // 2. 并行 Map-Reduce 计算阶段
+        // -----------------------------------------------------------------------
         let num_threads = rayon::current_num_threads();
-        let chunk_size = E_hi.len().div_ceil(num_threads);
+        let chunk_size = E_hi.len().div_ceil(num_threads); // 根据高位表大小切分任务
 
-        // 并行计算 partial ra_evals (局部 ra 统计向量)：
-        // 每个线程独立分配一个大小为 K 的零向量，避免锁竞争。
+        // 目标：计算 ra_evals 向量。
+        // ra_evals[k] = Sum_{t where trace[t].addr == k} ( eq(r, t) )
         let ra_evals: Vec<F> = E_hi
-            .par_chunks(chunk_size)
+            .par_chunks(chunk_size) // 并行迭代高位块
             .enumerate()
             .map(|(chunk_idx, chunk)| {
-                // 分配本地累加器，大小为 K (地址空间大小)
+                // [Map 步骤]
+                // 每个线程创建一个本地的累加器 vector，大小为 K (内存地址总数)。
+                // 初始化为 0。
                 let mut partial: Vec<F> = unsafe_allocate_zero_vec(K);
 
                 let chunk_start = chunk_idx * chunk_size;
-                // 外层循环：遍历分配给当前线程的 E_hi 块
+
+                // 双层循环遍历时间 t。
+                // 这里的 t = c_hi * in_len + c_lo
+
+                // 外层：遍历分配给当前线程的高位索引 c_hi
                 for (local_idx, &e_hi) in chunk.iter().enumerate() {
                     let c_hi = chunk_start + local_idx;
-                    // c_hi 是高位索引，对应的实际 cycle 索引基数是 c_hi * 2^lo_bits
-                    let c_hi_base = c_hi * in_len;
+                    let c_hi_base = c_hi * in_len; // 计算当前高位对应的 Trace 起始索引
 
-                    // 内层循环：遍历所有低位组合
+                    // 内层：遍历所有低位索引 c_lo
                     for c_lo in 0..in_len {
-                        let j = c_hi_base + c_lo;
-                        // 边界检查：防止 j 超出 Trace 实际长度
+                        let j = c_hi_base + c_lo; // j 就是绝对时间步 t (Cycle Index)
+
+                        // 边界检查：如果 Trace 长度不是 2 的幂次，需要提前退出
                         if j >= T {
                             break;
                         }
 
-                        // 获取第 j 个 cycle 访问的物理地址，并映射到密集索引 k
+                        // 核心逻辑：
+                        // 1. 获取第 j 步访问的物理内存地址。
+                        // 2. remap_address: 将稀疏的物理地址映射为密集的索引 k (0..K)。
+                        //    (例如：物理地址 0x8000 -> 索引 0)
                         if let Some(k) =
                             remap_address(trace[j].ram_access().address() as u64, memory_layout)
                         {
-                            // 累加权重：eq(r_cycle, j) = E_hi[c_hi] * E_lo[c_lo]
-                            // 将结果加到对应的地址桶 k 中
+                            // 3. 计算权重：w = E_hi[c_hi] * E_lo[c_lo]
+                            // 4. 累加到地址 k 对应的桶中
                             partial[k as usize] += e_hi * E_lo[c_lo];
                         }
                     }
                 }
-
-                partial
+                partial // 返回当前线程的局部累加结果
             })
-            // Reduce 阶段：将所有线程产生的 partial 向量对应位置相加
             .reduce(
+                // [Reduce 步骤]
+                // 初始化归约的 accumulator
                 || unsafe_allocate_zero_vec(K),
+                // 合并函数：将两个向量对应位置相加 (Vector Addition)
                 |mut running, new| {
                     running
                         .par_iter_mut()
@@ -255,12 +268,14 @@ impl<F: JoltField> RafEvaluationSumcheckProver<F> {
                 },
             );
 
-        // 构造密集的多线性多项式 ra
+        // -----------------------------------------------------------------------
+        // 3. 结果封装
+        // -----------------------------------------------------------------------
+        // 将计算好的向量封装为 MLE 多项式对象
         let ra = MultilinearPolynomial::from(ra_evals);
-        
-        // 构造 Unmap 多项式
-        // 这是一个简单的多项式，用于表示从重映射地址 k 恢复到物理地址的映射关系。
-        // 它在 Sumcheck 验证中用于确保 proving 的地址是一致的。
+
+        // 创建 Unmap 多项式：用于验证时将索引 k 还原回物理地址
+        // 这是一个简单的线性关系多项式，不需要繁重的计算
         let lowest_memory_address = memory_layout.get_lowest_address();
         let unmap = UnmapRamAddressPolynomial::new(K.log_2(), lowest_memory_address);
 

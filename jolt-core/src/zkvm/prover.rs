@@ -1220,7 +1220,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         // =================================================================
 
         // A. 初始化 Spartan Product Remainder Prover。
-        // 这是 Grand Product Argument（连乘论证）的第二阶段。
+        // 这是 Grand Product Argument（连乘论证）的第二阶段。主要是处理CPU查找表的正确性用两个连乘证明来说明两个表的一致性。
         // 它的任务是处理 Cycle（时间步）维度的变量绑定。
         // 结合 Stage 1 的 Univariate Skip，这两个阶段共同证明了 Spartan 协议中的 Grand Product 约束。
         let spartan_product_virtual_remainder = ProductVirtualRemainderProver::initialize(
