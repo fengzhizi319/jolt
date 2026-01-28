@@ -298,28 +298,38 @@ impl<F: JoltField> RamReadWriteCheckingProver<F> {
         memory_layout: &MemoryLayout,
         initial_ram_state: &[u64],
     ) -> Self {
+        // r_cycle 是 Verifier 提供的随机挑战向量，用于压缩“时间”维度
         let r_prime = &params.r_cycle;
 
-        // 1. 准备 Eq 多项式 (用于 Sumcheck 中的 eq(r_cycle, j) 项)
-        // 如果 Phase 1 轮数大于 0，我们使用 Gruen 的优化算法（Split Eq），允许逐轮绑定变量。
-        // 否则，如果直接从后续阶段开始，或没有 Phase 1，我们可能直接计算出完整的 Eq 表。
+        // -----------------------------------------------------------------------
+        // 1. 准备 Eq 多项式 (Time Weight)
+        // -----------------------------------------------------------------------
+        // 数学目标：计算 \tilde{eq}(r_{cycle}, t)。
+        // 这是一个多线性多项式，用于在 Sumcheck 中给每个时间步加权。
+        // 如果 Phase 1 轮数 > 0，说明我们要先绑定时间变量。
+        // 使用 Gruen 优化 (Split Eq) 可以流式处理，减少内存开销。
         let (gruen_eq, merged_eq) = if params.phase1_num_rounds > 0 {
             (
                 Some(GruenSplitEqPolynomial::new(
                     &r_prime.r,
                     BindingOrder::LowToHigh,
                 )),
-                None, // 尚未合并，处于分裂状态
+                None,
             )
         } else {
+            // 如果没有 Phase 1 (直接处理 Phase 2)，说明时间变量不需要逐轮绑定，
+            // 可以直接生成完整的 Eq 表。
             (
                 None,
                 Some(MultilinearPolynomial::from(EqPolynomial::evals(&r_prime.r))),
             )
         };
 
-        // 2. 生成 Inc (Increment) 多项式 Witness
-        // Inc 表示在特定周期写入发生时值的增量。
+        // -----------------------------------------------------------------------
+        // 2. 生成 Inc (Increment) 多项式
+        // -----------------------------------------------------------------------
+        // 数学公式：Inc(t) = v_{post}^{(t)} - v_{pre}^{(t)}
+        // 仅在 Write 操作时不为 0。这个多项式记录了内存值的“流动”。
         let inc = CommittedPolynomial::RamInc.generate_witness(
             bytecode_preprocessing,
             memory_layout,
@@ -327,16 +337,22 @@ impl<F: JoltField> RamReadWriteCheckingProver<F> {
             None,
         );
 
+        // -----------------------------------------------------------------------
         // 3. 处理初始 RAM 状态
-        // 将 u64 类型的初始内存值转换为有限域元素。
+        // -----------------------------------------------------------------------
+        // 初始内存中的值也视为一种“写入”（在时间 t=0 之前的写入）。
+        // 将 u64 转换为有限域 Field Element。
         let val_init: Vec<_> = initial_ram_state
             .par_iter()
             .map(|x| F::from_u64(*x))
             .collect();
 
+        // -----------------------------------------------------------------------
         // 4. 构建读写稀疏矩阵 (Cycle-Major)
-        // 这是证明的核心数据结构，包含了所有的内存访问记录。
-        // 初始构建时通常按照时间顺序 (Cycle-Major)。
+        // -----------------------------------------------------------------------
+        // 这一步将 Trace 转换为稀疏矩阵格式。
+        // RamCycleMajorEntry 包含了 (value, instruction_flags, address) 等信息。
+        // 此时数据是按“时间顺序”排列的 (Trace 本身就是按时间执行的)。
         let sparse_matrix = ReadWriteMatrixCycleMajor::<_, RamCycleMajorEntry<F>>::new(
             trace,
             val_init,
@@ -346,18 +362,22 @@ impl<F: JoltField> RamReadWriteCheckingProver<F> {
         let phase1_rounds = params.phase1_num_rounds;
         let phase2_rounds = params.phase2_num_rounds;
 
-        // 5. 根据阶段配置设置矩阵存储
-        // Jolt 的 Sumcheck 分为不同阶段绑定不同类型的变量（先时间后空间，或反之）。
-        // 不同的绑定顺序对矩阵的存储布局（行优先/列优先）有不同要求以优化性能。
+        // -----------------------------------------------------------------------
+        // 5. 阶段适配与矩阵转置
+        // -----------------------------------------------------------------------
+        // Jolt Sumcheck 分两个阶段：
+        // Phase 1: 绑定时间/Cycle 变量。需要矩阵按 Cycle 排序以便高效访问。
+        // Phase 2: 绑定空间/Address 变量。需要矩阵按 Address 排序。
         let (sparse_matrix_phase1, sparse_matrix_phase2, ra, val) = if phase1_rounds > 0 {
-            // 如果有 Phase 1 (绑定 Cycle 变量)，我们需要 Cycle-Major 的矩阵。
+            // 情况 A: 有 Phase 1。保留 Cycle-Major 矩阵。
+            // Phase 2 的矩阵稍后生成或不需要。
             (sparse_matrix, Default::default(), None, None)
         } else if phase2_rounds > 0 {
-            // 如果跳过 Phase 1 直接进入 Phase 2 (绑定 Address 变量)，
-            // 我们需要将矩阵转置/转换为 Address-Major 格式。
+            // 情况 B: 跳过 Phase 1，直接进入 Phase 2。
+            // 这意味着我们需要立即对矩阵进行“转置”或重排，使其变为 Address-Major。
+            // sparse_matrix.into() 会执行这个转换：Cycle-Order -> Address-Order。
             (Default::default(), sparse_matrix.into(), None, None)
         } else {
-            // 理论上不支持两个阶段都是 0 的情况（这意味着没有变量需要 Sumcheck 绑定）。
             unimplemented!("Unsupported configuration: both phase 1 and phase 2 are 0 rounds")
         };
 

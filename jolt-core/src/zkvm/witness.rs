@@ -272,6 +272,7 @@ impl CommittedPolynomial {
         }
     }
 
+
     #[tracing::instrument(skip_all, name = "CommittedPolynomial::generate_witness")]
     pub fn generate_witness<F>(
         &self,
@@ -284,25 +285,33 @@ impl CommittedPolynomial {
         F: JoltField,
     {
         match self {
+            // [类型 1] Bytecode Read Access
+            // 作用：证明取指操作的 PC 地址是有效的。
             CommittedPolynomial::BytecodeRa(i) => {
                 let one_hot_params = one_hot_params.unwrap();
                 let addresses: Vec<_> = trace
                     .par_iter()
                     .map(|cycle| {
                         let pc = bytecode_preprocessing.get_pc(cycle);
+                        // 将 PC 映射为 One-Hot 块的索引
                         Some(one_hot_params.bytecode_pc_chunk(pc, *i))
                     })
                     .collect();
+                // 生成压缩的 One-Hot 多项式
                 MultilinearPolynomial::OneHot(OneHotPolynomial::from_indices(
                     addresses,
                     one_hot_params.k_chunk,
                 ))
             }
+
+            // [类型 2] RAM Read Access
+            // 作用：证明 RAM 读写操作的地址是有效的。
             CommittedPolynomial::RamRa(i) => {
                 let one_hot_params = one_hot_params.unwrap();
                 let addresses: Vec<_> = trace
                     .par_iter()
                     .map(|cycle| {
+                        // remap_address: 将稀疏物理地址映射为密集索引
                         remap_address(cycle.ram_access().address() as u64, memory_layout)
                             .map(|address| one_hot_params.ram_address_chunk(address, *i))
                     })
@@ -312,36 +321,51 @@ impl CommittedPolynomial {
                     one_hot_params.k_chunk,
                 ))
             }
+
+            // [类型 3] RD (目标寄存器) Increment
+            // 作用：检查寄存器堆的一致性。
+            // 公式：Inc = Post - Pre
             CommittedPolynomial::RdInc => {
                 let coeffs: Vec<i128> = trace
                     .par_iter()
                     .map(|cycle| {
                         let (_, pre_value, post_value) = cycle.rd_write().unwrap_or_default();
+                        // 计算增量。注意这里使用 i128 防止溢出，因为是在算术域上计算
                         post_value as i128 - pre_value as i128
                     })
                     .collect();
-                coeffs.into()
+                coeffs.into() // 自动转换为多线性多项式
             }
+
+            // [类型 4] RAM Increment
+            // 作用：检查 RAM 的一致性。
+            // 逻辑：只有 Write 操作会改变值，Read 操作 Inc 为 0。
             CommittedPolynomial::RamInc => {
                 let coeffs: Vec<i128> = trace
                     .par_iter()
                     .map(|cycle| {
                         let ram_op = cycle.ram_access();
                         match ram_op {
+                            // 只有 Write 操作才有非零增量
                             tracer::instruction::RAMAccess::Write(write) => {
                                 write.post_value as i128 - write.pre_value as i128
                             }
+                            // Read 操作或无操作，增量为 0
                             _ => 0,
                         }
                     })
                     .collect();
                 coeffs.into()
             }
+
+            // [类型 5] Instruction Lookup Index
+            // 作用：用于指令解码查表。
             CommittedPolynomial::InstructionRa(i) => {
                 let one_hot_params = one_hot_params.unwrap();
                 let addresses: Vec<_> = trace
                     .par_iter()
                     .map(|cycle| {
+                        // 提取指令的 Lookup Index
                         let lookup_index = LookupQuery::<XLEN>::to_lookup_index(cycle);
                         Some(one_hot_params.lookup_index_chunk(lookup_index, *i))
                     })
@@ -351,6 +375,8 @@ impl CommittedPolynomial {
                     one_hot_params.k_chunk,
                 ))
             }
+
+            // 异常处理：Advice 多项式不应在此生成
             CommittedPolynomial::TrustedAdvice | CommittedPolynomial::UntrustedAdvice => {
                 panic!("Advice polynomials should not use generate_witness")
             }

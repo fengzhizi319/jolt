@@ -186,47 +186,73 @@ impl<F: JoltField> OutputSumcheckProver<F> {
     /// * `memory_layout`: Jolt 设备的内存布局配置。
     #[tracing::instrument(skip_all, name = "OutputSumcheckProver::initialize")]
     pub fn initialize(
-        params: OutputSumcheckParams<F>,
-        initial_ram_state: &[u64],
-        final_ram_state: &[u64],
-        memory_layout: &MemoryLayout,
+        params: OutputSumcheckParams<F>, // 包含 Verifier 的随机挑战点 r_address
+        initial_ram_state: &[u64],       // t=0 时刻的内存状态 (通常全 0)
+        final_ram_state: &[u64],         // t=T (程序结束) 时刻的内存状态
+        memory_layout: &MemoryLayout,    // 内存地址布局配置
     ) -> Self {
+        // K 是内存地址空间的大小，通常是 2 的幂次 (例如 2^16)
         let K = final_ram_state.len();
         debug_assert_eq!(initial_ram_state.len(), final_ram_state.len());
         debug_assert!(K.is_power_of_two());
 
-        // 计算内存中 IO 区域对应的 Witness 索引范围（起始和结束）
-        // remap_address 将物理地址映射为密集的数组索引
+        // -----------------------------------------------------------------------
+        // 1. 确定 IO 区域的边界
+        // -----------------------------------------------------------------------
+        // 物理地址空间通常是稀疏的（例如 0x80000000 开始）。
+        // remap_address 函数将物理地址映射为稠密索引 k \in [0, K)。
+        // 这里假设 IO 区域位于 [input_start, RAM_START_ADDRESS) 之间。
         let io_start = remap_address(memory_layout.input_start, memory_layout).unwrap() as usize;
         let io_end = remap_address(RAM_START_ADDRESS, memory_layout).unwrap() as usize;
 
-        // 构建 Val_io 多项式向量
-        // 逻辑：仅拷贝 Final RAM 中属于 IO 区域的值，其余部分保持为 0。
-        // 这表示了 Prover 声称的程序输出。
+        // -----------------------------------------------------------------------
+        // 2. 构建 val_io 多项式 (Output Values)
+        // -----------------------------------------------------------------------
+        // 数学定义：
+        // Val_{io}(k) = Val_{final}(k)  如果 k \in [io_start, io_end)
+        // Val_{io}(k) = 0               其他情况
+        //
+        // 初始化全 0 向量
         let mut val_io = vec![0; K];
-        val_io[io_start..io_end]
-            .par_iter_mut()
-            .zip(final_ram_state[io_start..io_end].par_iter())
-            .for_each(|(dest, src)| *dest = *src);
 
-        // 构建 io_mask 多项式向量
-        // 这是一个布尔掩码向量：在 IO 区域内为 true (1)，区域外为 false (0)。
-        // 它在 Sumcheck 方程中充当选择器，确保只检查 IO 区域的一致性。
+        // 仅拷贝 IO 区域内的数据。
+        // 这代表了 Prover 向 Verifier 展示的“公开输出”。
+        for (dest, src) in val_io[io_start..io_end]
+            .iter_mut()
+            .zip(final_ram_state[io_start..io_end].iter())
+        {
+            *dest = *src;
+        }
+
+        // -----------------------------------------------------------------------
+        // 3. 构建 io_mask 多项式 (Selector)
+        // -----------------------------------------------------------------------
+        // 数学定义：
+        // Mask(k) = 1   如果 k \in [io_start, io_end)
+        // Mask(k) = 0   其他情况
+        //
+        // 这是一个布尔掩码，用于在代数上“选中”IO 区域。
         let mut io_mask = vec![false; K];
-        io_mask[io_start..io_end]
-            .par_iter_mut()
-            .for_each(|k| *k = true);
+        for k in io_mask[io_start..io_end].iter_mut() {
+            *k = true;
+        }
 
-        // 初始化用于地址绑定的 Split-Eq 多项式
-        // BindingOrder::LowToHigh 意味着 Sumcheck 将从低位到高位处理变量
+        // -----------------------------------------------------------------------
+        // 4. 初始化 Eq 多项式 (Sumcheck 准备)
+        // -----------------------------------------------------------------------
+        // 准备 Sumcheck 所需的 \tilde{eq}(r, x) 多项式。
+        // r_address 是 Verifier 提供的随机挑战，维度为 log(K)。
+        // BindingOrder::LowToHigh 表示后续 Sumcheck 折叠变量的顺序。
         let eq_r_address = GruenSplitEqPolynomial::new(&params.r_address, BindingOrder::LowToHigh);
 
+        // 返回 Prover 结构体
         Self {
+            // 将原始数据转换为多线性多项式 (Multilinear Polynomial) 对象
             val_init: initial_ram_state.to_vec().into(),
-            val_final: final_ram_state.to_vec().into(), // 转换为 MultilinearPolynomial
-            val_io: val_io.into(),
-            eq_r_address,
-            io_mask: io_mask.into(),
+            val_final: final_ram_state.to_vec().into(), // V_T(x)
+            val_io: val_io.into(),                      // V_io(x)
+            eq_r_address,                               // \tilde{eq}(r, x)
+            io_mask: io_mask.into(),                    // M(x)
             params,
         }
     }

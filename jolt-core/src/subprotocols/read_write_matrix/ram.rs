@@ -36,9 +36,9 @@ use tracer::instruction::{Cycle, RAMAccess};
 #[derive(Allocative, Debug, PartialEq, Clone, Copy, Default)]
 pub struct RamCycleMajorEntry<F: JoltField> {
     /// The row index. Before binding, row \in [0, T)
-    pub row: usize,
+    pub row: usize,// 时间坐标 (Cycle Index)
     /// The column index. Before binding, col \in [0, K)
-    pub col: usize,
+    pub col: usize,// 空间坐标 (Address Index)
     /// In round i, each ReadWriteEntry represents a coefficient
     ///   Val(k, j', r)
     /// which is some combination of Val(k, j', 00...0), ...
@@ -46,7 +46,7 @@ pub struct RamCycleMajorEntry<F: JoltField> {
     /// `prev_val` contains the unbound coefficient before
     /// Val(k, j', 00...0) –– abusing notation, `prev_val` is
     /// Val(k, j'-1, 11...1)
-    pub(crate) prev_val: u64,
+    pub(crate) prev_val: u64,// 上一个时刻/维度的值
     /// In round i, each ReadWriteEntry represents a coefficient
     ///   Val(k, j', r)
     /// which is some combination of Val(k, j', 00...0), ...
@@ -54,12 +54,12 @@ pub struct RamCycleMajorEntry<F: JoltField> {
     /// `next_val` contains the unbound coefficient after
     /// Val(k, j', 00...0) –– abusing notation, `next_val` is
     /// Val(k, j'+1, 00...0)
-    pub(crate) next_val: u64,
+    pub(crate) next_val: u64,// 下一个时刻/维度的值
     /// The Val coefficient for this matrix entry.
-    pub val_coeff: F,
+    pub val_coeff: F,// 内存值 (Value) 的域元素表示
     /// The ra coefficient for this matrix entry. Note that for RAM,
     /// ra and wa are the same polynomial.
-    pub ra_coeff: F,
+    pub ra_coeff: F,// 访问系数 (Access Coefficient)
 }
 
 impl<F: JoltField> RamCycleMajorEntry<F> {

@@ -174,113 +174,111 @@ impl<F: JoltField> RafEvaluationSumcheckProver<F> {
     /// 4. **构建多项式**: 将结果封装为 `MultilinearPolynomial`，并初始化辅助的 `unmap` 多项式。
     #[tracing::instrument(skip_all, name = "RamRafEvaluationSumcheckProver::initialize")]
     pub fn initialize(
-        params: RafEvaluationSumcheckParams<F>, // 包含 Verifier 的随机挑战点 r_cycle
-        trace: &[Cycle],                        // CPU 执行痕迹，包含每一步的内存操作
-        memory_layout: &MemoryLayout,           // 内存地址布局，用于物理地址到密集索引的映射
-    ) -> Self {
-        let T = trace.len();                    // 总时间步数 (Trace 长度)
-        let K = 1 << params.log_K;              // 内存空间大小 (2^log_K)
+        // [参数 1] params: 包含 Verifier 发来的随机挑战点 r_cycle。
+        // 数学意义：r_cycle 是用于压缩时间维度的随机向量 $\vec{r}$。
+        params: RafEvaluationSumcheckParams<F>,
 
-        // -----------------------------------------------------------------------
-        // 1. Split-Eq 准备阶段
-        // -----------------------------------------------------------------------
-        // 将随机向量 r_cycle 拆分为高位 (hi) 和低位 (lo) 两部分。
-        // 这种拆分是为了优化计算性能，利用 eq 函数的 tensor product 性质。
+        // [参数 2] trace: CPU 的完整执行痕迹。
+        // 数学意义：时间序列数据，trace[t] 代表时刻 t 的状态。
+        trace: &[Cycle],
+
+        // [参数 3] memory_layout: 内存布局描述。
+        // 作用：提供物理地址(如 0x8000)到密集索引(如 0, 1, 2)的映射函数 $\pi(addr) \to k$。
+        memory_layout: &MemoryLayout,
+    ) -> Self {
+        let T = trace.len();                    // T: 总时间步数
+        let K = 1 << params.log_K;              // K: 内存空间的大小 (2^log_K)
+
+        // =======================================================================
+        // 阶段 1: Split-Eq 准备 (利用张量积性质优化权重计算)
+        // =======================================================================
+        // 假设 r_cycle 的长度为 m (例如 m=9)，则时间空间大小为 2^9 = 512。
+        // 我们将其拆分为高位和低位两部分。
         let r_cycle = &params.r_cycle.r;
         let log_T = r_cycle.len();
-        let lo_bits = log_T / 2;             // 低位比特数，例如 log_T=20 -> lo=10
-        let hi_bits = log_T - lo_bits;       // 高位比特数，例如 hi=10
+
+        // 拆分策略：对半分。例如 9 位拆分为 低位4 + 高位5。
+        let lo_bits = log_T / 2;
+        let hi_bits = log_T - lo_bits;
+
+        // split_at 将向量切开。
+        // r_hi 对应高位比特，控制外层循环。
+        // r_lo 对应低位比特，控制内层循环。
         let (r_hi, r_lo) = r_cycle.split_at(hi_bits);
 
-        // 并行计算两个小的 Eq 表。
-        // E_hi[i] 存储 eq(r_hi, i) 的值。
-        // E_lo[j] 存储 eq(r_lo, j) 的值。
-        // 最终的时间权重 eq(r, t) = E_hi[t_hi] * E_lo[t_lo]
-        let (E_hi, E_lo) = rayon::join(
-            || EqPolynomial::<F>::evals(r_hi),
-            || EqPolynomial::<F>::evals(r_lo),
-        );
+        // [核心优化] 预计算 Eq 表
+        // E_hi[i] = \tilde{eq}(r_hi, i)  <-- 这是一个大小为 2^hi_bits 的表
+        // E_lo[j] = \tilde{eq}(r_lo, j)  <-- 这是一个大小为 2^lo_bits 的表
+        // 数学原理：\tilde{eq}(r, t) = E_hi[t_hi] * E_lo[t_lo]
+        let E_hi = EqPolynomial::<F>::evals(r_hi);
+        let E_lo = EqPolynomial::<F>::evals(r_lo);
 
-        let in_len = E_lo.len(); // 内层循环的步长 (2^lo_bits)
+        let in_len = E_lo.len(); // 内层循环长度，等于 2^lo_bits
 
-        // -----------------------------------------------------------------------
-        // 2. 并行 Map-Reduce 计算阶段
-        // -----------------------------------------------------------------------
-        let num_threads = rayon::current_num_threads();
-        let chunk_size = E_hi.len().div_ceil(num_threads); // 根据高位表大小切分任务
+        // =======================================================================
+        // 阶段 2: 核心计算 (单线程累加)
+        // =======================================================================
+        // 目标：构建 ra_evals 向量
+        // 公式：ra_evals[k] = \sum_{t} \mathbb{I}(addr_t == k) * weight_t
 
-        // 目标：计算 ra_evals 向量。
-        // ra_evals[k] = Sum_{t where trace[t].addr == k} ( eq(r, t) )
-        let ra_evals: Vec<F> = E_hi
-            .par_chunks(chunk_size) // 并行迭代高位块
-            .enumerate()
-            .map(|(chunk_idx, chunk)| {
-                // [Map 步骤]
-                // 每个线程创建一个本地的累加器 vector，大小为 K (内存地址总数)。
-                // 初始化为 0。
-                let mut partial: Vec<F> = unsafe_allocate_zero_vec(K);
+        // 分配一个全 0 的向量，大小为 K (覆盖所有可能的内存索引)
+        let mut ra_evals: Vec<F> = unsafe_allocate_zero_vec(K);
 
-                let chunk_start = chunk_idx * chunk_size;
+        // 双层循环遍历时间 t (从 0 到 T-1)
+        // t 的二进制分解： t = c_hi * 2^{lo_bits} + c_lo
 
-                // 双层循环遍历时间 t。
-                // 这里的 t = c_hi * in_len + c_lo
+        // 外层循环：遍历高位部分 (Block)
+        for c_hi in 0..E_hi.len() {
+            let e_hi = E_hi[c_hi];         // 获取高位权重分量
+            let c_hi_base = c_hi * in_len; // 当前 Block 的起始时间索引
 
-                // 外层：遍历分配给当前线程的高位索引 c_hi
-                for (local_idx, &e_hi) in chunk.iter().enumerate() {
-                    let c_hi = chunk_start + local_idx;
-                    let c_hi_base = c_hi * in_len; // 计算当前高位对应的 Trace 起始索引
+            // 内层循环：遍历低位部分 (Offset within Block)
+            for c_lo in 0..in_len {
+                // 计算绝对时间步 j (即 t)
+                let j = c_hi_base + c_lo;
 
-                    // 内层：遍历所有低位索引 c_lo
-                    for c_lo in 0..in_len {
-                        let j = c_hi_base + c_lo; // j 就是绝对时间步 t (Cycle Index)
-
-                        // 边界检查：如果 Trace 长度不是 2 的幂次，需要提前退出
-                        if j >= T {
-                            break;
-                        }
-
-                        // 核心逻辑：
-                        // 1. 获取第 j 步访问的物理内存地址。
-                        // 2. remap_address: 将稀疏的物理地址映射为密集的索引 k (0..K)。
-                        //    (例如：物理地址 0x8000 -> 索引 0)
-                        if let Some(k) =
-                            remap_address(trace[j].ram_access().address() as u64, memory_layout)
-                        {
-                            // 3. 计算权重：w = E_hi[c_hi] * E_lo[c_lo]
-                            // 4. 累加到地址 k 对应的桶中
-                            partial[k as usize] += e_hi * E_lo[c_lo];
-                        }
-                    }
+                // [边界检查]
+                // 因为 EqPolynomial 总是按 2 的幂次生成，而 Trace 长度 T 可能不是 2 的幂次。
+                // 如果 j 超出了实际 Trace 长度，停止计算，相当于把后面填充为 0。
+                if j >= T {
+                    break;
                 }
-                partial // 返回当前线程的局部累加结果
-            })
-            .reduce(
-                // [Reduce 步骤]
-                // 初始化归约的 accumulator
-                || unsafe_allocate_zero_vec(K),
-                // 合并函数：将两个向量对应位置相加 (Vector Addition)
-                |mut running, new| {
-                    running
-                        .par_iter_mut()
-                        .zip(new.par_iter())
-                        .for_each(|(x, y)| *x += *y);
-                    running
-                },
-            );
 
-        // -----------------------------------------------------------------------
-        // 3. 结果封装
-        // -----------------------------------------------------------------------
-        // 将计算好的向量封装为 MLE 多项式对象
+                // [步骤 A] 获取物理地址并重映射
+                // 这里的 trace[j] 是时刻 j 的操作。
+                // remap_address 是映射函数 \pi: PhysicalAddr -> Index k
+                // 如果地址不在 RAM 范围内 (比如是代码区访问)，返回 None，跳过。
+                if let Some(k) =
+                    remap_address(trace[j].ram_access().address() as u64, memory_layout)
+                {
+                    // [步骤 B] 计算总权重
+                    // weight = \tilde{eq}(r, j)
+                    //        = \tilde{eq}(r_hi, c_hi) * \tilde{eq}(r_lo, c_lo)
+                    //        = e_hi * E_lo[c_lo]
+                    let weight = e_hi * E_lo[c_lo];
+
+                    // [步骤 C] 累加到桶中
+                    // 这行代码实现了公式中的求和符号 \sum
+                    ra_evals[k as usize] += weight;
+                }
+            }
+        }
+
+        // =======================================================================
+        // 阶段 3: 封装结果
+        // =======================================================================
+        // 将计算好的密集向量封装为多线性多项式对象
         let ra = MultilinearPolynomial::from(ra_evals);
 
-        // 创建 Unmap 多项式：用于验证时将索引 k 还原回物理地址
-        // 这是一个简单的线性关系多项式，不需要繁重的计算
+        // 构造辅助多项式 Unmap
+        // 它的作用是定义反向映射： k -> PhysicalAddr
+        // 在验证阶段，Verifier 需要知道索引 k 到底代表真实的哪个物理地址。
         let lowest_memory_address = memory_layout.get_lowest_address();
         let unmap = UnmapRamAddressPolynomial::new(K.log_2(), lowest_memory_address);
 
         Self { ra, unmap, params }
     }
+
 }
 
 impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for RafEvaluationSumcheckProver<F> {
@@ -290,35 +288,36 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for RafEvaluation
 
     #[tracing::instrument(skip_all, name = "RamRafEvaluationSumcheckProver::compute_message")]
     fn compute_message(&mut self, _round: usize, previous_claim: F) -> UniPoly<F> {
-        let evals = (0..self.ra.len() / 2)
-            .into_par_iter()
-            .map(|i| {
-                let ra_evals = self
-                    .ra
-                    .sumcheck_evals_array::<DEGREE_BOUND>(i, BindingOrder::LowToHigh);
-                let unmap_evals =
-                    self.unmap
-                        .sumcheck_evals(i, DEGREE_BOUND, BindingOrder::LowToHigh);
+        // 初始化累加器，用于存储每个度数的评估值总和
+        let mut evals = [F::Unreduced::zero(); DEGREE_BOUND];
 
-                // Compute the product evaluations
-                [
-                    ra_evals[0].mul_unreduced::<9>(unmap_evals[0]),
-                    ra_evals[1].mul_unreduced::<9>(unmap_evals[1]),
-                ]
-            })
-            .reduce(
-                || [F::Unreduced::zero(); DEGREE_BOUND],
-                |running, new| [running[0] + new[0], running[1] + new[1]],
-            )
-            .map(F::from_montgomery_reduce);
+        // 顺序遍历所有索引，计算每个位置的贡献
+        for i in 0..self.ra.len() / 2 {
+            // 获取 ra 多项式在第 i 个位置的评估值数组
+            let ra_evals = self
+                .ra
+                .sumcheck_evals_array::<DEGREE_BOUND>(i, BindingOrder::LowToHigh);
+            // 获取 unmap 多项式在第 i 个位置的评估值
+            let unmap_evals =
+                self.unmap
+                    .sumcheck_evals(i, DEGREE_BOUND, BindingOrder::LowToHigh);
+
+            // 计算乘积评估值并累加到结果中
+            evals[0] += ra_evals[0].mul_unreduced::<9>(unmap_evals[0]);
+            evals[1] += ra_evals[1].mul_unreduced::<9>(unmap_evals[1]);
+        }
+
+        // 将累加的未约减值转换为约减后的域元素
+        let evals = evals.map(F::from_montgomery_reduce);
 
         UniPoly::from_evals_and_hint(previous_claim, &evals)
     }
 
     #[tracing::instrument(skip_all, name = "RamRafEvaluationSumcheckProver::ingest_challenge")]
     fn ingest_challenge(&mut self, r_j: F::Challenge, _round: usize) {
-        self.ra.bind_parallel(r_j, BindingOrder::LowToHigh);
-        self.unmap.bind_parallel(r_j, BindingOrder::LowToHigh);
+        // 单线程顺序绑定挑战值
+        self.ra.bind(r_j, BindingOrder::LowToHigh);
+        self.unmap.bind(r_j, BindingOrder::LowToHigh);
     }
 
     fn cache_openings(
