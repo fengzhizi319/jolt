@@ -280,40 +280,83 @@ struct InstructionLookupsPhase1State<F: JoltField> {
 
 impl<F: JoltField> InstructionLookupsPhase1State<F> {
     fn initialize(
-        trace: Arc<Vec<Cycle>>,
-        params: &InstructionLookupsClaimReductionSumcheckParams<F>,
+        trace: Arc<Vec<Cycle>>, // 原始执行痕迹，包含了所有的指令输入输出
+        params: &InstructionLookupsClaimReductionSumcheckParams<F>, // 包含随机点 r 和 gamma
     ) -> Self {
+        // 1. 拆分随机点 r_spartan
+        // r_spartan 是 Verifier 提供的随机挑战点，长度为 log(Trace_Len)。
+        // 这里将其从中间切开，分为低位部分 (r_lo) 和高位部分 (r_hi)。
+        // 注意代码里的变量名：
+        // - r_lo 对应 prefix_n_vars (代码逻辑上的前缀/低位索引部分，用于构建 P)
+        // - r_hi 对应 suffix_n_vars (代码逻辑上的后缀/高位索引部分，用于内部求和折叠)
         let (r_hi, r_lo) = params.r_spartan.split_at(params.r_spartan.len() / 2);
-        let eq_prefix_evals = EqPolynomial::evals(&r_lo.r);
-        let eq_suffix_evals = EqPolynomial::evals(&r_hi.r);
-        let prefix_n_vars = r_lo.len();
-        let suffix_n_vars = r_hi.len();
 
-        // Prefix-suffix P and Q buffers.
-        // See <https://eprint.iacr.org/2025/611.pdf> (Appendix A).
+        // 2. 预计算 Eq 多项式
+        // eq_prefix_evals = P 向量。计算 \tilde{eq}(r_lo, x) 对所有 x 的值。
+        let eq_prefix_evals = EqPolynomial::evals(&r_lo.r);
+        // eq_suffix_evals 用于计算 Q 向量时的权重。计算 \tilde{eq}(r_hi, x) 对所有 x 的值。
+        let eq_suffix_evals = EqPolynomial::evals(&r_hi.r);
+
+        let prefix_n_vars = r_lo.len(); // 对应 x_lo 的比特数
+        let suffix_n_vars = r_hi.len(); // 对应 x_hi 的比特数
+
+        // 3. 定义 P 和 Q 缓冲区
+        // 参考文献: <https://eprint.iacr.org/2025/611.pdf> (Appendix A)
+        // 这里的优化是将 O(N) 的一次性求和拆解为两步，便于后续 Sumcheck 协议处理。
+
+        // P 向量就是 r_lo 部分的 Eq 评估值。
+        // P[x_lo] = eq(r_lo, x_lo)
         let P = eq_prefix_evals;
+
+        // Q 向量的大小等于 2^prefix_n_vars。
+        // 它存储的是“高位折叠后”的结果。
         let mut Q = unsafe_allocate_zero_vec(1 << prefix_n_vars);
 
+        // 获取随机线性组合 (RLC) 的系数 gamma
         let gamma = params.gamma;
         let gamma_sqr = params.gamma_sqr;
 
+        // 4. 并行计算 Q 向量
+        // 我们将 Q 切分成块 (BLOCK_SIZE=32) 进行并行处理。
+        // 每个 chunk 对应一组连续的 x_lo 索引。
         const BLOCK_SIZE: usize = 32;
         Q.par_chunks_mut(BLOCK_SIZE)
             .enumerate()
             .for_each(|(chunk_i, q_chunk)| {
+                // 初始化累加器，用于暂存 Trace 三个列的加权和
+                // 因为 Trace 有三列 (Output, Left, Right)，我们需要分别累加，最后再用 gamma 组合。
+                // 使用 Unreduced 类型是为了延迟取模，提高性能。
                 let mut q_lookup_output = [F::Unreduced::<6>::zero(); BLOCK_SIZE];
                 let mut q_left_lookup_operand = [F::Unreduced::<6>::zero(); BLOCK_SIZE];
                 let mut q_right_lookup_operand = [F::Unreduced::<7>::zero(); BLOCK_SIZE];
 
+                // --- 核心双重循环 ---
+
+                // 外层循环：遍历所有的高位组合 (x_hi)
+                // 这相当于遍历 Trace 表的“大跨度”
                 for x_hi in 0..(1 << suffix_n_vars) {
+
+                    // 内层循环：遍历当前 chunk 内的低位索引 (x_lo)
                     for i in 0..q_chunk.len() {
+                        // 重建全局索引 x
+                        // x_lo = 当前块基址 + 块内偏移
                         let x_lo = chunk_i * BLOCK_SIZE + i;
+                        // x = x_lo + x_hi * 2^(prefix_n_vars)
+                        // 注意：这里 trace 的索引构建方式暗示了内存布局是：先变化 lo，再变化 hi。
+                        // 类似于矩阵存储中的 Col-Major 或特定的 reshape。
                         let x = x_lo + (x_hi << prefix_n_vars);
+
+                        // 获取 Trace 在 x 处的数据
                         let cycle = &trace[x];
+
+                        // 提取指令的操作数和输出
                         let (left_lookup, right_lookup) =
                             LookupQuery::<XLEN>::to_lookup_operands(cycle);
                         let lookup_output = LookupQuery::<XLEN>::to_lookup_output(cycle);
 
+                        // 累加计算：
+                        // Accumulator += Trace(x) * eq(r_hi, x_hi)
+                        // 这里只乘了高位的权重 eq_suffix_evals[x_hi]，低位权重在 P 向量里。
                         q_lookup_output[i] +=
                             eq_suffix_evals[x_hi].mul_u64_unreduced(lookup_output);
                         q_left_lookup_operand[i] +=
@@ -323,7 +366,11 @@ impl<F: JoltField> InstructionLookupsPhase1State<F> {
                     }
                 }
 
+                // 5. RLC 组合与结果写入
+                // 在累加完所有的 x_hi 后，我们将三列数据组合成一个值，存入 Q。
                 for (i, q) in q_chunk.iter_mut().enumerate() {
+                    // 公式：Q[i] = Sum_Output + gamma * Sum_Left + gamma^2 * Sum_Right
+                    // 其中 Sum_... 已经是 \sum_{x_hi} Val(x_hi, x_lo) * eq(r_hi, x_hi)
                     *q = F::from_barrett_reduce(q_lookup_output[i])
                         + gamma * F::from_barrett_reduce(q_left_lookup_operand[i])
                         + gamma_sqr * F::from_barrett_reduce(q_right_lookup_operand[i]);

@@ -1263,7 +1263,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
 
         // E. 初始化 Instruction Lookups Claim Reduction Prover。
         // 负责将“Trace 中每一条指令的执行正确性”这一主张（Claim），
-        // 归约到“这些指令及其操作数存在于预计算的查找表中”这一更底层的主张。
+        // 归约到“这些指令及其操作数存在于预计算的查找表中”这一更底层的主张。只对数据做证明，不对指令做证明。
         let instruction_claim_reduction =
             InstructionLookupsClaimReductionSumcheckProver::initialize(
                 instruction_claim_reduction_params,
