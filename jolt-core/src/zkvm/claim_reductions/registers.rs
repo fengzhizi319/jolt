@@ -212,41 +212,90 @@ struct RegistersPhase1State<F: JoltField> {
 }
 
 impl<F: JoltField> RegistersPhase1State<F> {
+    ///Sum(Combined(x) * Eq(x, r)),Combined(x) = Val_rd(x) + gamma * Val_rs1(x) + gamma^2 * Val_rs2(x)
     fn initialize(
         trace: Arc<Vec<Cycle>>,
         params: &RegistersClaimReductionSumcheckParams<F>,
     ) -> Self {
+        // ========================================================================
+        // 1. 准备 Split Sumcheck 组件 (Prepare Split Sumcheck)
+        // ========================================================================
+        // [算法原理: Split Sumcheck / Tensor Product]
+        // 目标：证明 Sum(Trace(x) * Eq(x, r))。
+        // 方法：将随机点 r 拆分为高位 r_hi 和低位 r_lo。
+        // Eq(x, r) = Eq(x_hi, r_hi) * Eq(x_lo, r_lo)。
+
+        // 将随机点切分为两半
         let (r_hi, r_lo) = params.r_spartan.split_at(params.r_spartan.len() / 2);
+
+        // 计算 P 向量 (Prefix): 对应 Eq(x_lo, r_lo)
+        // 这是一个纯数学构造，只与随机点 r_lo 有关，不依赖 Trace 数据。
         let eq_prefix_evals = EqPolynomial::evals(&r_lo.r);
+
+        // 计算 Suffix 向量: 对应 Eq(x_hi, r_hi)
+        // 这将作为权重，用于将 Trace 矩阵沿着高位维度“折叠”。
         let eq_suffix_evals = EqPolynomial::evals(&r_hi.r);
+
         let prefix_n_vars = r_lo.len();
         let suffix_n_vars = r_hi.len();
 
+        // ========================================================================
+        // 2. 初始化 P 和 Q 缓冲区 (Initialize P & Q)
+        // ========================================================================
         // Prefix-suffix P and Q buffers.
         // See <https://eprint.iacr.org/2025/611.pdf> (Appendix A).
+        // P: 直接就是 prefix 的评估值。
         let P = eq_prefix_evals;
+
+        // Q: Suffix Sum 向量。
+        // Q 的大小仅为 2^prefix_len (例如 Trace 是 2^20，Q 可能只有 2^10)。
+        // 我们需要遍历整个 Trace 来填充这个 Q。
         let mut Q = unsafe_allocate_zero_vec(1 << prefix_n_vars);
 
+        // [算法原理: Random Linear Combination (RLC)]
+        // 我们需要同时提取三个不同的值：rd_write, rs1_read, rs2_read。
+        // 为了不跑三次 Sumcheck，我们用随机数 gamma 将它们打包：
+        // Combined(x) = Val_rd(x) + gamma * Val_rs1(x) + gamma^2 * Val_rs2(x)
         let gamma = params.gamma;
         let gamma_sqr = params.gamma_sqr;
 
+        // ========================================================================
+        // 3. 并行计算 Q 向量 (Compute Q in Parallel)
+        // ========================================================================
         const BLOCK_SIZE: usize = 32;
         Q.par_chunks_mut(BLOCK_SIZE)
             .enumerate()
             .for_each(|(chunk_i, q_chunk)| {
+                // [算法优化: Delayed Reduction]
+                // 为了性能，中间累加过程不进行取模（Reduce）。
+                // F::Unreduced 类型允许累加多次乘积结果，利用 CPU 的大寄存器避免频繁取模。
                 let mut q_rd_write_value = [F::Unreduced::<6>::zero(); BLOCK_SIZE];
                 let mut q_rs1_read_value = [F::Unreduced::<6>::zero(); BLOCK_SIZE];
                 let mut q_rs2_read_value = [F::Unreduced::<6>::zero(); BLOCK_SIZE];
 
+                // [核心循环: Marginalization / Folding]
+                // 遍历所有的高位组合 (Suffix)。
+                // 我们把整个 Trace 看作一个 [Rows x Cols] 的矩阵。
+                // Rows 是 x_hi (Suffix), Cols 是 x_lo (Prefix)。
+                // 我们要把每一列的所有行加权求和，压缩成一行 (Q)。
                 for x_hi in 0..(1 << suffix_n_vars) {
                     for i in 0..q_chunk.len() {
+                        // 构造完整的 Trace 索引 x
                         let x_lo = chunk_i * BLOCK_SIZE + i;
                         let x = x_lo + (x_hi << prefix_n_vars);
+
                         let cycle = &trace[x];
+
+                        // 提取每一行的寄存器操作数数值
+                        // .2 代表 rd 的写入值
                         let rd_write_value = cycle.rd_write().unwrap_or_default().2;
+                        // .1 代表 rs1 的读取值
                         let rs1_read_value = cycle.rs1_read().unwrap_or_default().1;
+                        // .1 代表 rs2 的读取值
                         let rs2_read_value = cycle.rs2_read().unwrap_or_default().1;
 
+                        // 累加到临时缓冲区
+                        // Q_temp[i] += Trace[x] * Suffix_Eq[x_hi]
                         q_rd_write_value[i] +=
                             eq_suffix_evals[x_hi].mul_u64_unreduced(rd_write_value);
                         q_rs1_read_value[i] +=
@@ -256,6 +305,8 @@ impl<F: JoltField> RegistersPhase1State<F> {
                     }
                 }
 
+                // [约束应用与合并]
+                // 将三个独立的累加结果，通过 gamma 进行线性组合，并进行最终的取模。
                 for (i, q) in q_chunk.iter_mut().enumerate() {
                     *q = F::from_barrett_reduce(q_rd_write_value[i])
                         + gamma * F::from_barrett_reduce(q_rs1_read_value[i])

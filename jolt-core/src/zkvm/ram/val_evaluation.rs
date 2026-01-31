@@ -194,32 +194,68 @@ impl<F: JoltField> ValEvaluationSumcheckProver<F> {
         bytecode_preprocessing: &BytecodePreprocessing,
         memory_layout: &MemoryLayout,
     ) -> Self {
-        // Compute the size-K table storing all eq(r_address, k) evaluations for
-        // k \in {0, 1}^log(K)
+        // ========================================================================
+        // 1. 预计算地址指纹表 (Precompute Address Fingerprints)
+        // ========================================================================
+        // [算法原理: MLE of Equality Polynomial]
+        // Verifier 提供了一个随机地址挑战点 r_address。
+        // EqPolynomial::evals 生成一个向量 V，其中 V[k] = Eq(k, r_address)。
+        //
+        // 这个向量 V 的作用是一个 "全局选择器"。
+        // 如果我们想把所有对地址 k 的访问挑出来，我们就用 Eq(k, r_address) 作为权重。
+        // 这利用了 MLE 的性质：在随机点 r 处求值，相当于对整个内存空间做了一个随机线性投影。
         let eq_r_address = EqPolynomial::evals(&params.r_address.r);
 
         let span = tracing::span!(tracing::Level::INFO, "compute wa(r_address, j)");
         let _guard = span.enter();
 
-        // Compute the wa polynomial using the above table
+        // ========================================================================
+        // 2. 构造地址选择多项式 (Construct WA Polynomial)
+        // ========================================================================
+        // [算法原理: Sparse-to-Dense Mapping & Index Selection]
+        // RAM 地址空间很大 (64位)，不能直接作为数组索引。
+        // remap_address 将 64位 物理地址映射到一个较小的密集空间 (0..K)，
+        // 仅包含 Trace 中实际访问过的地址或只读内存段地址。
         let wa_indices: Vec<Option<usize>> = trace
             .par_iter()
             .map(|cycle| {
+                // 对于 Trace 中的每一行 (cycle)，提取其访问的 RAM 地址，
+                // 并映射到密集索引 k。
                 remap_address(cycle.ram_access().address() as u64, memory_layout)
                     .map(|k| k as usize)
             })
             .collect();
+
+        // [算法原理: RaPolynomial / Address Selector]
+        // `wa` (Witness Address 或 Weighted Address) 是一个多项式向量。
+        // 对于 Trace 的第 i 行：
+        // 如果该行没有访问 RAM (None)，则 wa[i] = 0。
+        // 如果该行访问了地址 k，则 wa[i] = eq_r_address[k] = Eq(k, r_address)。
+        //
+        // 意义：wa[i] 代表了第 i 行操作的 "地址权重"。
+        // 在后续 Sumcheck 中，项 V[i] * wa[i] 意味着：
+        // "只有当第 i 行访问的地址与随机挑战 r_address '匹配'时，这一行的值 V[i] 才会被计入总和"。
         let wa = RaPolynomial::new(Arc::new(wa_indices), eq_r_address);
 
         drop(_guard);
         drop(span);
 
+        // ========================================================================
+        // 3. 生成辅助多项式 (Auxiliary Polynomials)
+        // ========================================================================
+        // [约束逻辑: Timestamp / Ordering]
+        // Inc (Increment) 多项式用于标记同一地址的访问次序。
+        // 在离线内存检查中，我们需要知道这是对地址 A 的第几次访问。
         let inc = CommittedPolynomial::RamInc.generate_witness(
             bytecode_preprocessing,
             memory_layout,
             trace,
             None,
         );
+
+        // [算法原理: Less-Than Constraints]
+        // Lt (Less Than) 多项式通常用于范围检查或时间戳比较。
+        // 这里基于 params.r_cycle (时间维度的随机点) 生成，用于证明操作的时间顺序正确性。
         let lt = LtPolynomial::new(&params.r_cycle);
 
         Self {

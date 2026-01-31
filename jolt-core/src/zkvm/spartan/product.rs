@@ -691,21 +691,21 @@ impl<F: JoltField> ProductVirtualRemainderProver<F> {
     ///
     /// # 返回
     /// (idx_lo, idx_hi): 最后一位分别为 0 和 1 的两个索引
-    #[inline(always)]
-    fn compute_trace_indices(
-        x_out_val: usize,
-        x_in_val: usize,
-        iter_num_x_in_vars: usize,
-    ) -> (usize, usize) {
-        // 构造基础索引：高位 || 低位
-        let base_idx = (x_out_val << iter_num_x_in_vars) | x_in_val;
-
-        // 构造最后一位 (LSB) 为 0 和 1 的两个物理索引
-        let idx_lo = base_idx << 1;     // LSB = 0
-        let idx_hi = idx_lo + 1;        // LSB = 1
-
-        (idx_lo, idx_hi)
-    }
+    // #[inline(always)]
+    // fn compute_trace_indices(
+    //     x_out_val: usize,
+    //     x_in_val: usize,
+    //     iter_num_x_in_vars: usize,
+    // ) -> (usize, usize) {
+    //     // 构造基础索引：高位 || 低位
+    //     let base_idx = (x_out_val << iter_num_x_in_vars) | x_in_val;
+    //
+    //     // 构造最后一位 (LSB) 为 0 和 1 的两个物理索引
+    //     let idx_lo = base_idx << 1;     // LSB = 0
+    //     let idx_hi = idx_lo + 1;        // LSB = 1
+    //
+    //     (idx_lo, idx_hi)
+    // }
 
     /// 辅助函数 2: 从 Trace 中获取行数据
     ///
@@ -716,16 +716,16 @@ impl<F: JoltField> ProductVirtualRemainderProver<F> {
     ///
     /// # 返回
     /// (row_lo, row_hi): 两个索引对应的行数据
-    #[inline(always)]
-    fn fetch_trace_rows(
-        trace: &[Cycle],
-        idx_lo: usize,
-        idx_hi: usize,
-    ) -> (ProductCycleInputs, ProductCycleInputs) {
-        let row_lo = ProductCycleInputs::from_trace::<F>(trace, idx_lo);
-        let row_hi = ProductCycleInputs::from_trace::<F>(trace, idx_hi);
-        (row_lo, row_hi)
-    }
+    // #[inline(always)]
+    // fn fetch_trace_rows(
+    //     trace: &[Cycle],
+    //     idx_lo: usize,
+    //     idx_hi: usize,
+    // ) -> (ProductCycleInputs, ProductCycleInputs) {
+    //     let row_lo = ProductCycleInputs::from_trace::<F>(trace, idx_lo);
+    //     let row_hi = ProductCycleInputs::from_trace::<F>(trace, idx_hi);
+    //     (row_lo, row_hi)
+    // }
 
     /// 辅助函数 3: 计算融合的左右多项式值
     ///
@@ -738,23 +738,23 @@ impl<F: JoltField> ProductVirtualRemainderProver<F> {
     ///
     /// # 返回
     /// ((left0, right0), (left1, right1)): 在两个点处的左右多项式值
-    #[inline(always)]
-    fn compute_fused_left_right(
-        row_lo: &ProductCycleInputs,
-        row_hi: &ProductCycleInputs,
-        weights_at_r0: &[F],
-    ) -> ((F, F), (F, F)) {
-        let (left0, right0) = ProductVirtualEval::fused_left_right_at_r::<F>(
-            row_lo,
-            weights_at_r0,
-        );
-        let (left1, right1) = ProductVirtualEval::fused_left_right_at_r::<F>(
-            row_hi,
-            weights_at_r0,
-        );
-
-        ((left0, right0), (left1, right1))
-    }
+    // #[inline(always)]
+    // fn compute_fused_left_right(
+    //     row_lo: &ProductCycleInputs,
+    //     row_hi: &ProductCycleInputs,
+    //     weights_at_r0: &[F],
+    // ) -> ((F, F), (F, F)) {
+    //     let (left0, right0) = ProductVirtualEval::fused_left_right_at_r::<F>(
+    //         row_lo,
+    //         weights_at_r0,
+    //     );
+    //     let (left1, right1) = ProductVirtualEval::fused_left_right_at_r::<F>(
+    //         row_hi,
+    //         weights_at_r0,
+    //     );
+    //
+    //     ((left0, right0), (left1, right1))
+    // }
 
     /// 辅助函数 4: 计算二次多项式的关键系数
     ///
@@ -768,21 +768,21 @@ impl<F: JoltField> ProductVirtualRemainderProver<F> {
     ///
     /// # 返回
     /// (p0, slope): 常数项和二次项系数
-    #[inline(always)]
-    fn compute_quadratic_coefficients(
-        left0: F,
-        left1: F,
-        right0: F,
-        right1: F,
-    ) -> (F, F) {
-        // p0 = P(0) = L(0) * R(0)
-        let p0 = left0 * right0;
-
-        // slope = 二次项系数 = (L(1)-L(0)) * (R(1)-R(0))
-        let slope = (left1 - left0) * (right1 - right0);
-
-        (p0, slope)
-    }
+    // #[inline(always)]
+    // fn compute_quadratic_coefficients(
+    //     left0: F,
+    //     left1: F,
+    //     right0: F,
+    //     right1: F,
+    // ) -> (F, F) {
+    //     // p0 = P(0) = L(0) * R(0)
+    //     let p0 = left0 * right0;
+    //
+    //     // slope = 二次项系数 = (L(1)-L(0)) * (R(1)-R(0))
+    //     let slope = (left1 - left0) * (right1 - right0);
+    //
+    //     (p0, slope)
+    // }
 
     /// 辅助函数 5: 累加到内循环累加器
     ///
@@ -794,17 +794,17 @@ impl<F: JoltField> ProductVirtualRemainderProver<F> {
     /// - `e_in`: Eq 多项式的权重
     /// - `p0`: 常数项值
     /// - `slope`: 二次项值
-    #[inline(always)]
-    fn accumulate_inner_sums(
-        inner_sum0: &mut F::Unreduced<9>,
-        inner_sum_inf: &mut F::Unreduced<9>,
-        e_in: F,
-        p0: F,
-        slope: F,
-    ) {
-        *inner_sum0 += e_in.mul_unreduced::<9>(p0);
-        *inner_sum_inf += e_in.mul_unreduced::<9>(slope);
-    }
+    // #[inline(always)]
+    // fn accumulate_inner_sums(
+    //     inner_sum0: &mut F::Unreduced<9>,
+    //     inner_sum_inf: &mut F::Unreduced<9>,
+    //     e_in: F,
+    //     p0: F,
+    //     slope: F,
+    // ) {
+    //     *inner_sum0 += e_in.mul_unreduced::<9>(p0);
+    //     *inner_sum_inf += e_in.mul_unreduced::<9>(slope);
+    // }
 
     /// 辅助函数 6: 保存边界值到缓冲区
     ///
@@ -816,22 +816,22 @@ impl<F: JoltField> ProductVirtualRemainderProver<F> {
     /// - `x_in_val`: 当前低位索引
     /// - `left0, left1`: 左多项式的两个值
     /// - `right0, right1`: 右多项式的两个值
-    #[inline(always)]
-    fn store_bound_values(
-        left_chunk: &mut [F],
-        right_chunk: &mut [F],
-        x_in_val: usize,
-        left0: F,
-        left1: F,
-        right0: F,
-        right1: F,
-    ) {
-        let off = 2 * x_in_val;
-        left_chunk[off] = left0;
-        left_chunk[off + 1] = left1;
-        right_chunk[off] = right0;
-        right_chunk[off + 1] = right1;
-    }
+    // #[inline(always)]
+    // fn store_bound_values(
+    //     left_chunk: &mut [F],
+    //     right_chunk: &mut [F],
+    //     x_in_val: usize,
+    //     left0: F,
+    //     left1: F,
+    //     right0: F,
+    //     right1: F,
+    // ) {
+    //     let off = 2 * x_in_val;
+    //     left_chunk[off] = left0;
+    //     left_chunk[off + 1] = left1;
+    //     right_chunk[off] = right0;
+    //     right_chunk[off + 1] = right1;
+    // }
 
     /// 辅助函数 7: 累加到外循环累加器
     ///
@@ -843,20 +843,20 @@ impl<F: JoltField> ProductVirtualRemainderProver<F> {
     /// - `e_out`: 外循环的 Eq 权重
     /// - `inner_sum0`: 内循环的常数项和
     /// - `inner_sum_inf`: 内循环的二次项和
-    #[inline(always)]
-    fn accumulate_outer_sums(
-        t0_acc_unr: &mut F::Unreduced<9>,
-        t_inf_acc_unr: &mut F::Unreduced<9>,
-        e_out: F,
-        inner_sum0: F::Unreduced<9>,
-        inner_sum_inf: F::Unreduced<9>,
-    ) {
-        let reduced0 = F::from_montgomery_reduce::<9>(inner_sum0);
-        let reduced_inf = F::from_montgomery_reduce::<9>(inner_sum_inf);
-
-        *t0_acc_unr += e_out.mul_unreduced::<9>(reduced0);
-        *t_inf_acc_unr += e_out.mul_unreduced::<9>(reduced_inf);
-    }
+    // #[inline(always)]
+    // fn accumulate_outer_sums(
+    //     t0_acc_unr: &mut F::Unreduced<9>,
+    //     t_inf_acc_unr: &mut F::Unreduced<9>,
+    //     e_out: F,
+    //     inner_sum0: F::Unreduced<9>,
+    //     inner_sum_inf: F::Unreduced<9>,
+    // ) {
+    //     let reduced0 = F::from_montgomery_reduce::<9>(inner_sum0);
+    //     let reduced_inf = F::from_montgomery_reduce::<9>(inner_sum_inf);
+    //
+    //     *t0_acc_unr += e_out.mul_unreduced::<9>(reduced0);
+    //     *t_inf_acc_unr += e_out.mul_unreduced::<9>(reduced_inf);
+    // }
 
     /// Compute the quadratic evaluations for the streaming round (right after univariate skip).
     ///

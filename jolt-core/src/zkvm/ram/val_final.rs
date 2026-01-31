@@ -166,27 +166,73 @@ impl<F: JoltField> ValFinalSumcheckProver<F> {
         bytecode_preprocessing: &BytecodePreprocessing,
         memory_layout: &MemoryLayout,
     ) -> Self {
-        // Compute the size-K table storing all eq(r_address, k) evaluations for
-        // k \in {0, 1}^log(K)
-        // TODO(moodlezoup): Can reuse from OutputSumcheck
+        // ========================================================================
+        // 1. 预计算地址指纹表 (Precompute Eq Evaluations)
+        // ========================================================================
+        // [算法原理: Multilinear Extension & Lookup Table]
+        // 算法公式：Table[k] = Eq(k, r_address) = \prod_{i=0}^{m-1} ( (1-k_i)(1-r_i) + k_i r_i )
+        //
+        // 我们不希望在遍历百万级 Trace 时，对每一行都重新计算 Eq 函数（那需要 O(log K) 次乘法）。
+        // 既然内存地址空间被重新映射到了较小的范围 K (Memory Layout)，
+        // 我们可以先用 O(K) 的时间算出所有可能的地址指纹，存入表中。
+        //
+        // [优化点 1: 查表法代替计算]
+        // 复杂度从 O(TraceLen * log K) 降低到 O(K + TraceLen)。
         let eq_r_address = EqPolynomial::evals(&params.r_address);
 
         let span = tracing::span!(tracing::Level::INFO, "compute wa(r_address, j)");
         let _guard = span.enter();
 
-        // Compute the wa polynomial using the above table
+        // ========================================================================
+        // 2. 构造地址选择多项式 (Construct WA Polynomial)
+        // ========================================================================
+        // [算法原理: Projection / Filtering]
+        // `wa` (Weighted Address) 是一个选择器向量。
+        // 对于 Trace 中的每一行 (Cycle t)，如果它操作了地址 A_t：
+        // wa[t] = Eq(A_t, r_address)
+        //
+        // 物理意义：
+        // Verifier 想检查随机地址 r_address 上的值。
+        // `wa` 将 Trace 中所有操作了 "类似 r_address" 的行筛选出来（赋予高权重），
+        // 而操作其他地址的行赋予接近 0 的权重。
+        //
+        // [优化点 2: 并行迭代 (Rayon Parallel Iterator)]
+        // 每一行的 wa 计算是完全独立的，因此使用 .par_iter() 进行数据并行处理。
+        // 这对于大规模 Trace (如 2^20 行) 带来线性加速比。
         let wa: Vec<F> = trace
             .par_iter()
             .map(|cycle| {
+                // remap_address: 将 64位物理地址映射到紧凑的索引空间 (0..K)
                 remap_address(cycle.ram_access().address() as u64, memory_layout)
+                    // 如果地址映射成功，查表获取指纹；否则 (非RAM操作) 权重为 0
                     .map_or(F::zero(), |k| eq_r_address[k as usize])
             })
             .collect();
+
+        // 将向量转化为多线性多项式对象
         let wa = MultilinearPolynomial::from(wa);
 
         drop(_guard);
         drop(span);
 
+        // ========================================================================
+        // 3. 生成增量/值多项式 (Witness Generation)
+        // ========================================================================
+        // [约束原理: Memory Consistency Formula]
+        // `inc` (Increment/Value) 代表了每一次内存操作对最终状态的贡献值。
+        //
+        // 核心约束公式 (由 Sumcheck 证明)：
+        // Val_final(r) = Val_init(r) + \sum_{t=0}^{T-1} wa(t) * inc(t)
+        //
+        // - Val_final(r): 最终内存状态在 r 处的评估值 (Fingerprint of Final Memory)。
+        // - Val_init(r): 初始内存状态在 r 处的评估值。
+        // - wa(t): 选择器，只有当第 t 步操作的地址匹配 r 时才非零。
+        // - inc(t): 第 t 步操作写入的值（或值的变化量）。
+        //
+        // 这个公式本质上在说：
+        // "最终内存里的东西 = 初始有的东西 + 过程中所有写入东西的总和"
+        // (注：具体是覆盖写还是增量写取决于 Jolt 的具体 Memory Argument 变体，
+        // 但数学形式都是线性累加)。
         let inc = CommittedPolynomial::RamInc.generate_witness(
             bytecode_preprocessing,
             memory_layout,
@@ -194,26 +240,19 @@ impl<F: JoltField> ValFinalSumcheckProver<F> {
             None,
         );
 
+        // [代码中保留的测试逻辑 - 用于验证约束]
+        // 下面的注释代码解释了约束的具体含义：
         // #[cfg(test)]
         // {
-        //     let OutputSumcheckProverState {
-        //         val_init,
-        //         val_final,
-        //         ..
-        //     } = &output_sumcheck_prover_state;
-        //     // Check that Val_init(r), wa(r, j), and Inc(j) are consistent with
-        //     // the claim Val_final(r)
-        //     let expected = val_final.final_sumcheck_claim();
+        //     let expected = val_final.final_sumcheck_claim(); // 左边：最终状态的 Claim
+        //     // 右边：初始状态 Claim + (地址权重 * 操作值) 的总和
         //     let actual = val_init.final_sumcheck_claim()
         //         + wa_r_address
         //             .par_iter()
         //             .enumerate()
         //             .map(|(j, wa)| inc.get_coeff(j) * wa)
         //             .sum::<F>();
-        //     assert_eq!(
-        //         expected, actual,
-        //         "Val_final(r_address) ≠ Val_init(r_address) + \\sum_j wa(r_address, j) * Inc(j)"
-        //     );
+        //     assert_eq!(expected, actual);
         // }
 
         Self { wa, inc, params }

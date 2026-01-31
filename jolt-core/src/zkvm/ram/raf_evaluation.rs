@@ -4,7 +4,7 @@ use num_traits::Zero;
 use allocative::Allocative;
 #[cfg(feature = "allocative")]
 use allocative::FlameGraphBuilder;
-use rayon::prelude::*;
+
 use tracer::instruction::Cycle;
 
 use crate::{

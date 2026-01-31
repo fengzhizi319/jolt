@@ -128,7 +128,26 @@ impl<F: JoltField> InstructionInputSumcheckProver<F> {
         trace: &[Cycle],
         opening_accumulator: &ProverOpeningAccumulator<F>,
     ) -> Self {
-        // Compute MLEs.
+        // ========================================================================
+        // 1. 计算多线性扩展 (Compute MLEs) - 数据准备阶段
+        // ========================================================================
+        // [算法原理: Multilinear Extension (MLE) Construction]
+        // 我们将 Trace 表中的每一列视为一个多线性多项式的评估值向量。
+        // 这里初始化了 8 个列向量，它们构成了 "多路复用器 (MUX)" 电路的输入信号。
+        //
+        // 左操作数 (Left Input) 的候选项：
+        // - left_is_rs1_poly: 标志位，为真表示左输入应来自 RS1 寄存器。
+        // - left_is_pc_poly:  标志位，为真表示左输入应来自 PC (如 JAL 指令)。
+        //
+        // 右操作数 (Right Input) 的候选项：
+        // - right_is_rs2_poly: 标志位，为真表示右输入应来自 RS2 寄存器。
+        // - right_is_imm_poly: 标志位，为真表示右输入应来自立即数 (Immediate)。
+        //
+        // 实际数值数据：
+        // - rs1_value_poly: Trace 中每一行 RS1 寄存器里的实际值。
+        // - rs2_value_poly: Trace 中每一行 RS2 寄存器里的实际值。
+        // - imm_poly:       Trace 中每一行指令解码出的立即数值。
+        // - unexpanded_pc_poly: Trace 中每一行的 PC 值。
         let mut left_is_rs1_poly = vec![false; trace.len()];
         let mut left_is_pc_poly = vec![false; trace.len()];
         let mut right_is_rs2_poly = vec![false; trace.len()];
@@ -137,6 +156,9 @@ impl<F: JoltField> InstructionInputSumcheckProver<F> {
         let mut rs2_value_poly = vec![0; trace.len()];
         let mut imm_poly = vec![0; trace.len()];
         let mut unexpanded_pc_poly = vec![0; trace.len()];
+
+        // [算法原理: Parallel Data Processing]
+        // 使用 Rayon 并行迭代 Trace，填充上述向量。这是构建证明系统中最耗时的步骤之一(O(N))。
         (
             &mut left_is_rs1_poly,
             &mut left_is_pc_poly,
@@ -151,23 +173,32 @@ impl<F: JoltField> InstructionInputSumcheckProver<F> {
             .into_par_iter()
             .for_each(
                 |(
-                    left_is_rs1_eval,
-                    left_is_pc_eval,
-                    right_is_rs2_eval,
-                    right_is_imm_eval,
-                    rs1_value_eval,
-                    rs2_value_eval,
-                    imm_eval,
-                    unexpanded_pc_eval,
-                    cycle,
-                )| {
+                     left_is_rs1_eval,
+                     left_is_pc_eval,
+                     right_is_rs2_eval,
+                     right_is_imm_eval,
+                     rs1_value_eval,
+                     rs2_value_eval,
+                     imm_eval,
+                     unexpanded_pc_eval,
+                     cycle,
+                 )| {
+                    // 解码当前行的指令
                     let instruction = cycle.instruction();
                     let instruction_norm = instruction.normalize();
+
+                    // [约束逻辑来源] 获取指令的标志位 (Flags)。
+                    // 比如 ADD 指令会设置 Left=Rs1, Right=Rs2。
+                    // 而 ADDI 指令会设置 Left=Rs1, Right=Imm。
                     let flags = instruction.instruction_flags();
+
+                    // 填充选择器 (Selectors)
                     *left_is_rs1_eval = flags[InstructionFlags::LeftOperandIsRs1Value];
                     *left_is_pc_eval = flags[InstructionFlags::LeftOperandIsPC];
                     *right_is_rs2_eval = flags[InstructionFlags::RightOperandIsRs2Value];
                     *right_is_imm_eval = flags[InstructionFlags::RightOperandIsImm];
+
+                    // 填充源数据 (Source Data)
                     *rs1_value_eval = cycle.rs1_read().unwrap_or_default().1;
                     *rs2_value_eval = cycle.rs2_read().unwrap_or_default().1;
                     *imm_eval = instruction_norm.operands.imm;
@@ -175,11 +206,33 @@ impl<F: JoltField> InstructionInputSumcheckProver<F> {
                 },
             );
 
+        // ========================================================================
+        // 2. 初始化 Eq 多项式 (Eq Polynomials)
+        // ========================================================================
+        // [算法原理: Split Sumcheck / Tensor Product]
+        // 这里的 GruenSplitEqPolynomial 是一种优化的 Eq 多项式实现。
+        // Stage 1 和 Stage 2 可能会有不同的随机挑战点 r_cycle。
+        // 这些 Eq 多项式用于后续 Sumcheck 中绑定特定的随机行。
         let eq_r_cycle_stage_1 =
             GruenSplitEqPolynomial::new(&params.r_cycle_stage_1.r, BindingOrder::LowToHigh);
         let eq_r_cycle_stage_2 =
             GruenSplitEqPolynomial::new(&params.r_cycle_stage_2.r, BindingOrder::LowToHigh);
 
+        // ========================================================================
+        // 3. 提取 Claim 并进行线性组合 (Claims & RLC)
+        // ========================================================================
+        // [算法原理: Fiat-Shamir / Random Linear Combination]
+        //
+        // 这里的逻辑是：
+        // Stage 1 (Outer) 和 Stage 2 (Product) 已经运行完毕。
+        // 它们宣称："我在处理第 r 行时，使用的 LeftInput 是 L，RightInput 是 R"。
+        //
+        // Stage 3 必须证明："你用的这个 L 和 R，确实符合指令 MUX 的逻辑"。
+        //
+        // 为了节省证明成本，我们将 Left 和 Right 的 Claim 用 gamma 混合：
+        // CombinedClaim = RightClaim + gamma * LeftClaim
+        //
+        // 这样我们只需要证明一个组合后的等式，而不是两个。
         let (_, left_claim_stage_1) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::LeftInstructionInput,
             SumcheckId::SpartanOuter,
@@ -196,10 +249,13 @@ impl<F: JoltField> InstructionInputSumcheckProver<F> {
             VirtualPolynomial::RightInstructionInput,
             SumcheckId::SpartanProductVirtualization,
         );
+
+        // 构造组合后的 Claim
         let claim_stage_1 = right_claim_stage_1 + params.gamma * left_claim_stage_1;
         let claim_stage_2 = right_claim_stage_2 + params.gamma * left_claim_stage_2;
 
         Self {
+            // 将 Rust 的 Vec 转换为域元素的向量，准备用于证明
             left_is_rs1_poly: left_is_rs1_poly.into(),
             left_is_pc_poly: left_is_pc_poly.into(),
             right_is_rs2_poly: right_is_rs2_poly.into(),

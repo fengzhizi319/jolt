@@ -1350,64 +1350,91 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
     /// 3. **Register Access Claims**: 将指令层面的“读写寄存器”行为，归约为底层的寄存器访问 Claim，为 Stage 4 的寄存器一致性检查建立桥梁。
     #[tracing::instrument(skip_all)]
     fn prove_stage3(&mut self) -> SumcheckInstanceProof<F, ProofTranscript> {
+        // [性能监控] 打印当前内存占用基线
         #[cfg(not(target_arch = "wasm32"))]
         print_current_memory_usage("Stage 3 baseline");
 
-        // 1. 初始化各子任务参数 (Initialization params)：
+        // ========================================================================
+        // 1. 初始化各子任务参数 (Initialization params)
+        // 这一步定义了我们要证明的三个具体的数学约束（多项式关系）。
+        // ========================================================================
 
-        // a. 移位检查参数 (Shift Check Params):
-        // "Shift" 指的是在 Trace 矩阵中对列进行错位（Shift）操作，用于检查 $State_{t}$ 和 $State_{t+1}$ 之间的关系。
-        // 主要用于证明：
-        // - PC 更新逻辑：$PC_{t+1} = PC_t + 4$ (顺序) 或 $PC_{t+1} = Target$ (跳转)。
-        // - 确保 Trace 的连续性和控制流的正确性。
+        // ------------------------------------------------------------------------
+        // a. 移位检查参数 (Shift Check Params),只初始化参数，没有建立约束
+        // ------------------------------------------------------------------------
+        // [算法原理: Shift / Rotation Constraint]
+        // 在 Trace 矩阵中，我们需要约束第 t 行和第 t+1 行的关系。
+        // 这通过将某一列数据 "Shift"（错位）来实现比较：State[t+1] - f(State[t]) == 0。
+        //
+        // 主要验证目标：
+        // 1. PC (Program Counter) 的连续性：
+        //    - 顺序执行：PC_{t+1} = PC_t + 4
+        //    - 分支跳转：PC_{t+1} = PC_t + immediate (如果条件满足)
+        // 2. RAM 初始化的连续性等。
+        //
+        // log_2() 表示多项式的变量个数（Trace长度为 2^k，则有 k 个变量）。
         let spartan_shift_params = ShiftSumcheckParams::new(
             self.trace.len().log_2(),
-            &self.opening_accumulator,
-            &mut self.transcript,
+            &self.opening_accumulator, // 传入之前的随机挑战，确保协议连续性
+            &mut self.transcript,      // Fiat-Shamir Transcript
         );
 
-        // b. 指令输入构造参数 (Instruction Input Params):
-        // 验证 ALU/Lookup 的输入数据是否构造正确。
-        // Jolt 支持多种指令格式（R-type, I-type, S-type 等）。
-        // 此步骤证明：$Input = \text{Mux}(Format, RegisterValue, Immediate)$。
-        // 确保了哪怕查找表本身是对的，我们查询查找表所用的“问题”也是符合指令定义的。
+        // ------------------------------------------------------------------------
+        // b. 指令输入构造参数 (Instruction Input Params),只初始化参数，没有建立约束
+        // ------------------------------------------------------------------------
+        // [算法原理: Multiplexer (MUX) Logic Constraint]
+        // 验证 ALU 或查找表的输入源是否正确。
+        // 逻辑公式：Input = (IsReg * RegValue) + (IsImm * ImmediateValue)
+        //
+        // 目的：
+        // 防止恶意 Prover 即使在指令是 ADDI (加立即数) 时，却使用了寄存器的值去欺骗查找表。
+        // 确保发往 Stage 1/2 查找表的 "Query" 本身是符合指令定义的。
         let spartan_instruction_input_params =
             InstructionInputParams::new(&self.opening_accumulator, &mut self.transcript);
 
-        // c. 寄存器使用声明归约 (Registers Claim Reduction):
-        // 这是一个“归约”步骤（Reduction）。
-        // 它负责证明：“在第 $t$ 步，指令 $I$ 确实请求读取了寄存器 $r_x$ 和 $r_y$，并请求写入 $r_d$”。
-        // 这个证明产生的结果（Claim），将作为下一阶段（Stage 4）寄存器读写一致性检查的输入（即“作为该一致性检查的正确查询”）。
+        // ------------------------------------------------------------------------
+        // c. 寄存器使用声明归约 (Registers Claim Reduction),只初始化参数，没有建立约束
+        // ------------------------------------------------------------------------
+        // [算法原理: Reduction for Offline Memory Checking]
+        // 这是一个"桥梁"步骤。
+        // Stage 3 并不直接验证内存读写值是否正确（那太慢了），而是生成一组 "Claim"（声明）。
+        // Claim 内容： "在时间 t，指令 I 请求读取了寄存器 r，并声称读到的值为 v"。
+        //
+        // 这些 Claim 会被压缩成多项式，作为 Input 传递给 Stage 4。
+        // Stage 4 将使用 "Grand Product Argument" (连乘积论证) 来批量验证这些读写的一致性。
         let spartan_registers_claim_reduction_params = RegistersClaimReductionSumcheckParams::new(
             self.trace.len(),
             &self.opening_accumulator,
             &mut self.transcript,
         );
 
-        // 2. 初始化具体的 Prover 实例 (Initialize):
-        // 创建负责计算和多项式生成的实体。
+        // ========================================================================
+        // 2. 初始化具体的 Prover 实例 (Initialize Provers)，根据实现trace建立约束，得到多项式点值
+        // 这一步加载实际的数据（Trace, Bytecode），将其转化为多线性多项式（MLE）。
+        // ========================================================================
 
-        // Shift Prover: 需要访问 Trace（当前状态）和 Bytecode（获取跳转目标/指令信息）来验证状态转移。
+        // Shift Prover: 需要 Trace (当前状态) 和 Bytecode (为了获取跳转指令的 offset)
         let spartan_shift = ShiftSumcheckProver::initialize(
             spartan_shift_params,
             Arc::clone(&self.trace),
             &self.preprocessing.shared.bytecode,
         );
 
-        // Instruction Input Prover: 需要 Trace 来获取每一行解码出的操作数源数据。
+        // Input Prover: 需要 Trace (解析指令的操作数)
         let spartan_instruction_input = InstructionInputSumcheckProver::initialize(
             spartan_instruction_input_params,
             &self.trace,
             &self.opening_accumulator,
         );
 
-        // Registers Reduction Prover: 需要 Trace 来确定每一行指令具体访问了哪些寄存器索引（Indices）。
+        // Registers Prover: 需要 Trace (提取 rd, rs1, rs2 索引)
+        //Sum(Combined(x) * Eq(x, r)),Combined(x) = Val_rd(x) + gamma * Val_rs1(x) + gamma^2 * Val_rs2(x)
         let spartan_registers_claim_reduction = RegistersClaimReductionSumcheckProver::initialize(
             spartan_registers_claim_reduction_params,
             Arc::clone(&self.trace),
         );
 
-        // 内存分析工具（可选特性）：打印各个 Prover 占用的堆内存大小。
+        // [调试工具] 打印各个 Prover 在堆上的内存占用
         #[cfg(feature = "allocative")]
         {
             print_data_structure_heap_usage("ShiftSumcheckProver", &spartan_shift);
@@ -1421,10 +1448,17 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             );
         }
 
-        // 3. 打包实例 (Batching):
-        // 将三个独立的检查打包。
-        // Jolt 的 Batched Sumcheck 技术允许这三个不同的多项式等式检查共享同一个 Verifier 随机挑战 $r$。
-        // 这将验证成本从 $3 \times O(Verifier)$ 降低到了接近 $1 \times O(Verifier)$。
+        // ========================================================================
+        // 3. 打包实例 (Batching)
+        // [算法原理: Random Linear Combination / Batching]
+        // 我们有三个独立的约束方程要证明：P_shift(x)=0, P_input(x)=0, P_reg(x)=0
+        //
+        // 为了节省 Verifier 的验证开销，我们不分别运行三次 Sumcheck。
+        // 而是利用随机数 r (也就是 alpha) 将它们线性组合：
+        // P_total(x) = P_shift(x) + r * P_input(x) + r^2 * P_reg(x)
+        //
+        // 这样只需要运行一次 Sumcheck 协议即可证明所有三个属性。
+        // ========================================================================
         let mut instances: Vec<Box<dyn SumcheckInstanceProver<_, _>>> = vec![
             Box::new(spartan_shift),
             Box::new(spartan_instruction_input),
@@ -1436,13 +1470,22 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
 
         tracing::info!("Stage 3 proving");
 
-        // 4. 执行批量 Sumcheck (Prove):
-        // 运行 Sumcheck 协议驱动器。
-        // 它会迭代 $\log(TraceLen)$ 轮。在每一轮中：
-        // - Prover 计算并发送单变量多项式。
-        // - Verifier 发送随机挑战 $r$。
-        // - 所有子 Prover 根据 $r$ 折叠自己的多项式。
-        // 最终返回一个合并后的 Sumcheck 证明对象。
+        // ========================================================================
+        // 4. 执行批量 Sumcheck (Prove)
+        // [算法原理: Sumcheck Protocol]
+        // 这是交互式零知识证明的核心循环。
+        //
+        // 过程：
+        // 1. 迭代 log(N) 轮（N 是 Trace 长度）。
+        // 2. 每轮 Prover 将多变量多项式 P(x_1, ..., x_k) 固定住一个变量，
+        //    变成单变量多项式 g(x_1) 并发送给 Verifier。
+        // 3. Verifier 发送随机挑战 r。
+        // 4. Prover 利用 r "折叠" (Fold) 多项式，将变量数减一。
+        //
+        // 最终结果：
+        // 返回一个 SumcheckProof，包含每一轮的单变量多项式评估值。
+        // 此时多变量问题被简化为了对单个随机点 Evaluation 的检查。
+        // ========================================================================
         let (sumcheck_proof, _r_stage3) = BatchedSumcheck::prove(
             instances.iter_mut().map(|v| &mut **v as _).collect(),
             &mut self.opening_accumulator,
@@ -1452,9 +1495,14 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         #[cfg(feature = "allocative")]
         write_instance_flamegraph_svg(&instances, "stage3_end_flamechart.svg");
 
-        // 后台释放资源：
-        // Sumcheck 结束后，这些 Prover 包含的大量中间数据不再需要。
-        // 在后台线程 drop 它们，防止阻塞主证明线程，提高性能。
+        // ========================================================================
+        // 5. 资源释放 (Cleanup)
+        // [工程优化: Async Drop]
+        // Sumcheck 结束后，instances 中包含巨大的多项式数据（可能占用 GB 级内存）。
+        // 直接 drop 会导致主线程阻塞几百毫秒甚至数秒。
+        // 这里的 drop_in_background_thread 将内存释放工作扔给后台线程，
+        // 让主线程可以立即开始 Stage 4 的计算，提高 Pipeline 效率。
+        // ========================================================================
         drop_in_background_thread(instances);
 
         sumcheck_proof
@@ -1478,58 +1526,78 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         #[cfg(not(target_arch = "wasm32"))]
         print_current_memory_usage("Stage 4 baseline");
 
-        // 1. 初始化寄存器读写检查参数 (Registers R/W Checking Params)：
-        // 这是 Stage 4 的核心任务之一。它旨在证明 CPU 寄存器文件（Register File）的状态一致性。
-        // 原理与 RAM 一致性检查类似：构建所有寄存器访问的操作记录（Trace），
-        // 并证明按“时间顺序”的访问列表与按“寄存器索引+时间”排序后的列表在多重集意义上是相等的。
-        // 即：证明在任意周期读取某寄存器（如 x1）获得的值，等于上一次写入该寄存器的值。
+        // ========================================================================
+        // 1. 寄存器读写检查参数 (Registers Read/Write Checking Params)
+        // ========================================================================
+        // [算法原理: Offline Memory Checking - 寄存器部分]
+        // 寄存器堆较小（通常32个），访问非常频繁。
+        // 这里主要准备验证核心内存等式：
+        // {所有写入操作} ∪ {初始状态} == {所有读取操作} ∪ {最终状态}
+        //
+        // 此步骤生成用于验证 "Read-Write Consistency" 的参数，
+        // 确保每次读取寄存器得到的值，都是上一次写入该寄存器的值。
         let registers_read_write_checking_params = RegistersReadWriteCheckingParams::new(
             self.trace.len(),
             &self.opening_accumulator,
             &mut self.transcript,
-            &self.rw_config,
+            &self.rw_config, // 读写配置，定义了哪些是读操作，哪些是写操作
         );
 
-        // 2. 累积 Advice（辅助输入）：
-        // 处理程序中的 "Advice"（即非确定性输入，如私有见证信息、密码学密钥 witness 或 Verifier 不知道的辅助数据）。
-        // 这一步本身不开启一个新的 Sumcheck 实例，而是将 Advice 多项式的评估值 "Folding" (折叠) 进 `opening_accumulator`。
-        // 这样做的目的是让 Advice 的数据完整性检查“搭便车”，作为 Stage 4 最终验证的一部分。
-        // `needs_single_advice_opening`: 判断是否需要单独对 Advice 进行 Opening 证明。
+        // ========================================================================
+        // 2. 累积 Advice (Accumulate Advice)
+        // ========================================================================
+        // [算法原理: Advice Commitment & Fiat-Shamir]
+        // 在离线内存检查中，Prover 需要提供额外的 "Advice"（建议/辅助信息）。
+        // 最关键的 Advice 是 "按地址排序的 Trace" (Sorted Trace)。
+        //
+        // Verifier 无法自己排序（计算量太大），所以 Prover 提供排序后的数据。
+        // 此函数将这些 Advice 多项式（untrusted）进行承诺，并混入 Transcript，
+        // 以便 Verifier 生成随机挑战，防止 Prover 伪造排序数据。
         prover_accumulate_advice(
-            &self.advice.untrusted_advice_polynomial, // Prover 提供的私有输入（需保密/承诺）
-            &self.advice.trusted_advice_polynomial,   // 预处理或公开的辅助输入
+            &self.advice.untrusted_advice_polynomial, // Prover 提供的辅助多项式（如排序后的内存访问）
+            &self.advice.trusted_advice_polynomial,   // 可信的系统多项式
             &self.program_io.memory_layout,
             &self.one_hot_params,
             &mut self.opening_accumulator,
             &mut self.transcript,
+            // 检查是否需要单点 Opening（优化策略，取决于 Trace 长度）
             self.rw_config
                 .needs_single_advice_opening(self.trace.len().log_2()),
         );
 
-        // 3. 初始化 RAM 值评估参数 (RAM Val Evaluation Params)：
-        // 注意：Stage 2 已经通过 Grand Product 证明了内存访问的“地址和时间顺序”的一致性（Read-Write Consistency）。
-        // Stage 4 的 `ValEvaluation` 侧重于内存操作中的“数据值 (Value)”部分。
-        // 它负责证明 Trace 中记录的内存值与内存布局、初始状态（Initial RAM，即程序加载时的内存快照）一致。
-        // 确保第一次读取某个地址时，读到的确实是初始值。
+        // ========================================================================
+        // 3. 初始化 RAM 相关的参数 (RAM Init & Final Params)
+        // ========================================================================
+        // [算法原理: RAM Consistency & One-Hot Encoding]
+        // RAM 与寄存器不同，地址空间巨大（如 2^64），但实际访问稀疏。
+        // Jolt 将 RAM 检查拆分为不同部分以优化性能。
+
+        // a. RAM 值评估 (Val Evaluation)
+        // 这通常涉及验证内存的 "初始状态 (Init)" 或特定时间点的正确性。
+        // one_hot_params 暗示这里可能使用了 One-Hot 编码来处理地址匹配，
+        // 或者用于验证读操作命中了正确的内存单元。
         let ram_val_evaluation_params = ValEvaluationSumcheckParams::new_from_prover(
             &self.one_hot_params,
             &self.opening_accumulator,
-            &self.initial_ram_state,
+            &self.initial_ram_state, // 必须确保读取未写入地址时返回初始值（通常是0）
             self.trace.len(),
         );
 
-        // 4. 初始化 RAM 最终状态检查参数 (RAM Final Value Params)：
-        // 验证程序执行结束后的内存状态（Final RAM State）。
-        // 这对于证明程序的副作用（Side Effects）或输出结果是正确的至关重要。
-        // 它确保最后一轮 Sumcheck 约束住的内存状态确实是程序宣称的那个最终状态。
+        // b. RAM 最终状态 (Val Final)
+        // [算法原理: Final State Consistency]
+        // 内存检查等式的右半部分需要包含 "最终内存状态 (Final Memory State)"。
+        // 验证： Init ∪ Writes == Reads ∪ Final
+        // 此参数用于生成证明 "Final" 集合正确性的多项式。
         let ram_val_final_params =
             ValFinalSumcheckParams::new_from_prover(self.trace.len(), &self.opening_accumulator);
 
-        // 5. 初始化具体的 Prover 实例：
-        // 根据上述参数创建负责多项式计算的对象。
+        // ========================================================================
+        // 4. 初始化具体的 Prover 实例 (Initialize Provers)
+        // ========================================================================
 
-        // 寄存器一致性证明器：
-        // 构造读写记录表（Access Log），并进行排序检查。它需要完整的 Trace 和指令字节码来重构寄存器访问行为。
+        // 4a. 寄存器读写一致性 Prover
+        // [算法原理: Grand Product Argument]
+        // 构建连乘积多项式，证明寄存器的访问记录在时间维度和空间（地址）维度上是一致的。
         let registers_read_write_checking = RegistersReadWriteCheckingProver::initialize(
             registers_read_write_checking_params,
             self.trace.clone(),
@@ -1537,8 +1605,8 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             &self.program_io.memory_layout,
         );
 
-        // RAM 值证明器：
-        // 验证加载/存储指令的数据载荷。它关注 `MemoryOp` 结构中的 `value` 字段。
+        // 4b. RAM 初始化/评估 Prover
+        // 负责证明 RAM 操作与初始状态的一致性。
         let ram_val_evaluation = RamValEvaluationSumcheckProver::initialize(
             ram_val_evaluation_params,
             &self.trace,
@@ -1546,8 +1614,8 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             &self.program_io.memory_layout,
         );
 
-        // RAM 最终状态证明器：
-        // 负责生成关于 Finale RAM State 的多项式。
+        // 4c. RAM 最终状态 Prover
+        // 负责证明执行结束后的 RAM 状态是所有历史操作的正确累积结果。
         let ram_val_final = ValFinalSumcheckProver::initialize(
             ram_val_final_params,
             &self.trace,
@@ -1555,8 +1623,6 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             &self.program_io.memory_layout,
         );
 
-        // 调试统计信息（Allocative Feature）：
-        // 打印这些 Prover 在堆上分配的内存大小，用于性能调优。
         #[cfg(feature = "allocative")]
         {
             print_data_structure_heap_usage(
@@ -1567,9 +1633,13 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             print_data_structure_heap_usage("ValFinalSumcheckProver", &ram_val_final);
         }
 
-        // 6. 打包实例进行批量证明 (Batching)：
-        // 将寄存器检查、RAM 值检查和 RAM 最终状态检查合并。
-        // 这是一个典型的 Spartan/Jolt 优化模式：多个独立的多变量多项式等式检查可以共享同一个随机挑战向量 $r$。
+        // ========================================================================
+        // 5. 打包实例 (Batching)
+        // ========================================================================
+        // [算法原理: Batched Sumcheck / Random Linear Combination]
+        // 将寄存器检查、RAM 初始检查、RAM 最终检查这三个任务打包。
+        // 通过随机线性组合，将它们合并为一个 Sumcheck 协议。
+        // 这样，Verifier 只需要验证一次 Sumcheck，就能确信这三部分（即整个内存系统）都是正确的。
         let mut instances: Vec<Box<dyn SumcheckInstanceProver<_, _>>> = vec![
             Box::new(registers_read_write_checking),
             Box::new(ram_val_evaluation),
@@ -1578,14 +1648,12 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
 
         #[cfg(feature = "allocative")]
         write_instance_flamegraph_svg(&instances, "stage4_start_flamechart.svg");
-
         tracing::info!("Stage 4 proving");
 
-        // 7. 执行批量 Sumcheck (Prove)：
-        // 驱动 Sumcheck 协议。
-        // Verifier 发送随机挑战，Prover 逐步归约多项式。
-        // 最终将所有关于寄存器和内存值的复杂声明压缩为一个简单的评估点验证，
-        // 并将结果存入 `opening_accumulator`，留待后续阶段（通常是 Stage 8 - Dory）进行统一的承诺验证。
+        // ========================================================================
+        // 6. 执行批量 Sumcheck (Prove)
+        // ========================================================================
+        // 驱动 Sumcheck 协议，进行多轮折叠（Folding），生成证明。
         let (sumcheck_proof, _r_stage4) = BatchedSumcheck::prove(
             instances.iter_mut().map(|v| &mut **v as _).collect(),
             &mut self.opening_accumulator,
@@ -1595,8 +1663,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         #[cfg(feature = "allocative")]
         write_instance_flamegraph_svg(&instances, "stage4_end_flamechart.svg");
 
-        // 后台释放资源：
-        // 证明生成完毕后，立即释放占用大量内存的 Prover 实例，防止内存峰值过高。
+        // [工程优化] 后台线程释放内存
         drop_in_background_thread(instances);
 
         sumcheck_proof

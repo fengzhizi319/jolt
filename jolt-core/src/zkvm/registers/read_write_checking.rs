@@ -191,11 +191,19 @@ impl<F: JoltField> RegistersReadWriteCheckingProver<F> {
     #[tracing::instrument(skip_all, name = "RegistersReadWriteCheckingProver::initialize")]
     pub fn initialize(
         params: RegistersReadWriteCheckingParams<F>,
-        trace: Arc<Vec<Cycle>>,
+        trace: Arc<Vec<Cycle>>, // 完整的执行轨迹
         bytecode_preprocessing: &BytecodePreprocessing,
         memory_layout: &MemoryLayout,
     ) -> Self {
-        let r_prime = &params.r_cycle;
+        let r_prime = &params.r_cycle; // Verifier 提供的随机挑战点 r
+
+        // ========================================================================
+        // 1. 初始化 Eq 多项式 (Eq Polynomial Setup)
+        // ========================================================================
+        // [算法原理: Gruen's Split Sumcheck Optimization]
+        // 这里的逻辑是为了支持 Split Sumcheck (分块求和检查)。
+        // 如果 phase1_num_rounds > 0，说明使用了分块优化，我们需要构造 GruenSplitEqPolynomial。
+        // 这允许我们将巨大的 Trace 分解为 Tensor Product (张量积) 形式，加速证明。
         let (gruen_eq, merged_eq) = if params.phase1_num_rounds > 0 {
             (
                 Some(GruenSplitEqPolynomial::new(
@@ -205,19 +213,46 @@ impl<F: JoltField> RegistersReadWriteCheckingProver<F> {
                 None,
             )
         } else {
+            // 如果没有 Phase 1 (小规模测试或特定配置)，则退化为标准的多线性扩展 Eq。
             (
                 None,
                 Some(MultilinearPolynomial::from(EqPolynomial::evals(&r_prime.r))),
             )
         };
+
+        // ========================================================================
+        // 2. 生成 Inc 多项式 (Increment Polynomial)
+        // ========================================================================
+        // [约束原理: Timestamp / Counter Logic]
+        // 内存检查需要区分操作的先后顺序。通常使用全局计数器。
+        // 但在 Jolt 中，"Inc" 可能用于标记寄存器是否发生变化的增量位，或者是时间戳的某种变体。
+        // 此多项式由 CommittedPolynomial 系统自动生成，代表了每一行 Trace 的辅助状态。
         let inc = CommittedPolynomial::RdInc.generate_witness(
             bytecode_preprocessing,
             memory_layout,
             &trace,
             None,
         );
+
+        // ========================================================================
+        // 3. 构建稀疏读写矩阵 (Sparse Read-Write Matrix)
+        // ========================================================================
+        // [算法原理: Sparse Matrix Representation for Memory Checking]
+        // 这是核心数据结构。
+        // 内存检查本质上是比较两个集合：{Writes + Init} 和 {Reads + Final}。
+        // 但寄存器访问是稀疏的（相对于整个 RAM 空间，或者相对于多变量域）。
+        //
+        // `ReadWriteMatrixCycleMajor` 负责将 Trace 转换为适合 Grand Product 计算的矩阵形式。
+        // 它使用 params.gamma 将 (Address, Value, Time) 压缩成单一指纹。
         let sparse_matrix =
             ReadWriteMatrixCycleMajor::<_, RegistersCycleMajorEntry<F>>::new(&trace, params.gamma);
+
+        // ========================================================================
+        // 4. 阶段划分 (Phase Splitting)
+        // ========================================================================
+        // [算法原理: Multi-Phase Sumcheck]
+        // 类似于 Stage 3，Stage 4 也可能将证明拆分为多个阶段以优化内存或计算。
+        // 这里根据配置将稀疏矩阵移动到 Phase 1 或 Phase 2 的槽位中。
         let phase1_rounds = params.phase1_num_rounds;
         let phase2_rounds = params.phase2_num_rounds;
 
@@ -235,6 +270,8 @@ impl<F: JoltField> RegistersReadWriteCheckingProver<F> {
             gruen_eq,
             merged_eq,
             inc,
+            // 下面这些字段 (ra, wa, val) 是 Grand Product 的中间值，
+            // 将在 Sumcheck 过程中动态计算，此处初始化为 None。
             ra: None,
             wa: None,
             val: None,

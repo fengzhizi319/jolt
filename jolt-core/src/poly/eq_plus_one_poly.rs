@@ -52,33 +52,46 @@ impl<F: JoltField> EqPlusOnePolynomial<F> {
     #[tracing::instrument(skip_all, "EqPlusOnePolynomial::evals")]
     pub fn evals(r: &[F::Challenge], scaling_factor: Option<F>) -> (Vec<F>, Vec<F>) {
         let ell = r.len();
+        // 分配内存。ell.pow2() 即 2^ell
         let mut eq_evals: Vec<F> = unsafe_allocate_zero_vec(ell.pow2());
         eq_evals[0] = scaling_factor.unwrap_or(F::one());
         let mut eq_plus_one_evals: Vec<F> = unsafe_allocate_zero_vec(ell.pow2());
 
-        // i indicates the LENGTH of the prefix of r for which the eq_table is calculated
+        // [算法: 标准 Eq 向量的增量更新]
+        // 这是一个辅助闭包，它将现有的 eq_evals 按照新的随机点维度 r[i] 进行“分裂”。
+        // 原本的每个值 v 会变成 v*(1-r[i]) 和 v*r[i]。
         let eq_evals_helper = |eq_evals: &mut Vec<F>, r: &[F::Challenge], i: usize| {
             debug_assert!(i != 0);
-            let step = 1 << (ell - i); // step = (full / size)/2
+            let step = 1 << (ell - i);
 
+            // 使用 Rayon 进行并行处理，提高在大规模 Trace 下的速度
             let mut selected: Vec<_> = eq_evals.par_iter_mut().step_by(step).collect();
 
             selected.par_chunks_mut(2).for_each(|chunk| {
-                *chunk[1] = *chunk[0] * r[i - 1];
-                *chunk[0] -= *chunk[1];
+                // chunk[0] 存储 v，chunk[1] 存储 0
+                *chunk[1] = *chunk[0] * r[i - 1]; // 变成 v * r[i]
+                *chunk[0] -= *chunk[1];          // 变成 v - v * r[i] = v * (1 - r[i])
             });
         };
 
+        // [算法: 核心循环 - 同时计算 Eq 和 Eq+1]
         for i in 0..ell {
             let step = 1 << (ell - i);
             let half_step = step / 2;
 
+            // [算法: 预计算后缀乘积]
+            // 为了计算 Eq(x+1, r)，当第 i 位发生进位时，更高位 (i+1...) 会被激活。
+            // 这里计算 (1 - r[i]) * r[i+1] * r[i+2] * ...
             let mut r_lower_product = F::one();
             for &x in r.iter().skip(i + 1) {
-                r_lower_product = r_lower_product * x; // To get the benefits of multiplication
+                r_lower_product = r_lower_product * x;
             }
             r_lower_product *= F::one() - r[i];
 
+            // [算法原理: 捕获进位贡献]
+            // EqPlusOne 的逻辑：如果在第 i 位发生了进位，那么低位部分必然是全 1。
+            // 我们利用当前已经算好的部分 Eq 评估值，乘以预计算的后缀乘积，
+            // 直接填入 eq_plus_one_evals 对应的索引位置。
             eq_plus_one_evals
                 .par_iter_mut()
                 .enumerate()
@@ -88,6 +101,7 @@ impl<F: JoltField> EqPlusOnePolynomial<F> {
                     *v = eq_evals[index - half_step] * r_lower_product;
                 });
 
+            // 更新标准 Eq 向量，为下一轮迭代做准备
             eq_evals_helper(&mut eq_evals, r, i + 1);
         }
 
@@ -129,15 +143,44 @@ pub struct EqPlusOnePrefixSuffixPoly<F: JoltField> {
 
 impl<F: JoltField> EqPlusOnePrefixSuffixPoly<F> {
     pub fn new(r: &OpeningPoint<BIG_ENDIAN, F>) -> Self {
+        // [算法原理: Variable Splitting (变量拆分)]
+        // 将随机点 r (长度为 n) 对半拆分为高位 r_hi 和低位 r_lo。
+        // 这对应了 Tensor Product 结构：Eq(x, r) = Eq(x_hi, r_hi) * Eq(x_lo, r_lo)
         let (r_hi, r_lo) = r.split_at(r.len() / 2);
+
+        // [算法原理: Boundary Condition (边界检查)]
+        // is_max_eval 用于处理进位逻辑。
+        // 当低位索引 x_lo 全为 1 时（例如 0111），x_lo + 1 会产生进位，影响高位 x_hi。
+        // EqPolynomial::mle 会计算：当变量全为 1 时，Eq(x_lo, r_lo) 的评估值。
         let is_max_eval = EqPolynomial::mle(&vec![F::one(); r_lo.len()], &r_lo.r);
+
+        // 初始化前缀进位多项式 (Prefix 1)
+        // 这个向量代表了：如果 x_lo 发生了进位，低位部分变成了全 0 (即索引 0)。
         let mut prefix_1_evals = vec![F::zero(); 1 << r_lo.len()];
         prefix_1_evals[0] = is_max_eval;
+
+        // [算法原理: EqPlusOne 递归评估]
+        // 核心算法：同时计算 Eq(x, r) 和 Eq(x+1, r) 的所有评估值。
+        // 对于高位部分 r_hi：
+        // - suffix_0 对应没有从低位进位过来的情况：Eq(x_hi, r_hi)
+        // - suffix_1 对应低位进位过来的情况：Eq(x_hi + 1, r_hi)
         let (suffix_0, suffix_1) = EqPlusOnePolynomial::<F>::evals(&r_hi.r, None);
+
         Self {
+            // [算法原理: Tensor Product 组装]
+
+            // prefix_0: 正常情况下的低位部分。
+            // 这里取 .1 是因为 EqPlusOnePolynomial 返回的是 (Eq, Eq+1)，
+            // 在 Jolt 的特定实现中，这里映射的是 Eq(x_lo + 1, r_lo)。
             prefix_0: EqPlusOnePolynomial::<F>::evals(&r_lo.r, None).1,
+
+            // suffix_0: 对应 Eq(x_hi, r_hi)
             suffix_0,
+
+            // prefix_1: 只有当 x_lo 为全 1 且进位时才非零的特殊项
             prefix_1: prefix_1_evals,
+
+            // suffix_1: 对应 Eq(x_hi + 1, r_hi)
             suffix_1,
         }
     }
