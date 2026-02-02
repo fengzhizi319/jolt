@@ -63,171 +63,223 @@ pub struct RegistersCycleMajorEntry<F: JoltField> {
 }
 
 impl<F: JoltField> ReadWriteMatrixCycleMajor<F, RegistersCycleMajorEntry<F>> {
-    /// Count how many distinct registers this cycle touches (0–3).
-    #[inline]
-    fn entry_count_for_cycle(cycle: &Cycle) -> u8 {
-        let mut regs: [Option<_>; 3] = [None, None, None];
-        let mut len = 0;
+        /// 计算单个 Cycle 涉及的**不同**寄存器数量 (0–3)。
+        ///
+        /// 在构建稀疏矩阵时，核心关注点是“(Cycle, Register)”元组。
+        /// 即使一条指令涉及多个操作数（rs1, rs2, rd），如果它们指向同一个物理寄存器（例如 `add x1, x1, x1`），
+        /// 则在矩阵中应被视为同一个条目，其读写系数会被累加。
+        ///
+        /// 返回值 `len` 表示矩阵中该 Cycle 对应的行将包含多少个非零元素。
+        #[inline]
+        fn entry_count_for_cycle(cycle: &Cycle) -> u8 {
+            let mut regs: [Option<_>; 3] = [None, None, None];
+            let mut len = 0;
 
-        if let Some((rs1, _)) = cycle.rs1_read() {
-            if !regs[..len].contains(&Some(rs1)) {
-                regs[len] = Some(rs1);
-                len += 1;
+            // 检查 rs1 是否是新出现的寄存器
+            if let Some((rs1, _)) = cycle.rs1_read() {
+                if !regs[..len].contains(&Some(rs1)) {
+                    regs[len] = Some(rs1);
+                    len += 1;
+                }
             }
-        }
-        if let Some((rs2, _)) = cycle.rs2_read() {
-            if !regs[..len].contains(&Some(rs2)) {
-                regs[len] = Some(rs2);
-                len += 1;
+            // 检查 rs2 是否是新出现的寄存器
+            if let Some((rs2, _)) = cycle.rs2_read() {
+                if !regs[..len].contains(&Some(rs2)) {
+                    regs[len] = Some(rs2);
+                    len += 1;
+                }
             }
-        }
-        if let Some((rd, ..)) = cycle.rd_write() {
-            if !regs[..len].contains(&Some(rd)) {
-                regs[len] = Some(rd);
-                len += 1;
+            // 检查 rd 是否是新出现的寄存器
+            if let Some((rd, ..)) = cycle.rd_write() {
+                if !regs[..len].contains(&Some(rd)) {
+                    regs[len] = Some(rd);
+                    len += 1;
+                }
             }
+
+            len as u8
         }
 
-        len as u8
-    }
+        /// 填充单个 Cycle 的矩阵条目，并按列 (寄存器索引) 排序。
+        ///
+        /// ### 数学公式与聚合逻辑
+        /// 我们需要构建读写多项式的系数。对于每个活跃的寄存器 $k$ 和周期 $j$：
+        ///
+        /// 1.  **Read Address Indicator (ra)**:
+        ///     使用 Verifier 提供的随机数 $\gamma$ 区分 rs1 和 rs2：
+        ///     $$ ra(k, j) = \gamma \cdot \mathbb{I}(rs1_j = k) + \gamma^2 \cdot \mathbb{I}(rs2_j = k) $$
+        ///     这意味着如果同一个寄存器既是 rs1 又是 rs2，系数相加。
+        ///
+        /// 2.  **Write Address Indicator (wa)**:
+        ///     $$ wa(k, j) = \mathbb{I}(rd_j = k) $$
+        ///     如果发生写入，系数为 1。
+        ///
+        /// 3.  **Values (val/prev/next)**:
+        ///     - `val_coeff` / `prev_val`: 操作**前**的值 $v_{pre}$。
+        ///     - `next_val`: 操作**后**的值 $v_{post}$。
+        #[inline]
+        fn fill_entries_for_cycle(
+            row: usize, // 当前 Cycle 索引 j
+            cycle: &Cycle,
+            out: &mut [RegistersCycleMajorEntry<F>],
+            gamma: F,
+            gamma_squared: F,
+        ) {
+            debug_assert!(out.len() <= 3);
+            let mut len = 0usize;
 
-    /// Fill the per-cycle entries into `out` (length 0–3), sorted by `col`.
-    #[inline]
-    fn fill_entries_for_cycle(
-        row: usize,
-        cycle: &Cycle,
-        out: &mut [RegistersCycleMajorEntry<F>],
-        gamma: F,
-        gamma_squared: F,
-    ) {
-        debug_assert!(out.len() <= 3);
-        let mut len = 0usize;
-
-        if let Some((rs1, rs1_val)) = cycle.rs1_read() {
-            out[len] = RegistersCycleMajorEntry {
-                row,
-                col: rs1,
-                prev_val: rs1_val,
-                next_val: rs1_val,
-                val_coeff: F::from_u64(rs1_val),
-                ra_coeff: gamma,
-                wa_coeff: F::zero(),
-            };
-            len += 1;
-        }
-
-        if let Some((rs2, rs2_val)) = cycle.rs2_read() {
-            if let Some(e) = out[..len].iter_mut().find(|e| e.col == rs2) {
-                e.ra_coeff += gamma_squared;
-            } else {
+            // --- 处理 rs1 (源寄存器 1) ---
+            // 贡献: ra += gamma
+            if let Some((rs1, rs1_val)) = cycle.rs1_read() {
                 out[len] = RegistersCycleMajorEntry {
                     row,
-                    col: rs2,
-                    prev_val: rs2_val,
-                    next_val: rs2_val,
-                    val_coeff: F::from_u64(rs2_val),
-                    ra_coeff: gamma_squared,
+                    col: rs1,
+                    prev_val: rs1_val,
+                    next_val: rs1_val,          // 默认为读，值不变
+                    val_coeff: F::from_u64(rs1_val),
+                    ra_coeff: gamma,            // rs1 贡献 gamma
                     wa_coeff: F::zero(),
                 };
                 len += 1;
             }
-        }
 
-        if let Some((rd, rd_pre_val, rd_post_val)) = cycle.rd_write() {
-            if let Some(e) = out[..len].iter_mut().find(|e| e.col == rd) {
-                // Same register is read and then written this cycle.
-                e.wa_coeff = F::one();
-                e.next_val = rd_post_val;
-            } else {
-                out[len] = RegistersCycleMajorEntry {
-                    row,
-                    col: rd,
-                    prev_val: rd_pre_val,
-                    next_val: rd_post_val,
-                    // val_coeff stores the value *before* any access at this cycle.
-                    val_coeff: F::from_u64(rd_pre_val),
-                    ra_coeff: F::zero(),
-                    wa_coeff: F::one(),
-                };
-                len += 1;
+            // --- 处理 rs2 (源寄存器 2) ---
+            // 贡献: ra += gamma^2
+            if let Some((rs2, rs2_val)) = cycle.rs2_read() {
+                // 检查 rs2 是否与 rs1 是同一个寄存器
+                if let Some(e) = out[..len].iter_mut().find(|e| e.col == rs2) {
+                    //如果是同一寄存器，累加 ra 系数
+                    // Formula: ra = ra_old + gamma^2 = gamma + gamma^2
+                    e.ra_coeff += gamma_squared;
+                } else {
+                    // 如果是新寄存器，创建新条目
+                    out[len] = RegistersCycleMajorEntry {
+                        row,
+                        col: rs2,
+                        prev_val: rs2_val,
+                        next_val: rs2_val,
+                        val_coeff: F::from_u64(rs2_val),
+                        ra_coeff: gamma_squared,    // rs2 贡献 gamma^2
+                        wa_coeff: F::zero(),
+                    };
+                    len += 1;
+                }
+            }
+
+            // --- 处理 rd (目标寄存器) ---
+            // 贡献: wa += 1, 且更新 next_val
+            if let Some((rd, rd_pre_val, rd_post_val)) = cycle.rd_write() {
+                if let Some(e) = out[..len].iter_mut().find(|e| e.col == rd) {
+                    // 如果 rd 之前已被读取 (是 rs1 或 rs2)
+                    // Formula: wa = 1
+                    e.wa_coeff = F::one();
+                    // Formula: next_val = v_post (写入的新值)
+                    e.next_val = rd_post_val;
+                } else {
+                    // 如果只是被写入 (如 ADDI x1, x0, 10)，创建新条目
+                    out[len] = RegistersCycleMajorEntry {
+                        row,
+                        col: rd,
+                        prev_val: rd_pre_val,
+                        next_val: rd_post_val,
+                        // val_coeff 始终存储操作前的值 v_pre
+                        val_coeff: F::from_u64(rd_pre_val),
+                        ra_coeff: F::zero(),
+                        wa_coeff: F::one(), // rd 贡献 wa = 1
+                    };
+                    len += 1;
+                }
+            }
+
+            debug_assert_eq!(len, out.len());
+
+            // --- 排序 ---
+            // 对输出条目按寄存器索引 (col) 进行排序。
+            // 这对于后续 Sumcheck Phase 2 转换为 Address-Major 格式至关重要。
+            // 由于 len <= 3，使用简单的比较交换网络 (Sorting Network) 即可。
+            match len {
+                0 | 1 => {}
+                2 => {
+                    if out[0].col > out[1].col {
+                        out.swap(0, 1);
+                    }
+                }
+                3 => {
+                    if out[0].col > out[1].col {
+                        out.swap(0, 1);
+                    }
+                    if out[1].col > out[2].col {
+                        out.swap(1, 2);
+                    }
+                    if out[0].col > out[1].col {
+                        out.swap(0, 1);
+                    }
+                }
+                _ => unreachable!(),
             }
         }
 
-        debug_assert_eq!(len, out.len());
+        /// 创建新的 `ReadWriteMatrixCycleMajor` 实例。
+        ///
+        /// 这个函数采用 **"Count -> Offset -> Fill"** 的并行模式来高效构建稀疏矩阵。
+        ///
+        /// 1. **Parallel Count**: 并行统计每个 Cycle 生成的寄存器数量。
+        /// 2. **Prefix Sum**: 计算偏移量，确定每个 Cycle 的数据在扁平数组中的位置。
+        /// 3. **Parallel Fill**: 并行填充实际数据，无锁且内存访问不冲突。
+        #[tracing::instrument(skip_all, name = "ReadWriteMatrixCycleMajor::new")]
+        pub fn new(trace: &[Cycle], gamma: F) -> Self {
+            // [Pass 1]: 并行统计每个 cycle 的寄存器数量 (0, 1, 2 或 3)
+            let counts: Vec<u8> = trace
+                .par_iter()
+                .map(|cycle| Self::entry_count_for_cycle(cycle))
+                .collect();
 
-        // Sort by col for this row; len <= 3 so do a tiny manual sort.
-        match len {
-            0 | 1 => {}
-            2 => {
-                if out[0].col > out[1].col {
-                    out.swap(0, 1);
-                }
+            // [Prefix Sum]: 计算前缀和，得到每个 cycle 在结果数组中的起始偏移量
+            // offsets[j] = sum(counts[0..j])
+            let mut offsets: Vec<usize> = Vec::with_capacity(counts.len() + 1);
+            offsets.push(0);
+            let mut total: usize = 0;
+            for &c in &counts {
+                total += c as usize;
+                offsets.push(total);
             }
-            3 => {
-                if out[0].col > out[1].col {
-                    out.swap(0, 1);
-                }
-                if out[1].col > out[2].col {
-                    out.swap(1, 2);
-                }
-                if out[0].col > out[1].col {
-                    out.swap(0, 1);
-                }
-            }
-            _ => unreachable!(),
-        }
-    }
+            let total_entries = total;
 
-    /// Creates a new `ReadWriteMatrixCycleMajor` to represent the ra, wa and Val polynomials
-    /// for the registers read/write checking sumcheck.
-    #[tracing::instrument(skip_all, name = "ReadWriteMatrixCycleMajor::new")]
-    pub fn new(trace: &[Cycle], gamma: F) -> Self {
-        // ---- Pass 1: per-cycle entry counts (parallel) ----
-        let counts: Vec<u8> = trace
-            .par_iter()
-            .map(|cycle| Self::entry_count_for_cycle(cycle))
-            .collect();
-
-        // ---- Prefix sum: counts -> offsets (sequential, linear) ----
-        let mut offsets: Vec<usize> = Vec::with_capacity(counts.len() + 1);
-        offsets.push(0);
-        let mut total: usize = 0;
-        for &c in &counts {
-            total += c as usize;
-            offsets.push(total);
-        }
-        let total_entries = total;
-
-        // ---- Allocate entries and set_len unsafely; we'll fill everything in pass 2 ----
-        let mut entries: Vec<RegistersCycleMajorEntry<F>> = Vec::with_capacity(total_entries);
-        unsafe {
-            entries.set_len(total_entries);
-        }
-        let entries_ptr = entries.as_mut_ptr() as usize;
-
-        // ---- Pass 2: fill entries in parallel, disjoint slices per row ----
-        let gamma_squared = gamma.square();
-        trace.par_iter().enumerate().for_each(|(j, cycle)| {
-            let count = counts[j] as usize;
-            if count == 0 {
-                return;
-            }
-
-            let start = offsets[j] as isize;
-            let entries_ptr = entries_ptr as *mut RegistersCycleMajorEntry<F>;
+            // [Allocation]: 分配未初始化的内存
+            // 使用 unsafe set_len 避免初始化开销，因为我们保证在 Pass 2 会填充所有位置。
+            let mut entries: Vec<RegistersCycleMajorEntry<F>> = Vec::with_capacity(total_entries);
             unsafe {
-                let dst = entries_ptr.offset(start);
-                let slice = std::slice::from_raw_parts_mut(dst, count);
-                Self::fill_entries_for_cycle(j, cycle, slice, gamma, gamma_squared);
+                entries.set_len(total_entries);
             }
-        });
+            let entries_ptr = entries.as_mut_ptr() as usize;
 
-        ReadWriteMatrixCycleMajor {
-            entries,
-            val_init: vec![F::zero(); REGISTER_COUNT as usize].into(),
+            // [Pass 2]: 并行填充数据，为每个trace的每个寄存器，保持对应的RegistersCycleMajorEntry状态，如row,col,prev_val,next_val,val_coeff,ra_coeff,wa_coeff
+            // 每个线程拿到自己对应的 trace cycle 和 target buffer slice，互不干扰。
+            let gamma_squared = gamma.square();
+            trace.par_iter().enumerate().for_each(|(j, cycle)| {
+                let count = counts[j] as usize;
+                if count == 0 {
+                    return;
+                }
+
+                let start = offsets[j] as isize;
+                // 将 usize 指针转回裸指针
+                let entries_ptr = entries_ptr as *mut RegistersCycleMajorEntry<F>;
+                unsafe {
+                    // 计算当前任务的写入起始地址
+                    let dst = entries_ptr.offset(start);
+                    // 创建一个可变切片供 fill_entries_for_cycle 写入
+                    let slice = std::slice::from_raw_parts_mut(dst, count);
+                    Self::fill_entries_for_cycle(j, cycle, slice, gamma, gamma_squared);
+                }
+            });
+
+            ReadWriteMatrixCycleMajor {
+                entries,
+                val_init: vec![F::zero(); REGISTER_COUNT as usize].into(),
+            }
         }
     }
-}
 
 impl<F: JoltField> CycleMajorMatrixEntry<F> for RegistersCycleMajorEntry<F> {
     fn row(&self) -> usize {

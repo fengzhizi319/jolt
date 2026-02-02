@@ -220,7 +220,7 @@ impl<F: JoltField> ValEvaluationSumcheckProver<F> {
             .par_iter()
             .map(|cycle| {
                 // 对于 Trace 中的每一行 (cycle)，提取其访问的 RAM 地址，
-                // 并映射到密集索引 k。
+                // 并映射到密集索引 k（即相对地址/8）
                 remap_address(cycle.ram_access().address() as u64, memory_layout)
                     .map(|k| k as usize)
             })

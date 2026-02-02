@@ -189,6 +189,24 @@ pub struct RegistersReadWriteCheckingProver<F: JoltField> {
 }
 
 impl<F: JoltField> RegistersReadWriteCheckingProver<F> {
+    ///
+    /// 将原始的 CPU 执行轨迹 (Trace) 转换成该 Prover 进行 Sumcheck 证明所需的代数结构和多项式**。    //
+    /// 具体来说，它执行了以下四个主要步骤：    //
+    /// 1.  **分块求和优化设置 (`Eq` Setup)**:
+    ///     *   根据配置 (`phase1_num_rounds`) 决定是否启用 **Gruen 分块优化**。如果启用，则初始化 `GruenSplitEqPolynomial` 以支持张量积形式的快速求和；否则初始化标准的密集 `Eq` 多项式。
+    ///
+    /// 2.  **生成增量多项式 (`Inc` Generation)**:
+    ///     *   利用 `BytecodePreprocessing` 和 `trace` 生成增量多项式 `inc`。
+    ///    *   该多项式是一个位标记（bit-flag），用于指示在特定周期是否有“写入”操作发生，这是内存检查逻辑中区分读/写的关键。
+    ///
+    /// 3.  **构建稀疏矩阵 (`Sparse Matrix` Construction)**:
+    ///     *   这是最关键的一步。它调用 `ReadWriteMatrixCycleMajor::new` 将执行轨迹转换为稀疏矩阵。
+    ///     *   它将寄存器的读写操作（`rs1`, `rs2`, `rd`）及其值，压缩成代数系数（利用随机数 $\gamma$ 进行指纹化），并按**时间周期 (Cycle-Major)** 排序，为第一阶段的证明做好数据准备。
+    ///
+    /// 4.  **阶段数据路由 (Phase Routing)**:
+    ///     *   根据 Sumcheck 协议的阶段配置（Phase 1 和 Phase 2 的轮数），决定将生成的稀疏矩阵放置在哪个“容器”中。
+    ///    *   如果配置了 Phase 1（时间绑定），稀疏矩阵保留在 `sparse_matrix_phase1` 中。
+    ///     *   如果跳过 Phase 1 直接从 Phase 2（空间绑定）开始，则立即将矩阵转置（从 Cycle-Major 转为 Address-Major）并放入 `sparse_matrix_phase2`。
     #[tracing::instrument(skip_all, name = "RegistersReadWriteCheckingProver::initialize")]
     pub fn initialize(
         params: RegistersReadWriteCheckingParams<F>,
@@ -248,6 +266,7 @@ impl<F: JoltField> RegistersReadWriteCheckingProver<F> {
         //
         // `ReadWriteMatrixCycleMajor` 负责将 Trace 转换为适合 Grand Product 计算的矩阵形式。
         // 它使用 params.gamma 将 (Address, Value, Time) 压缩成单一指纹。
+        //为每个trace的每个寄存器，保持对应的RegistersCycleMajorEntry状态，如row,col,prev_val,next_val,val_coeff,ra_coeff,wa_coeff,按照trace顺序排列成一个vec
         let sparse_matrix =
             ReadWriteMatrixCycleMajor::<_, RegistersCycleMajorEntry<F>>::new(&trace, params.gamma);
 
@@ -259,12 +278,30 @@ impl<F: JoltField> RegistersReadWriteCheckingProver<F> {
         // 这里根据配置将稀疏矩阵移动到 Phase 1 或 Phase 2 的槽位中。
         let phase1_rounds = params.phase1_num_rounds;
         let phase2_rounds = params.phase2_num_rounds;
-
+        /*
+        分支一：if phase1_rounds > 0 (标准流程)
+        语义：协议配置了第一阶段（绑定时间维度）。
+        操作：
+            。sparse_matrix_phase1: 直接接收原始的 sparse_matrix。因为 Phase 1 需要按时间顺序处理数据，Cycle-Major 格式正是它所需要的。
+            。sparse_matrix_phase2: 初始化为空 (Default::default())。
+        后续：当 Phase 1 的所有轮次运行结束后，系统会在运行时将 sparse_matrix_phase1 中的数据进行重排（转置），填充到 sparse_matrix_phase2 中。
+         */
         let (sparse_matrix_phase1, sparse_matrix_phase2) = if phase1_rounds > 0 {
             (sparse_matrix, Default::default())
         } else if phase2_rounds > 0 {
+            /*
+            语义：协议配置跳过了第一阶段，直接开始第二阶段（绑定寄存器地址维度）。这通常用于特定的测试配置或特殊参数设置。
+            操作：
+                。sparse_matrix_phase1: 初始化为空。
+                。sparse_matrix_phase2: 接收转换后的矩阵。
+            关键点：Phase 2 需要数据按寄存器地址聚类才能高效计算。因此，代码调用 .into() 触发类型转换（From<ReadWriteMatrixCycleMajor> trait），立即将矩阵从 Cycle-Major 重排为 Address-Major 格式。
+             */
             (Default::default(), sparse_matrix.into())
         } else {
+            /*
+            语义：既没有 Phase 1 也没有 Phase 2。
+            操作：抛出 unimplemented 错误，因为 Sumcheck 必须至少包含一个阶段来处理变量。
+             */
             unimplemented!("Unsupported configuration: both phase 1 and phase 2 are 0 rounds")
         };
 
