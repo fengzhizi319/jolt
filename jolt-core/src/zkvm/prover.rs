@@ -998,7 +998,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         #[cfg(not(target_arch = "wasm32"))]
         print_current_memory_usage("Stage 1 baseline");
 
-        tracing::info!("Stage 1 proving");
+        info!("Stage 1 proving");
 
         // =================================================================
         // 第一部分：UniSkip (Univariate Skip) - 第 0 轮
@@ -1344,10 +1344,10 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
     /// # 作用
     /// Stage 3 聚焦于 **Spartan Internal Consistency（内部一致性）**。
     /// 如果说 Stage 1 & 2 验证了“计算结果符合查找表”，那么 Stage 3 则验证“我们查找的是正确的数据”。
-    /// 主要包含三个核心任务：
-    /// 1. **State Transition (Shift Check)**: 验证跨时间步（Cycle）的约束。例如：验证程序计数器（PC）的更新逻辑（顺序执行 vs 跳转），以及 Next Instruction 逻辑。
-    /// 2. **Instruction Formatting (Input Validity)**: 验证指令解码逻辑。确保送入 ALU 或查找表的输入（Operands）是根据指令格式（Format）正确地从寄存器值或立即数（Imm）组合而成的。
-    /// 3. **Register Access Claims**: 将指令层面的“读写寄存器”行为，归约为底层的寄存器访问 Claim，为 Stage 4 的寄存器一致性检查建立桥梁。
+    // 主要包含三个核心任务：
+    // 1. **State Transition (Shift Check)**: 验证跨时间步（Cycle）的约束。例如：验证程序计数器（PC）的更新逻辑（顺序执行 vs 跳转），以及 Next Instruction 逻辑。
+    // 2. **Instruction Formatting (Input Validity)**: 验证指令解码逻辑。确保送入 ALU 或查找表的输入（Operands）是根据指令格式（Format）正确地从寄存器值或立即数（Imm）组合而成的。
+    // 3. **Register Access Claims**: 将指令层面的“读写寄存器”行为，归约为底层的寄存器访问 Claim，为 Stage 4 的寄存器一致性检查建立桥梁。
     #[tracing::instrument(skip_all)]
     fn prove_stage3(&mut self) -> SumcheckInstanceProof<F, ProofTranscript> {
         // [性能监控] 打印当前内存占用基线
