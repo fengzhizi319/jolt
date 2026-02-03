@@ -112,15 +112,44 @@ pub struct InstructionReadRafSumcheckParams<F: JoltField> {
 }
 
 impl<F: JoltField> InstructionReadRafSumcheckParams<F> {
+    /// 该函数负责初始化指令查找表 Sumcheck 参数，主要通过生成随机挑战 <span>\gamma</span> 将输出与操作数 Claim 批量合并，
+    /// 并从前序阶段提取时间维度归约点 r_reduction。
+    ///
+    /// # 功能
+    /// 该函数负责设置 Sumcheck 实例所需的各项参数，主要完成以下任务：
+    /// 1. **生成批处理随机数 ($\gamma$)**: 通过 Transcript 生成随机挑战 $\gamma$，用于将三个独立的查找表 Claim
+    ///    (LookupOutput, LeftOperand, RightOperand) 线性组合成一个 Claim 进行批量证明。
+    ///    组合形式为: $Claim = output + \gamma \cdot left + \gamma^2 \cdot right$。
+    /// 2. **获取归约挑战点**: 从上一阶段 (`InstructionClaimReduction`) 的累加器中提取
+    ///    用于时间周期 (Cycle) 维度的随机挑战点 `r_reduction`。
+    ///
+    /// # 参数
+    ///
+    /// * `n_cycle_vars` - 周期变量的数量 (即 $log_2(\text{Trace Length})$)。
+    /// * `one_hot_params` - One-hot 编码配置，定义了地址分块的大小 (`ra_virtual_log_k_chunk`)。
+    /// * `opening_accumulator` - 包含前序阶段生成的 Challenge 和 Claim 的累加器。
+    /// * `transcript` - Fiat-Shamir 协议的 Transcript，用于生成不可预测的随机数。
     pub fn new(
         n_cycle_vars: usize,
         one_hot_params: &OneHotParams,
         opening_accumulator: &dyn OpeningAccumulator<F>,
         transcript: &mut impl Transcript,
     ) -> Self {
+        // 1. 生成随机挑战 gamma。
+        //    这个 gamma 用于将三个不同的 claim (Lookup返回值, 左操作数, 右操作数)
+        //    压缩成一个单一的多项式 claim，以此通过一次 Sumcheck 完成所有验证。
         let gamma = transcript.challenge_scalar::<F>();
-        let gamma_sqr = gamma.square();
+        let gamma_sqr = gamma.square(); // 预计算平方，因为组合形式是 1, gamma, gamma^2 的线性组合
+
+        // 2. 确定 Sumcheck 的执行阶段数 (Phases)。
+        //    根据 Trace 的长度决定是否需要分阶段执行，以优化内存或计算效率。
         let phases = config::get_instruction_sumcheck_phases(n_cycle_vars);
+
+        // 3. 获取上一阶段产生的挑战点 r_reduction。
+        //    在 `InstructionClaimReduction` (Stage 1/2 部分) 中，我们已经针对时间维度 (Cycle)
+        //    进行了归约。这里提取那个归约产生的随机点，作为本阶段 Sumcheck 中
+        //    Cycle 变量 (最后 log(T) 轮) 的绑定目标。
+        //    注意：虽然这里取的是 LookupOutput 的点，但对于同一阶段的所有多项式，r_reduction 是共享的。
         let (r_reduction, _) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::LookupOutput,
             SumcheckId::InstructionClaimReduction,
@@ -240,16 +269,73 @@ impl<F: JoltField> InstructionReadRafSumcheckProver<F> {
     /// - Buckets cycles by table and by path (interleaved vs identity)
     /// - Allocates per-table suffix accumulators and u-evals for rv/raf parts
     /// - Instantiates the three RAF decompositions and Gruen EQs over cycles
+    /// 初始化指令读取与 RAF (Read, Arithmetic, Flag) 批量 Sumcheck 的 Prover 实例
+    ///
+    /// # 功能
+    ///
+    /// 该函数负责构建 Read+RAF Sumcheck 协议所需的初始状态。该协议用于证明指令查找表操作的正确性，
+    /// 即证明：`lookup(Input) == Output` 以及操作数分解的正确性。
+    ///
+    /// 主要完成以下初始化工作：
+    /// 1. **前缀-后缀分解 (Prefix-Suffix Decomposition) 初始化**: 为左操作数、右操作数和 Identity 多项式
+    ///    初始化分解结构。这是一种针对稀疏或结构化多项式的优化技术，用于加速 Sumcheck。
+    /// 2. **Trace 预处理**: 并行遍历执行轨迹 (Trace)，提取每个 Cycle 的查找键 (Lookup Index)、
+    ///    交错操作数标志 (Interleaved Flag) 以及所使用的具体查找表类型。
+    /// 3. **数据重组**:
+    ///    - 构建全局的 `lookup_indices` 和 `is_interleaved_operands` 向量。
+    ///    - 构建 `lookup_indices_by_table`，将 Cycle 按所使用的查找表进行分组，以便后续针对特定表进行批处理。
+    /// 4. **多项式准备**:
+    ///    - 初始化用于后续阶段的后缀多项式占位符。
+    ///    - 计算 `eq(r_reduction, j)` 的评估值 (`u_evals`)，这是上一阶段归约产生的系数。
+    ///    - 初始化 `GruenSplitEqPolynomial`，用于最后 $log(T)$ 轮的时间维度绑定。
+    /// 5. **阶段启动**: 调用 `init_phase(0)` 启动第一阶段的前缀计算。
+    ///
+    /// # 参数
+    ///
+    /// * `params` - Sumcheck 参数，包含批处理随机数 $\gamma$、阶段配置和归约点 $r_{reduction}$。
+    /// * `trace` - 完整的指令执行轨迹。
     #[tracing::instrument(skip_all, name = "InstructionReadRafSumcheckProver::initialize")]
+    /// 初始化指令 RAF (Read Access Frequency) 证明器
+    ///
+    /// **函数功能**:
+    /// 负责将原始的执行轨迹 (Trace) 转化为 Lasso 查找算法所需的多维索引数据结构。
+    /// 它并不直接生成证明，而是准备所有的"原材料"，包括：
+    /// 1. **Index 分解**: 将 64位的大索引分解为多个小的 chunks (Prefix/Suffix)。
+    /// 2. **Table 路由**: 确定每一步操作归属于哪个查找表 (ADD, MUL 等)。
+    /// 3. **Time 权重**: 预计算时间维度的随机线性组合系数。
+    ///
+    /// **输入**:
+    /// - `params`: 包含 Verifier 的随机挑战点 (r_reduction) 和系统配置 (phases, LOG_K)。
+    /// - `trace`: CPU 的完整执行记录。
     pub fn initialize(params: InstructionReadRafSumcheckParams<F>, trace: Arc<Vec<Cycle>>) -> Self {
+        // 计算 Trace 长度的对数，用于确定时间维度多项式的变量数
         let log_T = trace.len().log_2();
 
+        // ========================================================================
+        // 1. 初始化前缀-后缀分解器 (Prefix-Suffix Decomposition)
+        // ------------------------------------------------------------------------
+        // **背景**: Lasso 算法为了避免对巨大的查找表 (如 2^64) 进行整体承诺，
+        // 将大的 lookup index 拆分为多个较小的片段 (Phases/Chunks)。
+        // 例如：将 64位拆分为 4 个 16位片段。
+        //
+        // 这里分别为三种不同的"输入源"建立分解器：
+        // - Right Operand: 右操作数
+        // - Left Operand: 左操作数
+        // - Identity: 电路标志位 (Flags)
+        // ========================================================================
+
+        // log_m: 每个 Phase 处理的比特数 (例如 64位 / 4 phases = 16位)
         let log_m = LOG_K / params.phases;
+
+        // 创建基础多项式对象
         let right_operand_poly = OperandPolynomial::new(LOG_K, OperandSide::Right);
         let left_operand_poly = OperandPolynomial::new(LOG_K, OperandSide::Left);
         let identity_poly = IdentityPolynomial::new(LOG_K);
+
         let span = tracing::span!(tracing::Level::INFO, "Init PrefixSuffixDecomposition");
         let _guard = span.enter();
+
+        // 包装为分解器，支持按 chunk 提取数据
         let right_operand_ps =
             PrefixSuffixDecomposition::new(Box::new(right_operand_poly), log_m, LOG_K);
         let left_operand_ps =
@@ -260,24 +346,37 @@ impl<F: JoltField> InstructionReadRafSumcheckProver<F> {
 
         let num_tables = LookupTables::<XLEN>::COUNT;
 
+        // ========================================================================
+        // 2. 并行提取 Trace 元数据 (Build CycleData)
+        // ------------------------------------------------------------------------
+        // **目标**: 遍历 Trace，解析出每一条指令具体"查了什么表"、"查了什么索引"。
+        // 这是一个计算密集型操作，使用 Rayon 进行并行处理。
+        // ========================================================================
         let span = tracing::span!(tracing::Level::INFO, "Build cycle_data");
         let _guard = span.enter();
+
+        // 临时结构体，用于存储单步解析结果
         struct CycleData<const XLEN: usize> {
-            idx: usize,
-            lookup_index: LookupBits,
-            is_interleaved: bool,
-            table: Option<LookupTables<XLEN>>,
+            idx: usize,                     // Trace 中的绝对索引 (时间步 t)
+            lookup_index: LookupBits,       // 解析出的查找键值 (Key)
+            is_interleaved: bool,           // 是否使用交错操作数模式 (针对 64位扩展)
+            table: Option<LookupTables<XLEN>>, // 该指令归属的查找表 (如 Table_ADD)
         }
 
         let cycle_data: Vec<CycleData<XLEN>> = trace
             .par_iter()
             .enumerate()
             .map(|(idx, cycle)| {
+                // 将 CPU 状态转换为具体的查找索引 (例如: R1=5, R2=3 -> Index=8)
                 let bits = LookupBits::new(LookupQuery::<XLEN>::to_lookup_index(cycle), LOG_K);
+
+                // 检查指令标志位，判断操作数解析模式
                 let is_interleaved = cycle
                     .instruction()
                     .circuit_flags()
                     .is_interleaved_operands();
+
+                // 获取该指令对应的逻辑表
                 let table = cycle.lookup_table();
 
                 CycleData {
@@ -291,30 +390,44 @@ impl<F: JoltField> InstructionReadRafSumcheckProver<F> {
         drop(_guard);
         drop(span);
 
+        // ========================================================================
+        // 3. 构建核心平面向量 (Extract Vectors)
+        // ------------------------------------------------------------------------
+        // **优化**: 将 Struct 数组 (`Vec<CycleData>`) 拆解为多个原生数组 (`Vec<u64>`).
+        // 这样做可以提高内存局部性 (Cache Locality)，并方便后续 SIMD 加速。
+        // ========================================================================
         let span = tracing::span!(tracing::Level::INFO, "Extract vectors");
         let _guard = span.enter();
-        // Extract all vectors in parallel using par_extend
+
+        // 预分配内存，避免 realloc
         let mut lookup_indices = Vec::with_capacity(cycle_data.len());
         let mut is_interleaved_operands = Vec::with_capacity(cycle_data.len());
 
         {
             let span = tracing::span!(tracing::Level::INFO, "par_extend basic vectors");
             let _guard = span.enter();
+            // 并行填充数据
             lookup_indices.par_extend(cycle_data.par_iter().map(|data| data.lookup_index));
             is_interleaved_operands
                 .par_extend(cycle_data.par_iter().map(|data| data.is_interleaved));
         }
 
-        // Build lookup_indices_by_table fully in parallel
-        // Create a vector for each table in parallel
+        // ========================================================================
+        // 4. 按 Table 进行分组/倒排索引 (Binning / Routing)
+        // ------------------------------------------------------------------------
+        // **目标**: 建立 "Table ID -> [Cycle Indices]" 的映射。
+        // 如果 Trace 中第 0, 5, 8 步是 ADD 指令，那么 lookup_indices_by_table[ADD_ID] = [0, 5, 8]。
+        // 这允许后续 Prover 针对每个 Table 独立并行地生成证明，而不需要全量扫描 Trace。
+        // ========================================================================
         let lookup_indices_by_table: Vec<Vec<usize>> = (0..num_tables)
-            .into_par_iter()
+            .into_par_iter() // 并行遍历所有表类型
             .map(|t_idx| {
-                // Each table gets its own parallel collection
+                // 对于每种表，扫描 cycle_data 收集属于它的时间步
                 cycle_data
                     .par_iter()
                     .filter_map(|data| {
                         data.table.and_then(|t| {
+                            // 匹配 Table 枚举索引
                             if LookupTables::<XLEN>::enum_index(&t) == t_idx {
                                 Some(data.idx)
                             } else {
@@ -325,10 +438,20 @@ impl<F: JoltField> InstructionReadRafSumcheckProver<F> {
                     .collect()
             })
             .collect();
+
+        // **内存优化**: cycle_data 是一个巨大的中间结构，不再需要。
+        // 在后台线程释放它，防止阻塞主线程 (Drop 大内存可能耗时数毫秒)。
         drop_in_background_thread(cycle_data);
         drop(_guard);
         drop(span);
 
+        // ========================================================================
+        // 5. 初始化后缀多项式容器 (Suffix Polynomials Init)
+        // ------------------------------------------------------------------------
+        // 为每个查找表的"值列" (Values Column) 预留多项式空间。
+        // Lasso 需要证明 Index 指向的 Value 是正确的。
+        // 这里的 DensePolynomial 暂时为空，具体数值会在 `init_phase` 中按需计算填入。
+        // ========================================================================
         let suffix_polys: Vec<Vec<DensePolynomial<F>>> = LookupTables::<XLEN>::iter()
             .collect::<Vec<_>>()
             .par_iter()
@@ -336,30 +459,48 @@ impl<F: JoltField> InstructionReadRafSumcheckProver<F> {
                 table
                     .suffixes()
                     .par_iter()
-                    .map(|_| DensePolynomial::default()) // Will be properly initialized in `init_phase`
+                    .map(|_| DensePolynomial::default()) // 占位符
                     .collect()
             })
             .collect();
 
-        // Build split-eq polynomials and u_evals.
+        // ========================================================================
+        // 6. 计算时间维度权重 (Time Binding / U_evals)
+        // ------------------------------------------------------------------------
+        // **数学原理**: Sumcheck 需要证明 \sum_t Eq(r, t) * Count(t)。
+        // `r_reduction` 是 Verifier 提供的用于压缩时间维度的随机点。
+        // `u_evals` 预计算了 Eq(r_reduction, t) 对所有 t 的值。
+        // 这是将 O(N) 的验证压缩为 O(1) 的关键一步。
+        // ========================================================================
         let span = tracing::span!(tracing::Level::INFO, "Compute u_evals");
         let _guard = span.enter();
+
+        // 用于后续 Split-Sumcheck 的辅助结构
         let eq_poly_r_reduction =
             GruenSplitEqPolynomial::<F>::new(&params.r_reduction.r, BindingOrder::LowToHigh);
+
+        // 计算 Eq 表: [Eq(r, 0), Eq(r, 1), ..., Eq(r, T-1)]
         let u_evals = EqPolynomial::evals(&params.r_reduction.r);
         drop(_guard);
         drop(span);
 
+        // ========================================================================
+        // 7. 构造 Prover 实例并启动计算
+        // ------------------------------------------------------------------------
+        // ========================================================================
         let mut res = Self {
             trace,
             r: Vec::with_capacity(log_T + LOG_K),
             lookup_indices,
 
-            // Prefix-suffix state (first log(K) rounds)
+            // --- 地址绑定 (Space Binding) 相关状态 ---
             lookup_indices_by_table,
             is_interleaved_operands,
             prefix_checkpoints: vec![None.into(); Prefixes::COUNT],
             suffix_polys,
+            // 动态规划表 (ExpandingTable):
+            // 用于在 Sumcheck 每一轮迭代中，累积 Eq(r_high, prefix) 的乘积。
+            // 为每个 Phase 分配一个独立的表。
             v: (0..params.phases)
                 .map(|_| ExpandingTable::new(1 << log_m, BindingOrder::HighToLow))
                 .collect(),
@@ -368,13 +509,17 @@ impl<F: JoltField> InstructionReadRafSumcheckProver<F> {
             left_operand_ps,
             identity_ps,
 
-            // State for last log(T) rounds
+            // --- 时间绑定 (Time Binding) 相关状态 ---
             ra_polys: None,
             eq_r_reduction: eq_poly_r_reduction,
             prefix_registry: PrefixRegistry::new(),
             combined_val_polynomial: None,
             params,
         };
+
+        // **立即启动 Phase 0**:
+        // Lasso 是分阶段的。初始化完成后，立即开始 Phase 0 (处理地址最高位或最低位 Chunk) 的
+        // 多项式预计算，为 Sumcheck 的第一轮交互做准备。
         res.init_phase(0);
         res
     }
@@ -707,7 +852,7 @@ impl<F: JoltField> InstructionReadRafSumcheckProver<F> {
 }
 
 impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
-    for InstructionReadRafSumcheckProver<F>
+for InstructionReadRafSumcheckProver<F>
 {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         &self.params
@@ -1188,7 +1333,7 @@ impl<F: JoltField> InstructionReadRafSumcheckVerifier<F> {
 }
 
 impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
-    for InstructionReadRafSumcheckVerifier<F>
+for InstructionReadRafSumcheckVerifier<F>
 {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         &self.params
@@ -1527,7 +1672,7 @@ mod tests {
             &mut verifier_opening_accumulator,
             verifier_transcript,
         )
-        .unwrap();
+            .unwrap();
 
         assert_eq!(r_sumcheck, r_sumcheck_verif);
     }

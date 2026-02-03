@@ -284,9 +284,15 @@ mod tests {
     use ark_std::test_rng;
     use ark_std::One;
     use rand_chacha::rand_core::RngCore;
+    use tracing::info;
 
     #[test]
     fn implicit_montgomery_conversion() {
+        let test_data=<Fr as JoltField>::from_u64(0x12);
+        let _mont_data = <Fr as JoltField>::from_montgomery_reduce(
+            <Fr as JoltField>::from_u64(0x12).as_unreduced_ref().clone(),
+        );
+        info!("test_data: {:?}", test_data);
         let mut rng = test_rng();
         for _ in 0..256 {
             let x = rng.next_u64();

@@ -190,12 +190,15 @@ pub struct OperandPolynomial<F: JoltField> {
 
 impl<F: JoltField> OperandPolynomial<F> {
     pub fn new(num_vars: usize, side: OperandSide) -> Self {
+        // 1. 断言检查：变量数必须是偶数
         debug_assert!(num_vars.is_even(), "num_vars must be divisible by 2");
+
+        // 2. 初始化结构体
         OperandPolynomial {
-            num_vars,
-            num_bound_vars: 0,
-            bound_value: F::zero(),
-            side,
+            num_vars,               // 多项式的变量总数 (对应地址空间的位数，即 LOG_K)
+            num_bound_vars: 0,      // 当前已绑定的变量数 (Sumcheck 还没开始，所以是 0)
+            bound_value: F::zero(), // 当前的评估累加值 (初始为 0)
+            side,                   // 指示它是左操作数 (RS1) 还是右操作数 (RS2)
         }
     }
 }
@@ -556,28 +559,48 @@ mod tests {
         assert_eq!(unmap_poly.evaluate(&point_3), Fr::from(START_ADDRESS + 24));
     }
 
+    /// 测试 OperandPolynomial 在布尔超立方体上的正确性
+    ///
+    /// # 测试目标
+    ///
+    /// 验证 `OperandPolynomial` (左、右操作数多项式) 能够在布尔超立方体
+    /// (Boolean Hypercube) 的所有顶点上正确计算出对应的操作数值。
+    ///
+    /// # 测试逻辑
+    ///
+    /// 1. **布尔超立方体**: 对于 `NUM_VARS = 8`,布尔超立方体有 2^8 = 256 个顶点,
+    ///    每个顶点对应一个 8 位的二进制索引 (i)。
+    /// 2. **索引拆分**: 使用 `uninterleave_bits(i)` 将索引拆分为左、右操作数:
+    ///    - 如索引 `0b10110011`,拆分为 `left = 0b1101`, `right = 0b0011`
+    /// 3. **验证**: 在每个顶点 eval_point 上,验证多项式的评估值是否等于预期的操作数值。
     #[test]
     fn operand_poly_boolean_hypercube() {
         const NUM_VARS: usize = 8;
 
+        // 创建右操作数和左操作数多项式
         let ro_poly = OperandPolynomial::<Fr>::new(NUM_VARS, OperandSide::Right);
         let lo_poly = OperandPolynomial::<Fr>::new(NUM_VARS, OperandSide::Left);
 
-        // Test evaluation on boolean hypercube
+        // 遍历布尔超立方体的所有 2^8 = 256 个顶点
         for i in 0..(1 << NUM_VARS) {
+            // 1. 将索引 i 转换为布尔超立方体的评估点 (eval_point)
+            //    eval_point[j] = (i 的第 j 位是否为 1)
             let mut eval_point = vec![Fr::ZERO; NUM_VARS];
             for j in 0..NUM_VARS {
                 if (i >> j) & 1 == 1 {
                     eval_point[j] = Fr::ONE;
                 }
             }
+            // 注意: 反转是因为 Jolt 的比特顺序约定
             eval_point.reverse();
 
-            // Use uninterleave_bits to match the polynomial's implementation
+            // 2. 使用 uninterleave_bits 将索引 i 拆分为左右操作数
+            //    例如: i = 0b10110011 -> left = 0b1101, right = 0b0011
             let (left, right) = uninterleave_bits(i as u128);
             let expected_r = Fr::from_u64(right);
             let expected_l = Fr::from_u64(left);
 
+            // 3. 验证多项式在该顶点的评估值是否等于预期的操作数值
             assert_eq!(
                 ro_poly.evaluate(&eval_point),
                 expected_r,
@@ -591,6 +614,21 @@ mod tests {
         }
     }
 
+    /// 测试 OperandPolynomial 在 Sumcheck 协议中的正确性
+    ///
+    /// # 测试目标
+    ///
+    /// 验证 `OperandPolynomial` 在 Sumcheck 协议的各个轮次 (Rounds) 中的行为是否
+    /// 与参考多项式 (Reference Polynomial, 即完全展开的多线性多项式) 一致。
+    ///
+    /// # 测试流程
+    ///
+    /// 1. **初始化**: 创建操作数多项式和参考多项式 (通过完全展开的评估向量)。
+    /// 2. **布尔超立方体验证**: 在所有 256 个顶点上验证两者评估值一致。
+    /// 3. **Sumcheck 模拟**: 模拟 Sumcheck 的 8 轮绑定 (Binding) 过程:
+    ///    - 每轮开始前,验证 `sumcheck_evals` (单变量多项式的评估值) 与参考多项式一致。
+    ///    - 使用随机数 `r` 对当前变量进行绑定,将多项式维度降低 1。
+    /// 4. **最终声明**: 验证 Sumcheck 结束后的最终声明值 (Final Claim) 一致。
     #[test]
     fn operand_poly() {
         const NUM_VARS: usize = 8;
@@ -599,7 +637,8 @@ mod tests {
         let mut ro_poly = OperandPolynomial::<Fr>::new(NUM_VARS, OperandSide::Right);
         let mut lo_poly = OperandPolynomial::<Fr>::new(NUM_VARS, OperandSide::Left);
 
-        // Create reference polynomial with evaluations
+        // 1. 创建参考多项式 (Reference Polynomial)
+        //    通过显式计算所有 2^8 = 256 个评估点的值来构造完整的多线性多项式
         let (reference_evals_l, reference_evals_r): (Vec<Fr>, Vec<Fr>) = (0u128..(1 << NUM_VARS))
             .map(|i| {
                 let (left, right) = uninterleave_bits(i);
@@ -609,7 +648,7 @@ mod tests {
         let mut reference_poly_r = MultilinearPolynomial::from(reference_evals_r);
         let mut reference_poly_l = MultilinearPolynomial::from(reference_evals_l);
 
-        // Verify that both polynomials agree on the entire boolean hypercube
+        // 2. 验证两种多项式在整个布尔超立方体上的评估值一致
         for i in 0..(1 << NUM_VARS) {
             let mut eval_point = vec![Fr::ZERO; NUM_VARS];
             for j in 0..NUM_VARS {
@@ -627,9 +666,12 @@ mod tests {
             );
         }
 
+        // 3. 模拟 Sumcheck 协议的 NUM_VARS 轮绑定过程
         for round in 0..NUM_VARS {
+            // 当前轮的评估点数量 = 2^(剩余变量数)
             let num_evals = 1 << (NUM_VARS - round - 1);
 
+            // 对每个评估点,验证单变量多项式的评估值 (degree=3 表示评估 g(0), g(1), g(2))
             for i in 0..num_evals {
                 let ro_poly = ro_poly.sumcheck_evals(i, 3, BindingOrder::HighToLow);
                 let lo_poly = lo_poly.sumcheck_evals(i, 3, BindingOrder::HighToLow);
@@ -643,6 +685,8 @@ mod tests {
                 );
             }
 
+            // 使用 Verifier 发送的随机数 r 对当前变量进行绑定
+            // 绑定后,多项式的变量数减少 1
             let r = <Fr as JoltField>::Challenge::random(&mut rng);
             ro_poly.bind(r, BindingOrder::HighToLow);
             lo_poly.bind(r, BindingOrder::HighToLow);
@@ -650,6 +694,8 @@ mod tests {
             reference_poly_l.bind(r, BindingOrder::HighToLow);
         }
 
+        // 4. 验证 Sumcheck 结束后的最终声明值 (Final Claim)
+        //    此时所有变量都已绑定,多项式变为一个标量
         assert_eq!(
             ro_poly.final_sumcheck_claim(),
             reference_poly_r.final_sumcheck_claim(),
@@ -662,22 +708,48 @@ mod tests {
         );
     }
 
+    /// 测试 UnmapRamAddressPolynomial 的正确性
+    ///
+    /// # 功能说明
+    ///
+    /// `UnmapRamAddressPolynomial` 用于将规范化的 RAM 索引 `k` 映射回物理内存地址:
+    /// `physical_address = k * 8 + START_ADDRESS`
+    ///
+    /// 这在 RAM 访问证明中很关键,因为我们需要证明:
+    /// "我访问的地址 `addr` 是通过合法的索引 `k` 计算得到的"。
+    ///
+    /// # 测试流程
+    ///
+    /// 1. **初始化**: 创建地址反映射多项式和参考多项式。
+    /// 2. **Sumcheck 模拟**: 模拟 Sumcheck 的 4 轮绑定过程。
+    /// 3. **最终声明**: 验证最终声明值一致。
+    ///
+    /// # 举例
+    ///
+    /// 假设 `START_ADDRESS = 0x80000000`, `NUM_VARS = 4`:
+    /// - `k = 0` -> `address = 0 * 8 + 0x80000000 = 0x80000000`
+    /// - `k = 1` -> `address = 1 * 8 + 0x80000000 = 0x80000008`
+    /// - `k = 2` -> `address = 2 * 8 + 0x80000000 = 0x80000010`
     #[test]
     fn unmap_address_poly() {
         const NUM_VARS: usize = 4;
-        const START_ADDRESS: u64 = 0x80000000;
+        const START_ADDRESS: u64 = 0x80000000; // RAM 起始地址 (2GB)
 
         let mut unmap_poly = UnmapRamAddressPolynomial::<Fr>::new(NUM_VARS, START_ADDRESS);
 
+        // 1. 创建参考多项式
+        //    unmap_evals[k] = k * 8 + START_ADDRESS
         let K = 1 << NUM_VARS;
         let unmap_evals: Vec<Fr> = (0..K)
             .map(|k| Fr::from((k as u64).wrapping_mul(8).wrapping_add(START_ADDRESS)))
             .collect();
         let mut reference_poly = MultilinearPolynomial::from(unmap_evals.clone());
 
+        // 2. 模拟 Sumcheck 的 NUM_VARS 轮绑定过程
         for round in 0..NUM_VARS {
             let num_evals = 1 << (NUM_VARS - round - 1);
 
+            // 验证每个索引 i 处的单变量多项式评估值
             for i in 0..num_evals {
                 let unmap_evals = unmap_poly.sumcheck_evals(i, 3, BindingOrder::LowToHigh);
                 let reference_evals = reference_poly.sumcheck_evals(i, 3, BindingOrder::LowToHigh);
@@ -688,11 +760,13 @@ mod tests {
                 );
             }
 
+            // 使用确定性随机数进行绑定 (为了测试的可重复性)
             let r = <Fr as JoltField>::Challenge::from(0x12345678 + round as u128);
             unmap_poly.bind(r, BindingOrder::LowToHigh);
             reference_poly.bind(r, BindingOrder::LowToHigh);
         }
 
+        // 3. 验证最终声明值
         assert_eq!(
             unmap_poly.final_sumcheck_claim(),
             reference_poly.final_sumcheck_claim(),

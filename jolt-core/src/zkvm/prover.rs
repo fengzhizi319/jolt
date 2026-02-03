@@ -1687,19 +1687,27 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         // 1. 初始化各子任务参数 (Initialization params)：
 
         // a. 寄存器值评估参数 (Registers Value Evaluation Params):
-        // 这一步是为了验证寄存器状态的具体数值。
+        // 该函数负责从上一阶段（Stage 4: 读写一致性检查）的Registers验证状态中提取随机挑战点 `r`
         // 在 Stage 4 中，通过 Offline Memory Checking 保证了寄存器读写的一致性（即 Multiset Equality）。
+        // 即仅仅在平行宇宙中验证了，没有说明两个宇宙的一致性
         // 但这只保证了“读 = 写”，没有保证“写”进去的值是有效的 Field Element 或符合特定约束。
         // `RegistersValEvaluation` 补全了这一环，确保寄存器值的多项式表示是正确的。
         let registers_val_evaluation_params =
             RegistersValEvaluationSumcheckParams::new(&self.opening_accumulator);
 
         // b. RAM 地址归约参数 (RAM Read Address Production/Reduction):
+        // 该函数负责从累加器中提取 RAF、读写检查等四个前序阶段产生的 RAM 地址 Claim 及其对应的挑战点，
+        // 并采样随机系数 <span>\gamma</span> 将它们合并，从而初始化 RAM 地址归约（RA Reduction）所需的参数配置。
+
         // 这是一个“归约”步骤。
         // 在之前的阶段（如 Stage 2 RAM Coherence），我们证明了内存地址 $A$ 上的读写一致性。
         // 但为了在后续阶段使用查找表或其他机制检查地址本身的合法性或构造方式，
         // 我们需要将关于完整地址 $A$ 的 Claim，分解（归约）为关于地址各个部分的更细粒度的 Claim。
         // `Ra` 代表 Read Address。
+        // 目标: 验证内存地址的结构。
+        // 在 Stage 2/4 中，我们验证了 "Address A 上的读写一致性"。
+        // 这里我们需要证明 A 本身是合法的，即 A = High << 16 | Low，或者符合 One-Hot 编码规则。
+        // 这对于支持大地址空间（64位）的查找表至关重要。
         let ram_ra_reduction_params = RaReductionParams::new(
             self.trace.len(),
             &self.one_hot_params,
@@ -1708,6 +1716,9 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         );
 
         // c. 指令查找表读取标记参数 (Instruction Lookups Read RAF):
+        //该函数负责初始化指令查找表 Sumcheck 参数，主要通过生成随机挑战 <span>\gamma</span> 将输出与操作数 Claim 批量合并，
+        // 并从前序阶段提取时间维度归约点 r_reduction。
+
         // RAF = Read Access Frequency (读取访问频次/标记)。
         // Jolt 的核心思想是将指令执行视为查找表查询。如果 CPU 执行了一条 ADD 指令，
         // 那么在逻辑上，它应该去所有的指令查找表中，唯独“激活” ADD 表的查询，其他表（如 MUL, SUB）应视为未激活。
@@ -1723,8 +1734,11 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         // 根据参数创建负责实际多项式计算的对象。
 
         // 初始化寄存器值证明器：
-        // 需要 Trace 来获取每一时刻寄存器的实际值。
+        // 方法：现在的状态，等于初始状态加上历史上所有增量（Increments）的总和。
         // 需要 Bytecode 和 MemoryLayout 来处理一些隐式的寄存器行为（例如涉及 PC 或特殊内存映射寄存器的情况）。
+        // 初始化寄存器值证明器
+        // 输入: Trace (执行轨迹), Bytecode (程序代码), MemoryLayout (内存布局)
+        // 输出: inc (增量多项式), wa (写访问多项式) 等
         let registers_val_evaluation = RegistersValEvaluationSumcheckProver::initialize(
             registers_val_evaluation_params,
             &self.trace,
@@ -1734,6 +1748,8 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
 
         // 初始化 RAM 地址归约证明器：
         // 它的工作是将关于 RAM 地址的多项式评估请求，转换/归约为关于 One-Hot 编码参数的评估请求（如果有用到 One-Hot 优化）。
+        // 输入: Trace (提取其中的内存访问地址)
+        // 输出: 地址分片多项式, Eq 表等
         let ram_ra_reduction = RamRaClaimReductionSumcheckProver::initialize(
             ram_ra_reduction_params,
             &self.trace,
@@ -1743,6 +1759,8 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
 
         // 初始化指令查找表 RAF 证明器：
         // 遍历 Trace，统计每种指令查找表被访问的情况。这实际上是构建一个“指令类型 -> 查找表索引”的映射证明。
+        // 输入: Trace (提取 Opcode 和 Operands)
+        // 输出: Prefix-Suffix 分解多项式, Table 计数多项式
         let lookups_read_raf = InstructionReadRafSumcheckProver::initialize(
             lookups_read_raf_params,
             Arc::clone(&self.trace),

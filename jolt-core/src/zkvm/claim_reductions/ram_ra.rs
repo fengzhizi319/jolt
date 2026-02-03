@@ -90,6 +90,27 @@ enum RamRaClaimReductionPhase<F: JoltField> {
 
 impl<F: JoltField> RamRaClaimReductionSumcheckProver<F> {
     /// Create a new RAM RA reduction sumcheck prover.
+    /// 初始化 RAM RA 归约 Sumcheck 的 Prover 实例
+    ///
+    /// # 功能
+    ///
+    /// 该函数负责启动 RAM Random Access (RA) 的归约 Sumcheck 协议。
+    /// 该协议的目的是将前序阶段产生的四个关于 RAM 地址的 Claim（RAF, RW, ValEval, ValFinal）
+    /// 归约为一个单一的 Claim，以证明这些内存访问地址的正确性。
+    ///
+    /// Prover 的执行过程被设计为一个三阶段的状态机：
+    /// 1. **PhaseAddress**: 处理地址变量 ($log_K$ 轮)。证明地址的一致性。
+    /// 2. **PhaseCycle1**: 处理时间/周期变量的前半部分 ($log_T/2$ 轮)。利用 Prefix-Suffix 优化减少计算量。
+    /// 3. **PhaseCycle2**: 处理时间/周期变量的后半部分 ($log_T/2$ 轮)。使用 Dense Sumcheck。
+    ///
+    /// 本函数主要完成 **PhaseAddress** 的初始化工作，准备第一阶段所需的多项式数据。
+    ///
+    /// # 参数
+    ///
+    /// * `params` - 归约参数，包含从累加器提取的历史 Claim、挑战点坐标 ($r_{address}, r_{cycle}$) 以及批处理系数 $\gamma$。
+    /// * `trace` - 完整的执行轨迹，包含每个 Cycle 的内存访问信息（如读写的地址）。
+    /// * `memory_layout` - 内存布局配置，用于将物理地址重映射为规范化的 RAM 索引。
+    /// * `one_hot_params` - One-hot 编码参数，定义了 RAM 地址空间的大小 ($K$)。
     #[tracing::instrument(skip_all, name = "RamRaClaimReductionSumcheckProver::initialize")]
     pub fn initialize(
         params: RaReductionParams<F>,
@@ -97,18 +118,25 @@ impl<F: JoltField> RamRaClaimReductionSumcheckProver<F> {
         memory_layout: &MemoryLayout,
         one_hot_params: &OneHotParams,
     ) -> Self {
+        // 初始化状态机的第一阶段：PhaseAddress。
+        // 这一步会调用 `PhaseAddressState::gen` 来执行以下预计算：
+        // 1. 从 Trace 中提取所有内存访问地址。
+        // 2. 初始化用于地址绑定的 Eq 多项式 (B_1, B_2)。
+        // 3. 构建 ExpandingTable (F) 和计数数组 (G_A, G_B)，它们聚合了
+        //    所有 Cycle 上对特定地址 $k$ 的访问贡献。
         let phase = RamRaClaimReductionPhase::PhaseAddress(PhaseAddressState::gen(
             &params,
             trace,
             memory_layout,
             one_hot_params,
         ));
+
         Self { phase, params }
     }
 }
 
 impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
-    for RamRaClaimReductionSumcheckProver<F>
+for RamRaClaimReductionSumcheckProver<F>
 {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         &self.params
@@ -175,7 +203,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
                 r_address_reduced.iter().rev().copied().collect::<Vec<_>>(),
                 r_cycle_reduced.iter().rev().copied().collect::<Vec<_>>(),
             ]
-            .concat(),
+                .concat(),
         );
 
         // The reduced RA claim is H_prime.final_sumcheck_claim()
@@ -227,6 +255,28 @@ impl<F: JoltField> PhaseAddressState<F> {
     /// Minimum number of k iterations to parallelize the inner loop.
     const MIN_INNER_PARALLEL_LEN: usize = 1 << 12;
 
+    /// 初始化 Sumcheck 第一阶段 (PhaseAddress) 的状态
+    ///
+    /// # 功能
+    ///
+    /// 该函数负责预计算 RAM RA 归约 Sumcheck 协议中“地址变量绑定阶段”所需的所有数据结构。
+    /// 在这个阶段，协议主要关注 RAM 地址空间 ($k \in \{0, 1\}^{log\_K}$)，将多项式的求和范围
+    /// 逐步从地址维度归约到单个点。
+    ///
+    /// 主要完成以下任务：
+    /// 1. **提取内存访问地址**: 遍历 Trace，解析每个 Cycle 访问的 RAM 物理地址并映射为规范化的索引。
+    /// 2. **预计算 Eq 多项式 (B_1, B_2)**: 针对两个查询的地址坐标 $r_{address\_1}$ 和 $r_{address\_2}$，
+    ///    计算出全量的 Eq 向量评估值。这对应公式中的 $eq(r_{addr1}, k)$ 和 $eq(r_{addr2}, k)$。
+    /// 3. **初始化 ExpandingTable (F)**: 用于在后续 Sumcheck 每一轮中动态维护 $eq(r_{reduced}, k)$ 的折叠状态。
+    /// 4. **计算聚合系数数组 (G_A, G_B)**: 这是本阶段最核心的预计算。它将时间维度 ($c$) 的所有贡献预先聚合到
+    ///    地址维度 ($k$) 上。因为本阶段 Sumcheck 只对 $k$ 进行归约，$c$ 是常数项，可以提前通过并行计算求和。
+    ///
+    /// # 参数
+    ///
+    /// * `params` - 归约参数，包含挑战点坐标和批处理系数 $\gamma$。
+    /// * `trace` - 执行轨迹，包含内存访问信息。
+    /// * `memory_layout` - 内存布局，用于地址重映射。
+    /// * `one_hot_params` - 用于确定 RAM 地址空间大小 $K$。
     #[tracing::instrument(skip_all, name = "PhaseAddressState::gen")]
     fn gen(
         params: &RaReductionParams<F>,
@@ -234,7 +284,9 @@ impl<F: JoltField> PhaseAddressState<F> {
         memory_layout: &MemoryLayout,
         one_hot_params: &OneHotParams,
     ) -> Self {
-        // Extract addresses from trace
+        // 1. 从 Trace 中提取所有 Cycle 的内存访问地址。
+        //    将物理地址 (u64) 映射为 RAM 模块内部的索引 (usize)。
+        //    如果某 Cycle 没有进行 RAM 访问，则为 None。
         let addresses: Arc<Vec<Option<usize>>> = Arc::new(
             trace
                 .par_iter()
@@ -245,15 +297,27 @@ impl<F: JoltField> PhaseAddressState<F> {
                 .collect(),
         );
 
-        // Initialize eq tables for addresses
+        // 2. 初始化用于地址绑定的 Eq 多项式表 (B_1, B_2)。
+        //    B_1[k] = eq(r_address_1, k)，B_2[k] = eq(r_address_2, k)。
+        //    这两个向量长度为 K，在 Sumcheck 的每一轮地址变量绑定中会被逐步折叠。
         let B_1 = MultilinearPolynomial::from(EqPolynomial::<F>::evals(&params.r_address_1));
         let B_2 = MultilinearPolynomial::from(EqPolynomial::<F>::evals(&params.r_address_2));
 
-        // Initialize expanding table for tracking eq(r_addr_reduced, k)
+        // 3. 初始化动态扩展表 F。
+        //    这个表在 Sumcheck 开始时初始化为全 1 (eq(empty, empty) = 1)。
+        //    随着每一轮 Sumcheck 收到新的随机数 r_j，它会动态更新以表示 eq(r_prefix, k_prefix)。
+        //    它实际上充当了 bookkeeping table 的角色。
         let mut F = ExpandingTable::new(one_hot_params.ram_k, BindingOrder::LowToHigh);
         F.reset(F::one());
 
-        // Compute G_A and G_B arrays
+        // 4. 计算 G_A 和 G_B 数组。
+        //    这是 "PhaseAddress" 能够高效执行的关键优化。
+        //    原始求和公式是 Σ_{k,c} ...。在本阶段我们只处理 k。
+        //    因此可以定义 G[k] = Σ_{c: address[c]=k} (关于 c 的项)。
+        //    G_A[k] 聚合了所有在地址 k 发生的 RAF 和 ValEval 相关的 eq(r_cycle, c) 之和。
+        //    G_B[k] 聚合了所有在地址 k 发生的 RW 和 ValEval 相关的 eq(r_cycle, c) 之和。
+        //
+        //    这样，Sumcheck 的每一轮只需计算 Σ_k ( B[k] * G[k] )，无需遍历巨大的 Trace (T)。
         let (G_A, G_B) = Self::compute_G_arrays(
             &addresses,
             one_hot_params.ram_k,
@@ -887,8 +951,8 @@ impl<F: JoltField> PhaseCycle2State<F> {
                 array::from_fn::<_, DEGREE_BOUND, _>(|i| {
                     h_evals[i]
                         * (self.coeff_raf * eq_raf[i]
-                            + self.coeff_rw * eq_rw[i]
-                            + self.coeff_val * eq_val[i])
+                        + self.coeff_rw * eq_rw[i]
+                        + self.coeff_val * eq_val[i])
                 })
             })
             .reduce(
@@ -951,54 +1015,109 @@ pub struct RaReductionParams<F: JoltField> {
 }
 
 impl<F: JoltField> RaReductionParams<F> {
-    /// Create params from the opening accumulator.
+
+    /// 该函数负责从累加器中提取 RAF、读写检查等四个前序阶段产生的 RAM 地址 Claim 及其对应的挑战点，并采样随机系数 <span>\gamma</span> 将它们合并，从而初始化 RAM 地址归约（RA Reduction）所需的参数配置。   ///
+    /// **背景**:
+    /// 在 Jolt 的前序阶段（如 Stage 2, 4），系统对 RAM 的读写一致性进行了多次检查。
+    /// 每次检查都涉及到了 RAM 地址多项式 (`RamRa`) 的评估。
+    /// 到了 Stage 5，我们需要证明这些被评估的地址本身是合法的（即它们是由正确的各个部分如 High/Low bits 或 One-hot 编码构成的）。
+    ///
+    /// **功能**:
+    /// 1. 从 `opening_accumulator` 中提取出 4 个关于 `RamRa` 多项式的历史评估值（Claims）。
+    /// 2. 解析这些评估点，将它们拆分为 "地址空间坐标" ($r\_address$) 和 "时间周期坐标" ($r\_cycle$)。
+    /// 3. 通过 Fiat-Shamir 采样随机数 $\gamma$，用于后续将这 4 个独立的 Claim 合并为一个，实现批量证明。
     pub fn new(
-        trace_len: usize,
-        one_hot_params: &OneHotParams,
-        opening_accumulator: &dyn OpeningAccumulator<F>,
-        transcript: &mut impl Transcript,
+        trace_len: usize,                      // 执行轨迹的总长度 T (Trace Length)
+        one_hot_params: &OneHotParams,         // One-Hot 编码参数，包含 RAM 地址分段信息 K
+        opening_accumulator: &dyn OpeningAccumulator<F>, // 累加器，存储了之前所有 Sumcheck 产生的 (r, claim)
+        transcript: &mut impl Transcript,      // 证明转录本，用于生成不可预测的随机数
     ) -> Self {
+        // 1. 计算多变量多项式的维度参数
+        // log_K: RAM 地址分段大小的对数 (例如地址被切分为 K 大小的块，对应多项式的变量数)
+        // log_T: 时间步长/Trace 长度的对数 (对应时间维度的变量数)
         let log_K = one_hot_params.ram_k.log_2();
         let log_T = trace_len.log_2();
 
-        // Get the four RA claims from the accumulator
+        // 2. 从累加器中提取 4 个关于 RAM 地址 (RamRa) 的历史断言 (Opening Claims)
+        // 这些断言是在之前的 Sumcheck 协议结束时，由 Verifier 发起的查询。现在 Prover 要证明这些查询结果的正确性。
+
+        // a. RAF (Read Access Frequency) 相关断言:
+        // 来自 Stage 5 自身的 RAF 检查部分，涉及地址访问频次。
         let (r_raf, claim_raf) = opening_accumulator
             .get_virtual_polynomial_opening(VirtualPolynomial::RamRa, SumcheckId::RamRafEvaluation);
+
+
+        // b. RW (Read-Write Checking) 相关断言:
+        // 来自 Stage 2 (RAM Consistency)，涉及内存读写一致性检查。
         let (r_rw, claim_rw) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::RamRa,
             SumcheckId::RamReadWriteChecking,
         );
+
+
+        // c. Val Eval (Value Evaluation) 相关断言:
+        // 来自 Stage 4 (Offline Memory Checking)，涉及寄存器/内存 "读取" 操作的地址验证。
         let (r_val_eval, claim_val_eval) = opening_accumulator
             .get_virtual_polynomial_opening(VirtualPolynomial::RamRa, SumcheckId::RamValEvaluation);
+
+        // d. Val Final (Final Value Evaluation) 相关断言:
+        // 来自 Stage 4，涉及寄存器/内存 "最终/写入" 操作的地址验证。
         let (r_val_final, claim_val_final) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::RamRa,
             SumcheckId::RamValFinalEvaluation,
         );
 
-        // Extract r_address and r_cycle from each opening point
-        let (r_address_1, r_cycle_raf) = r_raf.split_at_r(log_K);
-        let (r_address_2, r_cycle_rw) = r_rw.split_at_r(log_K);
-        let (_, r_cycle_val) = r_val_eval.split_at_r(log_K);
 
-        // Verify coincidences (these should hold by construction)
+        // 3. 解析评估点坐标 (Split Evaluation Points)
+        // 这些多项式定义在 $K \times T$ 的超立方体上。
+        // 我们需要利用 `split_at_r` 将随机挑战点 $r$ 切分为两部分：
+        // - 第一部分 (长度 log_K): 对应 "地址内容" 的随机坐标 (r_address)
+        // - 第二部分 (长度 log_T): 对应 "时间/周期" 的随机坐标 (r_cycle)
+
+        // 切分 RAF 的评估点，得到 r_address_1 和 r_cycle_raf
+        let (r_address_1, r_cycle_raf) = r_raf.split_at_r(log_K);
+
+        // 切分 RW 的评估点，得到 r_address_2 和 r_cycle_rw
+        let (r_address_2, r_cycle_rw) = r_rw.split_at_r(log_K);
+
+        // 切分 ValEval 的评估点，这里只取 r_cycle_val (address 部分稍后验证一致性)
+        let (_, r_cycle_val) = r_val_eval.split_at_r(log_K);
+        // info!(
+        //     "RaReductionParams: r_cycle_val = {:?}",
+        //     r_cycle_val,
+        // );
+
+        // 4. 验证坐标一致性 (Verify Coincidences)
+        // 这是一个关键的健全性检查 (Sanity Check)。
+        // 根据 Jolt 的协议设计，某些不同的检查在数学上必须共享相同的随机点部分。如果这里断言失败，说明协议实现有 bug。
+        // 具体约束：
+        // - RAF 检查使用的地址坐标 (r_address_1) 必须等于 ValFinal 检查的地址坐标。
+        // - RW 检查使用的地址坐标 (r_address_2) 必须等于 ValEval 检查的地址坐标。
+        // - ValEval 检查的时间坐标 (r_cycle_val) 必须等于 ValFinal 检查的时间坐标。
         debug_assert_eq!(r_address_1, r_val_final.split_at_r(log_K).0);
         debug_assert_eq!(r_address_2, r_val_eval.split_at_r(log_K).0);
         debug_assert_eq!(r_cycle_val, r_val_final.split_at_r(log_K).1);
 
-        // Sample γ for combining claims
+        // 5. 采样组合系数 gamma (Sample Combining Challenge)
+        // 为了通过单次 Sumcheck 验证上述 4 个断言，我们需要将它们线性组合。
+        // 使用 Verifier 提供的随机数 gamma 进行加权求和 (Batching)。
+        // 目标多项式形式大致为: P_batch = P_raf + γ * P_rw + γ^2 * P_eval + γ^3 * P_final
         let gamma: F = transcript.challenge_scalar();
         let gamma_squared = gamma * gamma;
         let gamma_cubed = gamma_squared * gamma;
 
+        // 6. 构造并返回参数对象
         Self {
             gamma,
             gamma_squared,
             gamma_cubed,
+            // 保存切分后的坐标向量，Prover 在后续计算每一轮 Sumcheck 更新时会用到这些具体坐标
             r_address_1: r_address_1.to_vec(),
             r_address_2: r_address_2.to_vec(),
             r_cycle_raf: r_cycle_raf.to_vec(),
             r_cycle_rw: r_cycle_rw.to_vec(),
             r_cycle_val: r_cycle_val.to_vec(),
+            // 保存之前的 Claim 值，作为本次 Sumcheck 协议开始时的目标求和值 (Target Sum)
             claim_raf,
             claim_val_final,
             claim_rw,
@@ -1062,7 +1181,7 @@ impl<F: JoltField> RamRaClaimReductionSumcheckVerifier<F> {
 }
 
 impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
-    for RamRaClaimReductionSumcheckVerifier<F>
+for RamRaClaimReductionSumcheckVerifier<F>
 {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         &self.params
@@ -1122,7 +1241,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
                 r_address_reduced.iter().rev().copied().collect::<Vec<_>>(),
                 r_cycle_reduced.iter().rev().copied().collect::<Vec<_>>(),
             ]
-            .concat(),
+                .concat(),
         );
 
         accumulator.append_virtual(
