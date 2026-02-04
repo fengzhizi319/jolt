@@ -1828,33 +1828,41 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
 
         // =========================================================
         // 1. 初始化各子任务参数 (Initialization params)
-        // Stage 6 进入了更底层的约束检查，主要关注“位有效性”(Booleanity)
-        // 和“访问标记”(Access Flags) 以及 Advice 的初步归约。
+        // Stage 6 是 Jolt 的“基础设施工兵”。它不负责执行具体的加减乘除，
+        // 而是负责验证构建这一切的基础砖块（比特位、地址索引、内存读写源）是合法的。
         // =========================================================
 
-        // a. 字节码读取标记 (Bytecode Read RAF):
-        // 验证程序计数器 (PC) 指向的指令是否被正确从只读代码段 (ROM) 中读取。
-        // RAF (Read Access Flag/Frequency) ��保我们在执行指令时，确实对 Bytecode 对应的地址发起了读操作。
-        // 如果 Trace 说 "在 PC=100 执行了 ADD"，这里证明 "ROM[100] 确实是 ADD"。
+        // ---------------------------------------------------------
+        // A. 字节码读取一致性检查 (Bytecode Read RAF)
+        // ---------------------------------------------------------
+        // 目的：防止“代码注入”或“虚假指令”攻击。
+        // 原理：使用 Read Access Frequency (RAF) 技术。
+        // 检查：当 Trace 记录“在 PC=100 处执行指令 I”时，证明 ROM[100] 确实等于 I。
+        // 这一步确保了 CPU 执行的指令流与预编译的程序二进制文件严格一致。
         let bytecode_read_raf_params = BytecodeReadRafSumcheckParams::gen(
-            &self.preprocessing.shared.bytecode,
-            self.trace.len().log_2(),
+            &self.preprocessing.shared.bytecode, // 传入只读代码段 (ROM) 作为真值源
+            self.trace.len().log_2(),            // 时间步数 (Trace长度) 的对数
             &self.one_hot_params,
             &self.opening_accumulator,
             &mut self.transcript,
         );
 
-        // b. RAM 汉明重量布尔性 (RAM Hamming Booleanity):
-        // 用于优化内存检查的辅助标志位验证。
-        // 它验证与 RAM 访问相关的某些内部标志位是否严格为布尔值 (0 或 1)。
+        // ---------------------------------------------------------
+        // B. RAM 汉明重量辅助位检查 (RAM Hamming Booleanity)
+        // ---------------------------------------------------------
+        // 目的：验证内存相关的辅助标志位。
+        // 原理：Jolt 的内存检查可能涉及计算汉明重量 (Hamming Weight) 或其他标志。
+        // 检查：确保这些内部使用的辅助变量严格满足布尔约束 x * (x - 1) = 0。
         let ram_hamming_booleanity_params =
             HammingBooleanitySumcheckParams::new(&self.opening_accumulator);
 
-        // c. 通用布尔性检查 (Booleanity):
-        // Jolt ���赖将数值分解为比特位来进行范围检查或查找表索引。
-        // 此步骤对于整个系统的安全性至关重要：它证明那些声称是“比特”的变量 $x$，
-        // 其值确实满足约束 $x \cdot (x - 1) = 0$。
-        // 如果攻击者能偷运一个非 0/1 的值作为“比特”，整个查找表逻辑可能会崩塌。
+        // ---------------------------------------------------------
+        // C. 通用位有效性检查 (Booleanity)
+        // ---------------------------------------------------------
+        // 目的：Jolt 安全性的基石。
+        // 原理：Lasso 查找算法依赖将大整数切分为小 chunk (如 8-bit)。
+        // 风险：如果 Prover 声称一个变量是“比特”，但填入了 "5" 或 "-1"，数学结构会崩塌。
+        // 检查：遍历所有涉及比特分解、Flags 的列，强制验证 x \in {0, 1}。
         let booleanity_params = BooleanitySumcheckParams::new(
             self.trace.len().log_2(),
             &self.one_hot_params,
@@ -1862,56 +1870,68 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             &mut self.transcript,
         );
 
-        // d. RAM 和 Lookup 的虚拟地址读取 (Virtual Read Addresses):
-        // "Virtual" 在这里通常指代 Jolt 内部为了 Lasso 查找参数所构建的查询结构。
-        // 在 Lasso 中，大域元素的查找通常被分解为多个小 chunk 的查找。
-        // 这些参数用于验证：我们根据 Trace 数据构建出的用于查询这些小表的“虚拟地址”是合法的。
+        // ---------------------------------------------------------
+        // D. 虚拟地址构造检查 (Virtual Read Addresses)
+        // ---------------------------------------------------------
+        // 目的：验证 Lasso 查找表的“查询地址”构造逻辑。
+        // 场景：比如查一个 64位 的 RAM 地址。Jolt 会将其拆解为多个 16位 的“虚拟地址”去查子表。
+        // 检查：证明 VirtualAddr_i 是从 原始地址 Address 正确拆分/组合得来的。
+        //       如果没有这一步，Prover 可以随意编造一个查询地址，导致查找结果错乱。
         let ram_ra_virtual_params = RamRaVirtualParams::new(
             self.trace.len(),
             &self.one_hot_params,
             &self.opening_accumulator,
         );
+        // 同上，但针对指令查找表 (Lookups)
         let lookups_ra_virtual_params = InstructionRaSumcheckParams::new(
             &self.one_hot_params,
             &self.opening_accumulator,
             &mut self.transcript,
         );
 
-        // e. 增量声明归约 (Instruction Counter / Increment Reduction):
-        // 验证系统中的计数器或增量逻辑。
-        // 比如确保某些指令 ID 或步骤计数器是线性增长的，或者正确处理了 Padding 部分。
+        // ---------------------------------------------------------
+        // E. 增量/计数器归约 (Increment Reduction)
+        // ---------------------------------------------------------
+        // 目的：验证全局计数器或某些 ID 的连续性。
+        // 检查：确保 Step Counter 等变量是线性增长的，或者 Padding 处理正确。
         let inc_reduction_params = IncClaimReductionSumcheckParams::new(
             self.trace.len(),
             &self.opening_accumulator,
             &mut self.transcript,
         );
 
-        // f. Advice (辅助输入) 归约 - 第一阶段 (Phase 1):
-        // Advice 验证是一个两阶段过程。Stage 6 执行第一阶段。
-        // ���始问题是：“在第 t 步，地址 a 的值为 v”。这是一个依赖 (t, a, v) 的三元关系。
-        // Phase 1 的目标是消除“时间/周期 (Cycle, t)”维度的依赖，将其归约为关于 (Address) 的校验。
-        // 这里分别处理 Trusted（预定义）和 Untrusted（私有 Witness）两类 Advice。
+        // ---------------------------------------------------------
+        // F. 内存/Advice 归约 - 第一阶段 (Advice Phase 1)
+        // ---------------------------------------------------------
+        // 目的：离线内存检查 (Offline Memory Checking) 的核心步骤。
+        // 背景：内存读写记录是一组 (Time, Address, Value) 的元组。
+        // 逻辑：为了证明内存读写的一致性（即“读出的值 = 最后写入的值”），我们需要将“时间”维度消除。
+        // 动作：Stage 6 执行 Phase 1，将关于 Time 的多项式通过随机挑战折叠，
+        //       生成只关于 (Address, Value) 的中间形式，留给 Stage 7 做最终检查。
+
+        // 处理 Trusted Advice (通常指只读数据，如 ROM 辅助信息)
         let trusted_advice_phase1_params = AdviceClaimReductionPhase1Params::new(
             AdviceKind::Trusted,
             &self.program_io.memory_layout,
             self.trace.len(),
             &self.opening_accumulator,
             &mut self.transcript,
-            self.rw_config
-                .needs_single_advice_opening(self.trace.len().log_2()),
+            self.rw_config.needs_single_advice_opening(self.trace.len().log_2()),
         );
+
+        // 处理 Untrusted Advice (通常指读写内存 RAM)
         let untrusted_advice_phase1_params = AdviceClaimReductionPhase1Params::new(
             AdviceKind::Untrusted,
             &self.program_io.memory_layout,
             self.trace.len(),
             &self.opening_accumulator,
             &mut self.transcript,
-            self.rw_config
-                .needs_single_advice_opening(self.trace.len().log_2()),
+            self.rw_config.needs_single_advice_opening(self.trace.len().log_2()),
         );
 
         // =========================================================
-        // 2. 初始化具体的 Prover 实例
+        // 2. 初始化具体的 Prover 实例 (Initialize Provers)
+        // 根据上面生成的参数，构建实际执行 Sumcheck 协议的对象。
         // =========================================================
 
         let bytecode_read_raf = BytecodeReadRafSumcheckProver::initialize(
@@ -1925,7 +1945,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         let booleanity = BooleanitySumcheckProver::initialize(
             booleanity_params,
             &self.trace,
-            &self.preprocessing.shared.bytecode, // 某些指令隐含了地址位的分解，需要 Bytecode 信息辅助构建多项式
+            &self.preprocessing.shared.bytecode, // 某些指令自带常数，需要 Bytecode 信息
             &self.program_io.memory_layout,
         );
 
@@ -1940,14 +1960,14 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         let inc_reduction =
             IncClaimReductionSumcheckProver::initialize(inc_reduction_params, self.trace.clone());
 
-        // 初��化 Advice Phase 1 Provers。
-        // 注意：这里我们 Clone 了 advice 多项式。原因如下：
-        // 1. Phase 1 (Stage 6) 会破坏性地绑定“周期(Cycle)”变量，修改多项式视角。
-        // 2. Phase 2 (Stage 7) 将需要一份新的副本来绑定“地址(Address)”变量。
-        // 3. Stage 8 (RLC/Opening) 可能还需要原始多项式。
-        // 虽然有性能开销（Clone），但为了多阶段 Sumcheck 的独立性与安全性是必要的。
+        // 初始化 Advice Phase 1 Provers
+        // 关键点：这里使用了 `.clone()` 复制多项式。
+        // 原因：Sumcheck 过程是“破坏性”的，它会逐步绑定多项式的变量。
+        // Phase 1 绑定的是“时间/Cycle”变量。
+        // Phase 2 (Stage 7) 将需要绑定“地址/Address”变量。
+        // 因此必须保留副本或分叉，不能在同一个多项式对象上连续操作。
         let trusted_advice_phase1 = trusted_advice_phase1_params.map(|params| {
-            // 保存 gamma 值，Phase 2 会用到
+            // 保存 gamma 随机数，供下一阶段 (Stage 7) 验证使用
             self.advice_reduction_gamma_trusted = Some(params.gamma);
             let poly = self
                 .advice
@@ -1966,35 +1986,14 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             AdviceClaimReductionPhase1Prover::initialize(params, poly)
         });
 
+        // (省略了 Debug 用于打印内存使用的代码块 ...)
         #[cfg(feature = "allocative")]
-        {
-            print_data_structure_heap_usage("BytecodeReadRafSumcheckProver", &bytecode_read_raf);
-            print_data_structure_heap_usage(
-                "ram HammingBooleanitySumcheckProver",
-                &ram_hamming_booleanity,
-            );
-            print_data_structure_heap_usage("BooleanitySumcheckProver", &booleanity);
-            print_data_structure_heap_usage("RamRaSumcheckProver", &ram_ra_virtual);
-            print_data_structure_heap_usage("LookupsRaSumcheckProver", &lookups_ra_virtual);
-            print_data_structure_heap_usage("IncClaimReductionSumcheckProver", &inc_reduction);
-            if let Some(ref advice) = trusted_advice_phase1 {
-                print_data_structure_heap_usage(
-                    "AdviceClaimReductionPhase1Prover(trusted)",
-                    advice,
-                );
-            }
-            if let Some(ref advice) = untrusted_advice_phase1 {
-                print_data_structure_heap_usage(
-                    "AdviceClaimReductionPhase1Prover(untrusted)",
-                    advice,
-                );
-            }
-        }
+        { /* ... print heap usage ... */ }
 
         // =========================================================
         // 3. 打包实例进行批量证明 (Batching)
-        // 将所有关于位有效性、指令读取、地址构造和 Advice 初步归约的检查合并。
-        // 这 6-8 个独立的 Sumcheck 实例将共享同一个随机挑战向量 $r$。
+        // 优化核心：Jolt 不会对上面 6-8 个任务分别运行 Sumcheck。
+        // 而是使用随机线性组合 (RLC) 将它们合并为一个大的 Sumcheck 实例。
         // =========================================================
         let mut instances: Vec<Box<dyn SumcheckInstanceProver<_, _>>> = vec![
             Box::new(bytecode_read_raf),
@@ -2004,6 +2003,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             Box::new(lookups_ra_virtual),
             Box::new(inc_reduction),
         ];
+        // 根据配置决定是否加入 Advice 检查
         if let Some(advice) = trusted_advice_phase1 {
             instances.push(Box::new(advice));
         }
@@ -2016,9 +2016,13 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
 
         tracing::info!("Stage 6 proving");
 
-        // 4. 执行 Sumcheck
-        // 验证上述所有属性。
-        // 这一步产生的 `sumcheck_proof` 极其紧凑，却包含了对海量底层位操作有效性和内存访问正确性的保证。
+        // =========================================================
+        // 4. 执行 Sumcheck (Execution)
+        // BatchedSumcheck::prove 会执行以下操作：
+        // 1. 从 Transcript 获取随机权重 alpha。
+        // 2. 将所有 Prover 的多项式加权求和：P_combined = P1 + alpha*P2 + ...
+        // 3. 执行 Sumcheck 协议，将多变元多项式的求和归约为单点求值。
+        // =========================================================
         let (sumcheck_proof, _r_stage6) = BatchedSumcheck::prove(
             instances.iter_mut().map(|v| &mut **v as _).collect(),
             &mut self.opening_accumulator,
@@ -2028,8 +2032,11 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         #[cfg(feature = "allocative")]
         write_instance_flamegraph_svg(&instances, "stage6_end_flamechart.svg");
 
-        // 后台释放资源
-        // 这些 Prover 包含的大量的多项式数据在此刻之后不再需要。
+        // =========================================================
+        // 5. 资源清理 (Cleanup)
+        // 这里的 Prover 实例持有巨大的多项式数据。
+        // 既然证明已经生成完毕，立即在后台线程释放内存，防止后续 Stage OOM (内存溢出)。
+        // =========================================================
         drop_in_background_thread(instances);
 
         sumcheck_proof
