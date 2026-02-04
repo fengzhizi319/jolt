@@ -864,59 +864,142 @@ for InstructionReadRafSumcheckProver<F>
     /// - For the first LOG_K rounds: returns two evaluations combining
     ///   read-checking and RAF prefix–suffix messages (at X∈{0,2}).
     /// - For the last log(T) rounds: uses Gruen-split EQ.
+        #[tracing::instrument(skip_all, name = "InstructionReadRafSumcheckProver::compute_message")]
+        /// 计算 Prover 在当前轮次需要发送的单变量多项式消息。
+        ///
+        /// # 逻辑概览
+        /// Sumcheck 协议将多变量多项式的求和问题转化为一系列单变量多项式的交互。
+        /// 本函数根据当前轮数 `round` 的不同，分别处理两个阶段：
+        /// 1. **Phase 1 (Address Binding)**: 前 LOG_K 轮。处理地址变量，使用 Prefix/Suffix 分解逻辑。
+        /// 2. **Phase 2 (Cycle Binding)**: 后 log(T) 轮。处理时间变量，使用 Gruen Split 优化进行并行累加。
+        ///
+        /// # 参数
+        /// - `round`: 当前是第几轮 Sumcheck (从 0 开始)。
+        /// - `previous_claim`: 上一轮 Verifier 发来的挑战值在多项式上的评估结果 (用于一致性检查或优化)。
     fn compute_message(&mut self, round: usize, previous_claim: F) -> UniPoly<F> {
         if round < LOG_K {
-            // Phase 1: First log(K) rounds
+            // =================================================================
+            // Phase 1: 地址绑定阶段 (Address Binding)
+            // 目标：将查找表的 Index 变量 (x_0...x_63) 绑定为随机数 r_addr。
+            // =================================================================
+
+            // 对应 initialize:
+            // 这里消耗的是 initialize 中生成的 "PrefixSuffixDecomposition" 数据结构。
+            // 因为大表被拆分成了小块 (Chunks)，这里的计算涉及复杂的“进位”和“指纹传递”逻辑，
+            // 也就是之前讨论的 "Grand Product" 在拆分场景下的变体。
             self.compute_prefix_suffix_prover_message(round, previous_claim)
         } else {
+            // =================================================================
+            // Phase 2: 周期/时间绑定阶段 (Cycle/Time Binding)
+            // 目标：将 Trace 的时间变量 (t_0...t_n) 绑定为随机数 r_time。
+            // =================================================================
+
+            // 此时，地址变量已经被完全绑定。这就好比我们已经确定了 "我们要查什么地址(r_addr)"。
+            // 现在要证明的是："在整个 CPU 执行历史中，对 r_addr 的访问总和是对的"。
+
+            // 公式目标： sum_{t} Eq(r_time, t) * [ Combined_Val(t) * RA_Selector(t) ]
+
+            // 1. 获取当前活跃的多项式引用 (消耗 initialize 准备的数据)
+            // ---------------------------------------------------------
+            // ra_polys (Read Access Polys):
+            // 对应 initialize 中的 `lookup_indices_by_table` 分组逻辑。
+            // 如果有 3 个表 (ADD, MUL, SUB)，这里就有 3 个多项式。
+            // 它们充当 "Selector"：ra_polys[i](t) = 1 表示时刻 t 正在访问表 i。
             let ra_polys = self.ra_polys.as_ref().unwrap();
+
+            // combined_val:
+            // 对应 initialize 中提取的 `lookup_indices` (Trace 数据)。
+            // 它实际上是 Value(t) 和 RAF_Counter(t) 的线性组合。
             let combined_val = self.combined_val_polynomial.as_ref().unwrap();
+
+            // 计算乘积项的总数
+            // 我们要计算 P(x) = Combined(x) * RA_0(x) * RA_1(x) ...
+            // 如果有 N 个 RA 多项式，加上 Combined 多项式，乘积的度数最高为 N+1。
+            // 因此我们需要计算 N+2 个点的评估值才能确定这个单变量多项式。
             let n_evals = ra_polys.len() + 1;
 
+            // 2. 并行计算和 (Gruen Split Accumulation) - 核心算法
+            // ---------------------------------------------------------
+            // 这是一个优化算法。朴素做法是遍历所有 2^N 个点，非常慢。
+            // Jolt 使用 "Gruen Split" 将巨大的 Eq 多项式切分为 "高位(Out)" 和 "低位(In)" 两部分。
+            // 这允许我们将大任务切分为小块，并行分发给 CPU 的不同核心。
             let mut sum_evals = self
                 .eq_r_reduction
-                .E_out_current()
-                .par_iter()
+                .E_out_current() // 外部循环：遍历 Eq 的高位块
+                .par_iter()      // <--- 关键：Rayon 并行迭代
                 .enumerate()
                 .map(|(j_out, e_out)| {
-                    // Each pair is a linear polynomial.
+                    // --- 线程内部逻辑 ---
+
+                    // pairs: 存储线性对 (Linear Pairs)。
+                    // 对于每一层 Sumcheck，多线性多项式在当前变量 x_j 上都是线性的： L(x) = A(1-x) + Bx
+                    // 我们只需要存储 A (x=0时的值) 和 B (x=1时的值)。
                     let mut pairs = vec![(F::zero(), F::zero()); n_evals];
+
+                    // evals_acc: 累加器。
+                    // 存储最终乘积多项式在 {0, 1, ..., n_evals} 这些点上的值。
+                    // Unreduced 是为了性能：只做整数加法，不频繁做取模运算 (Mod P)。
                     let mut evals_acc = vec![F::Unreduced::<9>::zero(); n_evals];
 
+                    // 内部循环：遍历 Eq 的低位块 (通常大小适合 L1/L2 Cache)
                     for (j_in, e_in) in self.eq_r_reduction.E_in_current().iter().enumerate() {
+                        // 计算全局索引 j (对应当前时刻 t 的前半部分)
+                        // 这里的 j 对应变量 x_i = 0 的位置，j+1 对应 x_i = 1 的位置 (ML 存储布局)
                         let j = self.eq_r_reduction.group_index(j_out, j_in);
 
+                        // 准备数据容器
                         let Some((val_pair, ra_pairs)) = pairs.split_first_mut() else {
                             unreachable!()
                         };
 
-                        let v_at_0 = combined_val.get_bound_coeff(2 * j);
-                        let v_at_1 = combined_val.get_bound_coeff(2 * j + 1);
-                        // Load linear poly: eq * combined_val.
+                        // --- Step A: 加载 Trace 数据 (Combined Val) ---
+                        // 从 initialize 准备的大数组中，直接拿出相邻的两个值。
+                        let v_at_0 = combined_val.get_bound_coeff(2 * j);     // x_i = 0
+                        let v_at_1 = combined_val.get_bound_coeff(2 * j + 1); // x_i = 1
+
+                        // 构造线性项 L_val(x)
+                        // 注意：我们将 Eq 的因子 e_in 直接乘到了这里。
+                        // 这是 Sumcheck 的标准优化：Eq(r, x) * Poly(x)
                         *val_pair = (*e_in * v_at_0, *e_in * v_at_1);
-                        // Load ra polys.
+
+                        // --- Step B: 加载 Selector 数据 (RA Polys) ---
+                        // 遍历所有表的分组多项式，取出它们在当前时刻的值。
                         zip(ra_pairs, ra_polys).for_each(|(pair, ra_poly)| {
                             let eval_at_0 = ra_poly.get_bound_coeff(2 * j);
                             let eval_at_1 = ra_poly.get_bound_coeff(2 * j + 1);
                             *pair = (eval_at_0, eval_at_1);
                         });
 
-                        // TODO: Use unreduced arithmetic in eval_linear_prod_assign.
+                        // --- Step C: 核心数学计算 ---
+                        // 输入：一组线性函数 [L_0, L_1, ... L_k] (即 pairs)
+                        // 动作：
+                        // 1. 构造乘积多项式 P(x) = L_0(x) * ... * L_k(x)
+                        // 2. 计算 P(x) 在 x \in {0, 1, ... deg} 处的值
+                        // 3. 累加到 evals_acc 中
                         eval_linear_prod_accumulate(&pairs, &mut evals_acc);
                     }
 
+                    // 线程收尾：归约 (Reduce) 并应用外部 Eq 系数
                     evals_acc
                         .into_iter()
                         .map(|v| F::from_montgomery_reduce(v) * e_out)
                         .collect::<Vec<F>>()
                 })
+                // --- 聚合所有线程的结果 ---
                 .reduce(
                     || vec![F::zero(); n_evals],
                     |a, b| zip(a, b).map(|(a, b)| a + b).collect(),
                 );
 
+            // 3. 后处理：应用全局缩放因子
+            // 由于 Gruen Split 的数学特性，可能还有一个全局系数需要乘上去。
             let current_scalar = self.eq_r_reduction.get_current_scalar();
             sum_evals.iter_mut().for_each(|v| *v *= current_scalar);
+
+            // 4. 插值生成消息 (Univariate Polynomial)
+            // 我们现在有了总和多项式在点 0, 1, 2... 处的值。
+            // Verifier 需要的是系数形式的多项式 (ax^2 + bx + c)。
+            // 这里进行拉格朗日插值 (Lagrange Interpolation) 转换格式。
             finish_mles_product_sum_from_evals(&sum_evals, previous_claim, &self.eq_r_reduction)
         }
     }
@@ -1542,140 +1625,176 @@ mod tests {
         }
     }
 
-    fn test_read_raf_sumcheck(instruction: Option<Cycle>) {
-        let mut rng = StdRng::seed_from_u64(12345);
+        fn test_read_raf_sumcheck(instruction: Option<Cycle>) {
+            // 1. 设置随机数生成器种子，确保测试结果可复现
+            let mut rng = StdRng::seed_from_u64(12345);
 
-        let trace: Arc<Vec<_>> = Arc::new(
-            (0..T)
-                .map(|_| random_instruction(&mut rng, &instruction))
-                .collect(),
-        );
+            // 2. 生成模拟的执行痕迹 (Trace)
+            // trace 是一个包含 T 个 Cycle 的向量，每个 Cycle 代表一步指令执行。
+            // 如果 instruction 参数是 Some，则全部生成该指令；如果是 None，则随机混合不同指令。
+            let trace: Arc<Vec<_>> = Arc::new(
+                (0..T)
+                    .map(|_| random_instruction(&mut rng, &instruction))
+                    .collect(),
+            );
 
-        let prover_transcript = &mut Blake2bTranscript::new(&[]);
-        let mut prover_opening_accumulator = ProverOpeningAccumulator::new(trace.len().log_2());
-        let verifier_transcript = &mut Blake2bTranscript::new(&[]);
-        let mut verifier_opening_accumulator = VerifierOpeningAccumulator::new(trace.len().log_2());
+            // 3. 初始化 Transcript 和 Opening Accumulators
+            // Prover 和 Verifier 各自拥有自己的 Transcript 以模拟交互式协议的随机性生成。
+            // Accumulator 用于收集 Sumcheck 过程中产生的 Claim（声称值）。
+            let prover_transcript = &mut Blake2bTranscript::new(&[]);
+            let mut prover_opening_accumulator = ProverOpeningAccumulator::new(trace.len().log_2());
+            let verifier_transcript = &mut Blake2bTranscript::new(&[]);
+            let mut verifier_opening_accumulator = VerifierOpeningAccumulator::new(trace.len().log_2());
 
-        let r_cycle: Vec<<Fr as JoltField>::Challenge> =
-            prover_transcript.challenge_vector_optimized::<Fr>(LOG_T);
-        let _r_cycle: Vec<<Fr as JoltField>::Challenge> =
-            verifier_transcript.challenge_vector_optimized::<Fr>(LOG_T);
-        let eq_r_cycle = EqPolynomial::<Fr>::evals(&r_cycle);
+            // 4. 生成时间维度的随机挑战点 r_cycle (长度为 log(T))
+            // 在正式协议中，这是上一轮 Sumcheck (Instruction Claim Reduction) 的输出。
+            // 为了便于测试，这里直接从 Transcript 中模拟生成。
+            // 注意：Prover 和 Verifier 必须使用相同的 Transcript 状态来获取相同的随机数。
+            let r_cycle: Vec<<Fr as JoltField>::Challenge> =
+                prover_transcript.challenge_vector_optimized::<Fr>(LOG_T);
+            let _r_cycle: Vec<<Fr as JoltField>::Challenge> =
+                verifier_transcript.challenge_vector_optimized::<Fr>(LOG_T);
 
-        let mut rv_claim = Fr::zero();
-        let mut left_operand_claim = Fr::zero();
-        let mut right_operand_claim = Fr::zero();
+            // 计算 Eq 多项式在 r_cycle 处的评估值，即 [eq(r_cycle, 0), ..., eq(r_cycle, T-1)]
+            let eq_r_cycle = EqPolynomial::<Fr>::evals(&r_cycle);
 
-        for (i, cycle) in trace.iter().enumerate() {
-            let lookup_index = LookupQuery::<XLEN>::to_lookup_index(cycle);
-            let table: Option<LookupTables<XLEN>> = cycle.lookup_table();
-            if let Some(table) = table {
-                rv_claim +=
-                    JoltField::mul_u64(&eq_r_cycle[i], table.materialize_entry(lookup_index));
+            // 5. 手动计算预期的各个 Claim (Ground Truth)
+            // 这一步模拟了 "Oracle" 的行为，通过直接遍历 trace 来计算正确的结果，用于后续校验。
+            let mut rv_claim = Fr::zero();              // Lookup Output Claim (Sum(Eq * Output))
+            let mut left_operand_claim = Fr::zero();    // 左操作数 Claim (Sum(Eq * Left))
+            let mut right_operand_claim = Fr::zero();   // 右操作数 Claim (Sum(Eq * Right))
+
+            for (i, cycle) in trace.iter().enumerate() {
+                // 获取当前指令对应的查找键、表类型
+                let lookup_index = LookupQuery::<XLEN>::to_lookup_index(cycle);
+                let table: Option<LookupTables<XLEN>> = cycle.lookup_table();
+
+                // 累加 Output Claim: 如果指令使用了查找表，则加上 Eq[i] * Table[Key]
+                if let Some(table) = table {
+                    rv_claim +=
+                        JoltField::mul_u64(&eq_r_cycle[i], table.materialize_entry(lookup_index));
+                }
+
+                // 累加 Operand Claims: 左操作数和右操作数
+                let (lo, ro) = LookupQuery::<XLEN>::to_lookup_operands(cycle);
+                left_operand_claim += JoltField::mul_u64(&eq_r_cycle[i], lo);
+                right_operand_claim += JoltField::mul_u128(&eq_r_cycle[i], ro);
             }
 
-            // Compute left and right operand claims
-            let (lo, ro) = LookupQuery::<XLEN>::to_lookup_operands(cycle);
-            left_operand_claim += JoltField::mul_u64(&eq_r_cycle[i], lo);
-            right_operand_claim += JoltField::mul_u128(&eq_r_cycle[i], ro);
+            // 6. 将计算出的 Claim 注入 Prover 的累加器
+            // 模拟上一阶段 Sumcheck 输出的 Claim，Prover 本次只需要证明这些 Claim 是一致的。
+            prover_opening_accumulator.append_virtual(
+                prover_transcript,
+                VirtualPolynomial::LookupOutput,
+                SumcheckId::InstructionClaimReduction,
+                OpeningPoint::new(r_cycle.clone()),
+                rv_claim,
+            );
+            prover_opening_accumulator.append_virtual(
+                prover_transcript,
+                VirtualPolynomial::LeftLookupOperand,
+                SumcheckId::InstructionClaimReduction,
+                OpeningPoint::new(r_cycle.clone()),
+                left_operand_claim,
+            );
+            prover_opening_accumulator.append_virtual(
+                prover_transcript,
+                VirtualPolynomial::RightLookupOperand,
+                SumcheckId::InstructionClaimReduction,
+                OpeningPoint::new(r_cycle.clone()),
+                right_operand_claim,
+            );
+            // SpartanProductVirtualization 也是产生 LookupOutput 的 Claim 来源之一
+            prover_opening_accumulator.append_virtual(
+                prover_transcript,
+                VirtualPolynomial::LookupOutput,
+                SumcheckId::SpartanProductVirtualization,
+                OpeningPoint::new(r_cycle.clone()),
+                rv_claim,
+            );
+
+            // 7. 初始化 Prover
+            // 配置 One-Hot 参数（这里仅用于配置结构，具体值在 InstructionReadRafContext 下不太关键）
+            let one_hot_params = OneHotParams::new(trace.len().log_2(), 100, 100);
+
+            // 创建 Sumcheck 参数，这会从 accumulator 中读取 r_reduction，并从 transcript 生成 gamma
+            let params = InstructionReadRafSumcheckParams::new(
+                trace.len().log_2(),
+                &one_hot_params,
+                &prover_opening_accumulator,
+                prover_transcript,
+            );
+
+            // 核心初始化：Prover 会在这里进行 Trace 预处理、表聚合、权重计算等繁重工作
+            let mut prover_sumcheck =
+                InstructionReadRafSumcheckProver::initialize(params, Arc::clone(&trace));
+
+            // 8. 执行 Prover 端的 Sumcheck 协议
+            // 生成多项式承诺证明 proof，以及最终的随机挑战点 r_sumcheck
+            let (proof, r_sumcheck) = BatchedSumcheck::prove(
+                vec![&mut prover_sumcheck],
+                &mut prover_opening_accumulator,
+                prover_transcript,
+            );
+
+            // 9. 准备 Verifier 环境
+            // 获取 Prover 生成的 Claim 值，传递给 Verifier 累加器（模拟网络传输）
+            // 实际上 Verifier 并不知晓具体值是怎么算的，只知道 Prover 承诺了这些值。
+            for (key, (_, value)) in &prover_opening_accumulator.openings {
+                let empty_point = OpeningPoint::<BIG_ENDIAN, Fr>::new(vec![]);
+                verifier_opening_accumulator
+                    .openings
+                    .insert(*key, (empty_point, *value));
+            }
+
+            // Verifier 需要知道要在哪些点上查询哪些多项式，这里注册这些“意图”
+            verifier_opening_accumulator.append_virtual(
+                verifier_transcript,
+                VirtualPolynomial::LookupOutput,
+                SumcheckId::InstructionClaimReduction,
+                OpeningPoint::new(r_cycle.clone()),
+            );
+            verifier_opening_accumulator.append_virtual(
+                verifier_transcript,
+                VirtualPolynomial::LeftLookupOperand,
+                SumcheckId::InstructionClaimReduction,
+                OpeningPoint::new(r_cycle.clone()),
+            );
+            verifier_opening_accumulator.append_virtual(
+                verifier_transcript,
+                VirtualPolynomial::RightLookupOperand,
+                SumcheckId::InstructionClaimReduction,
+                OpeningPoint::new(r_cycle.clone()),
+            );
+            verifier_opening_accumulator.append_virtual(
+                verifier_transcript,
+                VirtualPolynomial::LookupOutput,
+                SumcheckId::SpartanProductVirtualization,
+                OpeningPoint::new(r_cycle.clone()),
+            );
+
+            // 10. 初始化 Verifier
+            let mut verifier_sumcheck = InstructionReadRafSumcheckVerifier::new(
+                trace.len().log_2(),
+                &one_hot_params,
+                &verifier_opening_accumulator,
+                verifier_transcript,
+            );
+
+            // 11. 执行 Verifier 端的验证逻辑
+            // 验证 proof 是否合法，计算最终用于 Open 操作的 challenge 点。
+            let r_sumcheck_verif = BatchedSumcheck::verify(
+                &proof,
+                vec![&mut verifier_sumcheck],
+                &mut verifier_opening_accumulator,
+                verifier_transcript,
+            )
+                .unwrap();
+
+            // 12. 最终断言
+            // 确保 Prover 和 Verifier 协商出的最终随机点一致，这意味着协议交互流程正确无误。
+            assert_eq!(r_sumcheck, r_sumcheck_verif);
         }
-
-        prover_opening_accumulator.append_virtual(
-            prover_transcript,
-            VirtualPolynomial::LookupOutput,
-            SumcheckId::InstructionClaimReduction,
-            OpeningPoint::new(r_cycle.clone()),
-            rv_claim,
-        );
-        prover_opening_accumulator.append_virtual(
-            prover_transcript,
-            VirtualPolynomial::LeftLookupOperand,
-            SumcheckId::InstructionClaimReduction,
-            OpeningPoint::new(r_cycle.clone()),
-            left_operand_claim,
-        );
-        prover_opening_accumulator.append_virtual(
-            prover_transcript,
-            VirtualPolynomial::RightLookupOperand,
-            SumcheckId::InstructionClaimReduction,
-            OpeningPoint::new(r_cycle.clone()),
-            right_operand_claim,
-        );
-        prover_opening_accumulator.append_virtual(
-            prover_transcript,
-            VirtualPolynomial::LookupOutput,
-            SumcheckId::SpartanProductVirtualization,
-            OpeningPoint::new(r_cycle.clone()),
-            rv_claim,
-        );
-
-        let one_hot_params = OneHotParams::new(trace.len().log_2(), 100, 100);
-
-        let params = InstructionReadRafSumcheckParams::new(
-            trace.len().log_2(),
-            &one_hot_params,
-            &prover_opening_accumulator,
-            prover_transcript,
-        );
-        let mut prover_sumcheck =
-            InstructionReadRafSumcheckProver::initialize(params, Arc::clone(&trace));
-
-        let (proof, r_sumcheck) = BatchedSumcheck::prove(
-            vec![&mut prover_sumcheck],
-            &mut prover_opening_accumulator,
-            prover_transcript,
-        );
-
-        // Take claims
-        for (key, (_, value)) in &prover_opening_accumulator.openings {
-            let empty_point = OpeningPoint::<BIG_ENDIAN, Fr>::new(vec![]);
-            verifier_opening_accumulator
-                .openings
-                .insert(*key, (empty_point, *value));
-        }
-
-        verifier_opening_accumulator.append_virtual(
-            verifier_transcript,
-            VirtualPolynomial::LookupOutput,
-            SumcheckId::InstructionClaimReduction,
-            OpeningPoint::new(r_cycle.clone()),
-        );
-        verifier_opening_accumulator.append_virtual(
-            verifier_transcript,
-            VirtualPolynomial::LeftLookupOperand,
-            SumcheckId::InstructionClaimReduction,
-            OpeningPoint::new(r_cycle.clone()),
-        );
-        verifier_opening_accumulator.append_virtual(
-            verifier_transcript,
-            VirtualPolynomial::RightLookupOperand,
-            SumcheckId::InstructionClaimReduction,
-            OpeningPoint::new(r_cycle.clone()),
-        );
-        verifier_opening_accumulator.append_virtual(
-            verifier_transcript,
-            VirtualPolynomial::LookupOutput,
-            SumcheckId::SpartanProductVirtualization,
-            OpeningPoint::new(r_cycle.clone()),
-        );
-
-        let mut verifier_sumcheck = InstructionReadRafSumcheckVerifier::new(
-            trace.len().log_2(),
-            &one_hot_params,
-            &verifier_opening_accumulator,
-            verifier_transcript,
-        );
-
-        let r_sumcheck_verif = BatchedSumcheck::verify(
-            &proof,
-            vec![&mut verifier_sumcheck],
-            &mut verifier_opening_accumulator,
-            verifier_transcript,
-        )
-            .unwrap();
-
-        assert_eq!(r_sumcheck, r_sumcheck_verif);
-    }
 
     #[test]
     fn test_random_instructions() {
