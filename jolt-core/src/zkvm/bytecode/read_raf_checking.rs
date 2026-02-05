@@ -712,25 +712,55 @@ pub struct BytecodeReadRafSumcheckParams<F: JoltField> {
 
 impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
     #[tracing::instrument(skip_all, name = "BytecodeReadRafSumcheckParams::gen")]
+    /// 生成 BytecodeReadRafSumcheckParams 实例。
+    ///具体来说，它负责：
+    /// 收集挑战数：从 Transcript 中获取随机挑战数 <span>\gamma</span>（Gamma）。
+    /// 计算目标值：从之前的证明步骤（Opening Accumulator）中提取多项式的评估值，并通过随机线性组合（RLC）计算出当前 Sumcheck 需要证明的总和（LHS）。
+    /// 计算 Val 多项式：为了验证效率，通过一次并行扫描（Fused Pass）计算所有 5 个阶段所需的 Val(k) 多项式，而不是扫描 5 次。
+    /// 此函数是协议设置阶段的核心，负责：
+    /// 1. 从 Transcript 获取随机挑战数 (Gamma)。
+    /// 2. 从 OpeningAccumulator 获取各个子协议生成的 Claims (声称值)。
+    /// 3. 计算最终的 input_claim (Verifier 期望 Prover 证明的总和)。
+    /// 4. 预计算所有阶段的 Val 多项式。
+    /// 生成 BytecodeReadRafSumcheck 实例的参数
+    /// 主要任务：收集前 5 个 Stage 关于“指令读取”的承诺，并结合静态字节码构建验证多项式。
     pub fn gen(
-        bytecode_preprocessing: &BytecodePreprocessing,
-        n_cycle_vars: usize,
-        one_hot_params: &OneHotParams,
-        opening_accumulator: &dyn OpeningAccumulator<F>,
-        transcript: &mut impl Transcript,
+        bytecode_preprocessing: &BytecodePreprocessing, // 预处理的静态字节码 (ROM)
+        n_cycle_vars: usize,                            // 对应 trace 长度的变量数 (log_2(Time))
+        one_hot_params: &OneHotParams,                  // One-hot 编码参数
+        opening_accumulator: &dyn OpeningAccumulator<F>, // 存储前序 Stage 计算结果的累加器
+        transcript: &mut impl Transcript,               // Fiat-Shamir 挑战生成器
     ) -> Self {
+        // =========================================================
+        // 1. 生成全局随机权重 Gamma
+        // 用于将 5 个不同的 Stage 的 Check + 2 个 RAF Check 合并为一个大的 Sumcheck
+        // =========================================================
         let gamma_powers = transcript.challenge_scalar_powers(7);
 
         let bytecode = &bytecode_preprocessing.bytecode;
 
-        // Generate all stage-specific gamma powers upfront (order must match verifier)
+        // =========================================================
+        // 2. 为每个子 Stage 生成内部混合系数
+        // 前面的每个 Stage 可能包含多个子多项式（例如 Stage 1 有多个 Circuit Flags），
+        // 这里需要生成对应的权重将它们压缩。
+        // =========================================================
+
+        // Stage 1: Spartan Outer (验证操作码 Opcode 是否正确)
         let stage1_gammas: Vec<F> = transcript.challenge_scalar_powers(2 + NUM_CIRCUIT_FLAGS);
+        // Stage 2: Product Virtualization (验证乘法相关逻辑)
         let stage2_gammas: Vec<F> = transcript.challenge_scalar_powers(4);
+        // Stage 3: Shift Sumcheck (验证位移操作)
         let stage3_gammas: Vec<F> = transcript.challenge_scalar_powers(9);
+        // Stage 4: Register R/W Checking (验证寄存器读写索引 rd, rs1, rs2)
         let stage4_gammas: Vec<F> = transcript.challenge_scalar_powers(3);
+        // Stage 5: Instruction Lookups (验证指令查找表的结果)
         let stage5_gammas: Vec<F> = transcript.challenge_scalar_powers(2 + NUM_LOOKUP_TABLES);
 
-        // Compute rv_claims (these don't iterate bytecode, just query opening accumulator)
+        // =========================================================
+        // 3. 计算各个 Stage 的 "声明值" (RV Claims)
+        // 这些值代表了：“在前几个 Stage 中，Prover 声称从 Bytecode 中读到了什么值”。
+        // opening_accumulator 里存的是 MLE(r) 的求值结果。
+        // =========================================================
         let rv_claim_1 = Self::compute_rv_claim_1(opening_accumulator, &stage1_gammas);
         let rv_claim_2 = Self::compute_rv_claim_2(opening_accumulator, &stage2_gammas);
         let rv_claim_3 = Self::compute_rv_claim_3(opening_accumulator, &stage3_gammas);
@@ -738,17 +768,25 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
         let rv_claim_5 = Self::compute_rv_claim_5(opening_accumulator, &stage5_gammas);
         let rv_claims = [rv_claim_1, rv_claim_2, rv_claim_3, rv_claim_4, rv_claim_5];
 
-        // Pre-compute eq_r_register for stages 4 and 5 (they use different r_register points)
+        // =========================================================
+        // 4. 预计算 Eq 多项式 (用于过滤寄存器)
+        // Stage 4 和 5 涉及到寄存器索引的检查。
+        // 我们需要构建 eq(r_register, index) 来验证 Trace 里的寄存器索引是否匹配。
+        // =========================================================
+
+        // 获取 Stage 4 中用于校验寄存器读写的随机点 r
         let r_register_4 = opening_accumulator
             .get_virtual_polynomial_opening(
-                VirtualPolynomial::RdWa,
+                VirtualPolynomial::RdWa, // 目标是 Rd/Wa (Write Address)
                 SumcheckId::RegistersReadWriteChecking,
             )
             .0
-            .r;
+            .r; // 取出随机向量 r
+        // 计算 eq(r, x) 在所有可能的寄存器索引上的值 (0..31)
         let eq_r_register_4 =
             EqPolynomial::<F>::evals(&r_register_4[..(REGISTER_COUNT as usize).log_2()]);
 
+        // 同上，处理 Stage 5
         let r_register_5 = opening_accumulator
             .get_virtual_polynomial_opening(
                 VirtualPolynomial::RdWa,
@@ -759,7 +797,13 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
         let eq_r_register_5 =
             EqPolynomial::<F>::evals(&r_register_5[..(REGISTER_COUNT as usize).log_2()]);
 
-        // Fused pass: compute all val polynomials in a single parallel iteration
+        // =========================================================
+        // 5. [核心优化] 融合计算 (Fused Computation)
+        // 这是为了性能。我们需要遍历静态的 Bytecode 来计算“理论上的多项式值”。
+        // 与其对 Bytecode 遍历 5 次（为每个 Stage 算一次），
+        // 不如遍历 1 次，同时计算出 5 个 Stage 所需的系数 (val_polys)。
+        // 这将生成这一轮 Sumcheck 所需的基础多项式。
+        // =========================================================
         let val_polys = Self::compute_val_polys(
             bytecode,
             &eq_r_register_4,
@@ -771,12 +815,24 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
             &stage5_gammas,
         );
 
+        // 身份多项式，对应地址索引，用于注入 RAF 贡献
         let int_poly = IdentityPolynomial::new(one_hot_params.bytecode_k.log_2());
 
+        // =========================================================
+        // 6. 获取 RAF Claims (读访问频次声明)
+        // 这里从 accumulator 获取之前的 Sumcheck 结果，这些结果隐含了
+        // "PC 这一列在之前的检查中被访问了多少次"。
+        // =========================================================
         let (_, raf_claim) = opening_accumulator
             .get_virtual_polynomial_opening(VirtualPolynomial::PC, SumcheckId::SpartanOuter);
         let (_, raf_shift_claim) = opening_accumulator
             .get_virtual_polynomial_opening(VirtualPolynomial::PC, SumcheckId::SpartanShift);
+
+        // =========================================================
+        // 7. 组合最终的 Input Claim (总目标值)
+        // Sumcheck 的目标是证明：Sum(Poly(x)) = Input_Claim
+        // input_claim = (Claim1 * γ^0) + ... + (Claim5 * γ^4) + (RAF * γ^5) + (Shift * γ^6)
+        // =========================================================
         let input_claim = [
             rv_claim_1,
             rv_claim_2,
@@ -788,9 +844,14 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
         ]
             .iter()
             .zip(&gamma_powers)
-            .map(|(claim, g)| *claim * g)
+            .map(|(claim, g)| *claim * g) // 线性组合
             .sum();
 
+        // =========================================================
+        // 8. 收集时间绑定随机点 (Time Binding / r_cycle)
+        // 这些 r 值代表了之前的 Stage 是在哪个“时刻”（Cycle）进行的检查。
+        // 在离线内存检查中，我们需要把这些“时刻”信息剥离，转化为对“地址”的检查。
+        // =========================================================
         let (r_cycle_1, _) = opening_accumulator
             .get_virtual_polynomial_opening(VirtualPolynomial::Imm, SumcheckId::SpartanOuter);
         let (r_cycle_2, _) = opening_accumulator.get_virtual_polynomial_opening(
@@ -801,6 +862,8 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
             VirtualPolynomial::UnexpandedPC,
             SumcheckId::SpartanShift,
         );
+        // ... (重复获取其他 Stage 的 r_cycle)
+        // 注意：寄存器检查的 r 向量包含了 (Cycle || RegisterIndex)，这里用 split_at 把 Cycle 部分切出来。
         let (r, _) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::Rs1Ra,
             SumcheckId::RegistersReadWriteChecking,
@@ -819,8 +882,7 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
             r_cycle_5.r,
         ];
 
-        // Note: We don't have r_address at this point (it comes from sumcheck_challenges),
-        // so we initialize r_address_chunks as empty and will compute it later
+        // 返回构造好的参数结构体
         Self {
             gamma_powers,
             input_claim,
