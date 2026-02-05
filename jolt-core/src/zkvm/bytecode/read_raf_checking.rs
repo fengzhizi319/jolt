@@ -363,7 +363,7 @@ impl<F: JoltField> BytecodeReadRafSumcheckProver<F> {
 }
 
 impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
-    for BytecodeReadRafSumcheckProver<F>
+for BytecodeReadRafSumcheckProver<F>
 {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         &self.params
@@ -408,8 +408,8 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
                             std::array::from_fn::<F, DEGREE, _>(|j| {
                                 val_evals[j]
                                     + int_evals.map_or(F::zero(), |int_evals| {
-                                        int_evals[j] * gamma.unwrap()
-                                    })
+                                    int_evals[j] * gamma.unwrap()
+                                })
                             })
                         });
 
@@ -598,7 +598,7 @@ impl<F: JoltField> BytecodeReadRafSumcheckVerifier<F> {
 }
 
 impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
-    for BytecodeReadRafSumcheckVerifier<F>
+for BytecodeReadRafSumcheckVerifier<F>
 {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         &self.params
@@ -786,10 +786,10 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
             raf_claim,
             raf_shift_claim,
         ]
-        .iter()
-        .zip(&gamma_powers)
-        .map(|(claim, g)| *claim * g)
-        .sum();
+            .iter()
+            .zip(&gamma_powers)
+            .map(|(claim, g)| *claim * g)
+            .sum();
 
         let (r_cycle_1, _) = opening_accumulator
             .get_virtual_polynomial_opening(VirtualPolynomial::Imm, SumcheckId::SpartanOuter);
@@ -1058,10 +1058,10 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
             rd_wa_claim,
             write_lookup_output_to_rd_flag_claim,
         ]
-        .into_iter()
-        .zip_eq(gamma_powers)
-        .map(|(claim, gamma)| claim * gamma)
-        .sum()
+            .into_iter()
+            .zip_eq(gamma_powers)
+            .map(|(claim, gamma)| claim * gamma)
+            .sum()
     }
 
     fn compute_rv_claim_3(
@@ -1129,10 +1129,10 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
             is_virtual_claim,
             is_first_in_sequence_claim,
         ]
-        .into_iter()
-        .zip_eq(gamma_powers)
-        .map(|(claim, gamma)| claim * gamma)
-        .sum()
+            .into_iter()
+            .zip_eq(gamma_powers)
+            .map(|(claim, gamma)| claim * gamma)
+            .sum()
     }
 
     fn compute_rv_claim_4(
