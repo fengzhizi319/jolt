@@ -91,7 +91,7 @@ enum RamRaClaimReductionPhase<F: JoltField> {
 impl<F: JoltField> RamRaClaimReductionSumcheckProver<F> {
     /// Create a new RAM RA reduction sumcheck prover.
     /// 初始化 RAM RA 归约 Sumcheck 的 Prover 实例
-    ///
+    /// 证明的目的：证明 Trace 中 CPU 访问的物理地址 ≡ RAM 多项式 (RamRa) 编码的地址，两个平行世界的一致性
     /// # 功能
     ///
     /// 该函数负责启动 RAM Random Access (RA) 的归约 Sumcheck 协议。

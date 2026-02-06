@@ -31,6 +31,7 @@ use allocative::Allocative;
 use allocative::FlameGraphBuilder;
 use common::jolt_device::MemoryLayout;
 use rayon::prelude::*;
+use tracing::info;
 use tracer::{instruction::Cycle, JoltDevice};
 
 /// Degree bound of the sumcheck round polynomials in [`ValFinalSumcheckVerifier`].
@@ -179,6 +180,8 @@ impl<F: JoltField> ValFinalSumcheckProver<F> {
         // [优化点 1: 查表法代替计算]
         // 复杂度从 O(TraceLen * log K) 降低到 O(K + TraceLen)。
         let eq_r_address = EqPolynomial::evals(&params.r_address);
+        // info!("ValFinalSumcheckProver eq_r_address.len(): {:?}", eq_r_address.len());//819
+        // info!("ValFinalSumcheckProver params.r_address.len(): {:?}", params.r_address.len());//13
 
         let span = tracing::span!(tracing::Level::INFO, "compute wa(r_address, j)");
         let _guard = span.enter();
@@ -191,10 +194,7 @@ impl<F: JoltField> ValFinalSumcheckProver<F> {
         // 对于 Trace 中的每一行 (Cycle t)，如果它操作了地址 A_t：
         // wa[t] = Eq(A_t, r_address)
         //
-        // 物理意义：
-        // Verifier 想检查随机地址 r_address 上的值。
-        // `wa` 将 Trace 中所有操作了 "类似 r_address" 的行筛选出来（赋予高权重），
-        // 而操作其他地址的行赋予接近 0 的权重。
+        //对不同的地址使用了不同的加权因子Eq，起到了加扰的作用，防止证明者作弊。        
         //
         // [优化点 2: 并行迭代 (Rayon Parallel Iterator)]
         // 每一行的 wa 计算是完全独立的，因此使用 .par_iter() 进行数据并行处理。

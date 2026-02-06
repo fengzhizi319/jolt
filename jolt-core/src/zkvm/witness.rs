@@ -285,72 +285,101 @@ impl CommittedPolynomial {
         F: JoltField,
     {
         match self {
-            // [类型 1] Bytecode Read Access
-            // 作用：证明取指操作的 PC 地址是有效的。
+            // ====================================================================
+            // 类型 1: Bytecode Read Access (RA) - 取指地址的一热编码
+            // ====================================================================
+            // [算法原理: One-Hot Encoding with Chunking]
+            // 这里的 "Ra" 代表 Read Address (或 Access)。
+            // 为了在查找表 (Lasso Lookup) 中证明 PC 的合法性，我们需要指明 PC 访问了哪个位置。
+            // 由于地址空间很大，Jolt 将地址切分为多个 Chunk (例如 16-bit 一块)。
+            // 这里的 `i` 表示第 i 个 Chunk。
             CommittedPolynomial::BytecodeRa(i) => {
                 let one_hot_params = one_hot_params.unwrap();
                 let addresses: Vec<_> = trace
-                    .par_iter()
+                    .par_iter() // [优化: 并行计算]
                     .map(|cycle| {
                         let pc = bytecode_preprocessing.get_pc(cycle);
-                        // 将 PC 映射为 One-Hot 块的索引
+                        // [算法: Chunking] 提取 PC 的第 i 个片段
+                        // 公式: chunk_val = (pc >> (i * chunk_bits)) & mask
                         Some(one_hot_params.bytecode_pc_chunk(pc, *i))
                     })
                     .collect();
-                // 生成压缩的 One-Hot 多项式
+
+                // [优化: Sparse Representation]
+                // 不直接存储巨大的 0/1 向量，而是存储 "哪个索引是 1"。
                 MultilinearPolynomial::OneHot(OneHotPolynomial::from_indices(
                     addresses,
                     one_hot_params.k_chunk,
                 ))
             }
 
-            // [类型 2] RAM Read Access
-            // 作用：证明 RAM 读写操作的地址是有效的。
+            // ====================================================================
+            // 类型 2: RAM Read Access (RA) - 内存地址的一热编码
+            // ====================================================================
+            // [约束说明: Valid Memory Access]
+            // 证明 Trace 中访问的 RAM 地址都在合法的 Memory Layout 范围内。
             CommittedPolynomial::RamRa(i) => {
                 let one_hot_params = one_hot_params.unwrap();
                 let addresses: Vec<_> = trace
                     .par_iter()
                     .map(|cycle| {
-                        // remap_address: 将稀疏物理地址映射为密集索引
+                        // [算法: Remapping]
+                        // 物理地址 (64-bit) -> 密集索引 (Compact Index)
+                        // 如果地址未映射 (None)，则不在 One-Hot 中激活任何位。
                         remap_address(cycle.ram_access().address() as u64, memory_layout)
                             .map(|address| one_hot_params.ram_address_chunk(address, *i))
                     })
                     .collect();
+
                 MultilinearPolynomial::OneHot(OneHotPolynomial::from_indices(
                     addresses,
                     one_hot_params.k_chunk,
                 ))
             }
 
-            // [类型 3] RD (目标寄存器) Increment
-            // 作用：检查寄存器堆的一致性。
-            // 公式：Inc = Post - Pre
+            // ====================================================================
+            // 类型 3: RD (目标寄存器) Increment - 寄存器值变化量
+            // ====================================================================
+            // [约束说明: Consistency Check (Post - Pre)]
+            // 这里的 "Inc" 代表 Increment (增量)。
+            // 约束目标：证明寄存器状态的连续性。
+            // 对于同一个寄存器，第 t 次操作后的值，必须等于第 t+1 次操作前的初始值。
+            // 这里的计算是为了验证全局求和约束：Sum(Final) = Sum(Init) + Sum(Inc)。
             CommittedPolynomial::RdInc => {
                 let coeffs: Vec<i128> = trace
                     .par_iter()
                     .map(|cycle| {
+                        // 获取 RD 寄存器写操作前后的值
                         let (_, pre_value, post_value) = cycle.rd_write().unwrap_or_default();
-                        // 计算增量。注意这里使用 i128 防止溢出，因为是在算术域上计算
+
+                        // [算法公式: Delta Calculation]
+                        // Delta = Value_{post} - Value_{pre}
+                        // 使用 i128 是为了防止在转换到有限域 F 之前发生整数溢出。
+                        // 负数在有限域中会被正确处理为 (Modulus - x)。
                         post_value as i128 - pre_value as i128
                     })
                     .collect();
-                coeffs.into() // 自动转换为多线性多项式
+                coeffs.into() // 自动转换为多线性多项式 (Dense form)
             }
 
-            // [类型 4] RAM Increment
-            // 作用：检查 RAM 的一致性。
-            // 逻辑：只有 Write 操作会改变值，Read 操作 Inc 为 0。
+            // ====================================================================
+            // 类型 4: RAM Increment - 内存值变化量
+            // ====================================================================
+            // [约束说明: Read-Write Consistency]
+            // 类似于寄存器，RAM 的一致性也依赖于 "值守恒"。
+            // 读操作 (Read) 不改变状态，所以增量为 0。
+            // 写操作 (Write) 改变状态，增量为 Post - Pre。
             CommittedPolynomial::RamInc => {
                 let coeffs: Vec<i128> = trace
                     .par_iter()
                     .map(|cycle| {
                         let ram_op = cycle.ram_access();
                         match ram_op {
-                            // 只有 Write 操作才有非零增量
+                            // Write 操作：产生状态变更
                             tracer::instruction::RAMAccess::Write(write) => {
                                 write.post_value as i128 - write.pre_value as i128
                             }
-                            // Read 操作或无操作，增量为 0
+                            // Read 操作：状态不变，增量为 0
                             _ => 0,
                         }
                     })
@@ -358,14 +387,19 @@ impl CommittedPolynomial {
                 coeffs.into()
             }
 
-            // [类型 5] Instruction Lookup Index
-            // 作用：用于指令解码查表。
+            // ====================================================================
+            // 类型 5: Instruction Lookup Index - 指令查找索引
+            // ====================================================================
+            // [算法原理: Lasso Lookup]
+            // Jolt 使用 Lasso 算法查表来执行指令。
+            // 这里提取指令的 lookup_index，并将其切分为 chunk。
+            // 用于证明：opcode 和操作数构成的查询键值存在于预定义的指令表中。
             CommittedPolynomial::InstructionRa(i) => {
                 let one_hot_params = one_hot_params.unwrap();
                 let addresses: Vec<_> = trace
                     .par_iter()
                     .map(|cycle| {
-                        // 提取指令的 Lookup Index
+                        // 将指令解码为查找表索引
                         let lookup_index = LookupQuery::<XLEN>::to_lookup_index(cycle);
                         Some(one_hot_params.lookup_index_chunk(lookup_index, *i))
                     })
@@ -376,7 +410,7 @@ impl CommittedPolynomial {
                 ))
             }
 
-            // 异常处理：Advice 多项式不应在此生成
+            // 异常处理
             CommittedPolynomial::TrustedAdvice | CommittedPolynomial::UntrustedAdvice => {
                 panic!("Advice polynomials should not use generate_witness")
             }

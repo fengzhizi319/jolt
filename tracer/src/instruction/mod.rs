@@ -308,7 +308,7 @@ impl From<()> for RAMAccess {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct NormalizedInstruction {
     /// 指令所在的内存地址（程序计数器 PC 的值）。
     pub address: usize,

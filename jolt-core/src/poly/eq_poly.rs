@@ -269,21 +269,48 @@ mod tests {
     use std::time::Instant;
 
     #[test]
-    /// Test that the results of running `evals_serial`, `evals_parallel`, and `evals_serial_cached`
-    /// (taking the last vector) are the same (and also benchmark them)
+    /// 测试 `evals_serial`、`evals_parallel` 和 `evals_serial_cached` 的结果是否一致，
+    /// 并对它们的性能进行基准测试。
+    ///
+    /// # 测试目的
+    /// 1. 验证三种不同实现计算的等式多项式评估表是否完全相同
+    /// 2. 对比串行、并行和缓存版本的性能差异
+    ///
+    /// # 测试范围
+    /// - 测试向量长度从 5 到 21（对应 2^5 到 2^21 的评估表大小）
+    /// - 使用随机挑战点验证算法正确性
+    /// 等式多项式 eq(r, x) = ∏ᵢ (rᵢxᵢ + (1-rᵢ)(1-xᵢ)) 在 sumcheck 中用于选择特定顶点
+    /// 大端序索引：evals[i] 对应 i 的二进制表示 (b₀,...,bₙ₋₁)，其中 b₀ 是 MSB
     fn test_evals() {
         let mut rng = test_rng();
+
+        // 遍历不同长度的挑战向量，测试算法的可扩展性
         for len in 5..22 {
+            // 生成长度为 len 的随机挑战点向量 r
+            // 这些挑战点用于计算 eq(r, x) 对所有 x ∈ {0,1}^len 的评估
             let r = (0..len)
                 .map(|_| <Fr as JoltField>::Challenge::random(&mut rng))
                 .collect::<Vec<_>>();
+
+            // === 串行版本性能测试 ===
             let start = Instant::now();
+            // evals_serial 计算评估表: [eq(r, 0), eq(r, 1), ..., eq(r, 2^len-1)]
+            // 使用单线程动态规划算法，时间复杂度 O(2^len)
             let evals_serial: Vec<Fr> = EqPolynomial::evals_serial(&r, None);
             let end_first = Instant::now();
+
+            // === 并行版本性能测试 ===
+            // evals_parallel 使用 rayon 并行计算，适合长向量（len > 16）
             let evals_parallel = EqPolynomial::evals_parallel(&r, None);
             let end_second = Instant::now();
+
+            // === 缓存版本性能测试 ===
+            // evals_serial_cached 不仅计算最终结果，还缓存所有中间层的评估表
+            // 返回 Vec<Vec<F>>，其中 result[j] 包含 eq(r[..j], x) 的所有评估
             let evals_serial_cached = EqPolynomial::evals_serial_cached(&r, None);
             let end_third = Instant::now();
+
+            // 输出性能对比信息
             println!(
                 "len: {}, Time taken to compute evals_serial: {:?}",
                 len,
@@ -299,23 +326,56 @@ mod tests {
                 len,
                 end_third - end_second
             );
+
+            // === 正确性验证 ===
+            // 验证串行版本和并行版本的结果完全一致
             assert_eq!(evals_serial, evals_parallel);
+
+            // 验证缓存版本的最后一层（完整评估表）与串行版本一致
+            // evals_serial_cached.last() 对应 eq(r[..len], x) = eq(r, x)
             assert_eq!(evals_serial, *evals_serial_cached.last().unwrap());
         }
     }
 
     #[test]
-    /// Test that the `i`th vector of `evals_serial_cached` is equivalent to
-    /// `evals(&r[..i])`, for all `i`.
+    /// 测试 `evals_serial_cached` 的缓存正确性。
+    ///
+    /// # 测试目的
+    /// 验证缓存版本返回的每一层评估表都正确对应于前缀挑战点的评估。
+    ///
+    /// # 验证逻辑
+    /// 对于缓存结果的第 i 层，应该等于对前缀 r[..i] 调用 evals 的结果：
+    /// ```text
+    /// evals_serial_cached(&r)[i] == evals(&r[..i])
+    /// ```
+    ///
+    /// # 数学含义
+    /// - evals_serial_cached[0] = [1]  (空前缀，恒为1)
+    /// - evals_serial_cached[1] = [1-r[0], r[0]]  (前缀 r[0])
+    /// - evals_serial_cached[2] = eq(r[..2], x) for x ∈ {0,1}²
+    /// - ...
+    /// - evals_serial_cached[len] = eq(r, x) for x ∈ {0,1}^len
     fn test_evals_cached() {
         let mut rng = test_rng();
+
+        // 测试向量长度从 2 到 21
         for len in 2..22 {
+            // 生成随机挑战点向量
             let r = (0..len)
                 .map(|_| <Fr as JoltField>::Challenge::random(&mut rng))
                 .collect::<Vec<_>>();
+
+            // 计算所有前缀的缓存评估表
+            // 返回 len+1 层，每层 i 包含 2^i 个评估值
             let evals_serial_cached = EqPolynomial::<Fr>::evals_serial_cached(&r, None);
+
+            // 逐层验证缓存结果的正确性
             for i in 0..len {
+                // 独立计算前缀 r[..i] 的评估表
                 let evals = EqPolynomial::<Fr>::evals(&r[..i]);
+
+                // 验证缓存的第 i 层与独立计算的结果完全一致
+                // 这确保了缓存版本在构建中间层时没有引入错误
                 assert_eq!(evals_serial_cached[i], evals);
             }
         }
