@@ -90,30 +90,40 @@ pub struct RamRaVirtualParams<F: JoltField> {
 }
 
 impl<F: JoltField> RamRaVirtualParams<F> {
+      /// 初始化 RA 虚拟多项式的参数。
+    ///
+    /// 此函数从 `opening_accumulator` 中获取先前 Sumcheck 阶段（`RamRaClaimReduction`）产生的声明（claim），
+    /// 并从其对应的随机打开点 `r` 中提取出“地址部分”和“周期/时间部分”。
+    /// 地址部分会被进一步拆分为多个块（chunk），以对应多线性扩展（MLE）中的 One-Hot 编码结构。
     pub fn new(
         trace_len: usize,
         one_hot_params: &OneHotParams,
         opening_accumulator: &dyn OpeningAccumulator<F>,
     ) -> Self {
+        // 计算 RAM 大小 K 的对数，即地址位数
         let log_K = one_hot_params.ram_k.log_2();
 
-        // Get the reduced RA claim from RA reduction sumcheck
+        // 从累加器中获取 RAM RA 多项式在先前 Sumcheck 协议中的打开点 `r` 和对应的评估值 `_ra_claim_reduced`。
+        // `r` 是一个合并后的随机向量，包含地址随机数和周期随机数。
         let (r, _ra_claim_reduced) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::RamRa,
             SumcheckId::RamRaClaimReduction,
         );
 
-        // Split the opening point into address and cycle parts
+        // 将总的随机打开点 `r` 切分为两部分：
+        // `r_address`: 前 log_K 个元素，对应于内存地址的变量绑定。
+        // `r_cycle`: 剩余的元素（log_T 个），对应于执行周期（时间步骤）的变量绑定。
         let (r_address, r_cycle) = r.split_at(log_K);
 
-        // Split r_address into chunks according to one-hot decomposition
+        // 根据 One-Hot 参数的配置，将 `r_address` 进一步切分成多个小块（chunks）。
+        // 这一步是为了适应内存构造中的分段查找逻辑（例如将大地址拆分为高低位段）。
         let r_address_chunks = one_hot_params.compute_r_address_chunks::<F>(&r_address.r);
 
         Self {
-            r_cycle,
-            r_address_chunks,
-            d: one_hot_params.ram_d,
-            log_T: trace_len.log_2(),
+            r_cycle,          // 用于绑定时间维度的随机点
+            r_address_chunks, // 处理后的地址维度随机点片段
+            d: one_hot_params.ram_d, // 多少个 One-Hot 段
+            log_T: trace_len.log_2(), // 执行痕迹长度的对数（时间步数）
         }
     }
 }
@@ -264,7 +274,7 @@ impl<F: JoltField> RamRaVirtualSumcheckVerifier<F> {
 }
 
 impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
-    for RamRaVirtualSumcheckVerifier<F>
+for RamRaVirtualSumcheckVerifier<F>
 {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         &self.params

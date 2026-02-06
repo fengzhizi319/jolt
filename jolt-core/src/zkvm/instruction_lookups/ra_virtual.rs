@@ -49,38 +49,78 @@ pub struct InstructionRaSumcheckParams<F: JoltField> {
 }
 
 impl<F: JoltField> InstructionRaSumcheckParams<F> {
+    /// 初始化上下文，负责重建完整的地址随机挑战点 `r_address` 并提取周期随机点 `r_cycle`。
+    ///
+    /// 在 Jolt 中，由于内存地址空间 (M) 可能很大（例如 2^64），直接对整个地址空间进行多项式承诺可能不切实际。
+    /// 因此，Read Access (RA) 多项式被切分成了多个“虚拟多项式” (`InstructionRa(i)`)，每个负责地址的一部分比特。
+    ///
+    /// 此函数的任务是将这些分散的随机点片段（chunks）重新拼接，以还原出 Verifier 在整个地址空间上进行一致性检查所需的完整随机向量。
+    ///
+    /// # 举例说明
+    ///
+    /// 假设系统的参数如下：
+    /// - `LOG_K` (总地址位数) = 64
+    /// - `ra_virtual_log_k_chunk` (每个虚拟多项式负责的地址位数) = 16
+    ///
+    /// 则 `n_virtual_ra_polys` = 64 / 16 = 4。我们需要 4 个虚拟多项式来覆盖整个地址空间。
+    ///
+    /// 在 Sumcheck 过程中，Prover 针对这 4 个多项式分别提供了 Opening，对应的随机点结构如下：
+    /// - `InstructionRa(0)` 打开点: `P0 = [r_addr_bits_0..16,  r_cycle_bits]`
+    /// - `InstructionRa(1)` 打开点: `P1 = [r_addr_bits_16..32, r_cycle_bits]`
+    /// - `InstructionRa(2)` 打开点: `P2 = [r_addr_bits_32..48, r_cycle_bits]`
+    /// - `InstructionRa(3)` 打开点: `P3 = [r_addr_bits_48..64, r_cycle_bits]`
+    ///
+    /// 此函数会遍历这 4 个 Opening：
+    /// 1. 调用 `split_at_r` 将 `r_cycle` 分离。
+    /// 2. 提取前半部分的地址片段 `r_address_chunk`。
+    /// 3. 将这些片段依次追加到 `r_address` Vec 中。
+    ///
+    /// 最终得到的 `r_address` 包含了完整的 64 个比特的随机性：`[r_addr_bits_0..64]`。
     pub fn new(
         one_hot_params: &OneHotParams,
         opening_accumulator: &dyn OpeningAccumulator<F>,
         transcript: &mut impl Transcript,
     ) -> Self {
-        // Extract the full r_address from the virtual ra_i openings.
+        // 用于存放重建后的完整地址随机挑战点 (长度应为 LOG_K)
         let mut r_address = Vec::new();
 
         let ra_virtual_log_k_chunk = one_hot_params.lookups_ra_virtual_log_k_chunk;
         let ra_committed_log_k_chunk = one_hot_params.log_k_chunk;
+
+        // 计算每个虚拟多项式包含多少个已提交的多项式块
         let n_committed_per_virtual = ra_virtual_log_k_chunk / ra_committed_log_k_chunk;
 
+        // 计算总共需要多少个虚拟多项式来覆盖整个 LOG_K 地址空间
         let n_virtual_ra_polys = LOG_K / ra_virtual_log_k_chunk;
         let n_committed_ra_polys = LOG_K / ra_committed_log_k_chunk;
 
+        // 遍历所有虚拟多项式，提取地址片段
         for i in 0..n_virtual_ra_polys {
+            // 从累加器中获取第 i 个 InstructionRa 多项式的 Opening Point (点 r)
             let (r, _) = opening_accumulator.get_virtual_polynomial_opening(
                 VirtualPolynomial::InstructionRa(i),
                 SumcheckId::InstructionReadRaf,
             );
 
+            // r 的结构是 [address_chunk_randomness, cycle_randomness]
+            // split_at_r 将其切分，我们只需要前半部分 (地址片段)
             let (r_address_chunk, _) = r.split_at_r(ra_virtual_log_k_chunk);
+
+            // 将片段拼接到总向量中
             r_address.extend_from_slice(r_address_chunk);
         }
 
+        // 提取 r_cycle (所有 chunk 共享同一个 cycle 随机点，取第 0 个即可)
         let (r, _) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::InstructionRa(0),
             SumcheckId::InstructionReadRaf,
         );
+        // split_at 将 r 切分为 [地址部分 (len=chunk), 周期部分 (其余)]
         let (_, r_cycle) = r.split_at(ra_virtual_log_k_chunk);
 
+        // 生成 gamma 的幂次，用于后续在此上下文中线性组合多个多项式项
         let gamma_powers = transcript.challenge_scalar_powers(n_virtual_ra_polys);
+
         Self {
             r_cycle,
             one_hot_params: one_hot_params.clone(),

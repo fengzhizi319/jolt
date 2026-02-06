@@ -85,27 +85,42 @@ pub struct AdviceClaimReductionPhase1Params<F: JoltField> {
     pub r_val_final: Option<OpeningPoint<BIG_ENDIAN, F>>,
 }
 
+
 impl<F: JoltField> AdviceClaimReductionPhase1Params<F> {
+    /// 初始化 Advice Sumcheck 第一阶段的参数。
+    ///
+    /// 这个阶段主要负责处理 Advice 数据的 multilinear extension（多线性扩展）结构，
+    /// 并计算从 Transcript 或 Accumulator 中获取的随机挑战点。
     pub fn new(
-        kind: AdviceKind,
-        memory_layout: &MemoryLayout,
-        trace_len: usize,
-        accumulator: &dyn OpeningAccumulator<F>,
-        transcript: &mut impl Transcript,
-        single_opening: bool,
+        kind: AdviceKind,                // Advice 的类型 (Trusted 或 Untrusted)
+        memory_layout: &MemoryLayout,    // 内存布局，包含 Advice 的最大允许大小
+        trace_len: usize,                // 执行痕迹的长度 (Trace Length, T)
+        accumulator: &dyn OpeningAccumulator<F>, // 包含之前步骤产生的多项式承诺打开值
+        transcript: &mut impl Transcript, // Fiat-Shamir 交互记录，用于生成随机数
+        single_opening: bool,            // 是否只需要单次打开（用于区分读写校验模式）
     ) -> Option<Self> {
+        // 1. 根据 Advice 类型确定其最大字节数
+        // Trusted Advice 由 Verifier 提供，Untrusted 由 Prover 提供
         let max_advice_size_bytes = match kind {
             AdviceKind::Trusted => memory_layout.max_trusted_advice_size as usize,
             AdviceKind::Untrusted => memory_layout.max_untrusted_advice_size as usize,
         };
 
+        // 2. 计算 Dory 承诺方案的主参数 (Main Trace)
         let log_t = trace_len.log_2();
+        // 获取 log_k_chunk (向量查找的参数)
         let log_k_chunk = OneHotConfig::new(log_t).log_k_chunk as usize;
+        // 计算主 Trace 的 sigma 和 nu。
+        // 在 Dory 中，数据被视为 Tensor，sigma 通常对应“列”的对数维度，nu 对应“行”的对数维度。
         let (sigma_main, _nu_main) = DoryGlobals::main_sigma_nu(log_k_chunk, log_t);
 
+        // 3. 从累加器中获取之前的随机挑战点 (Evaluation Points)
+        // 如果之前没有生成由于 Advice 相关的打开证明，这里会返回 None，导致初始化失败
         let r_val_eval = accumulator
             .get_advice_opening(kind, SumcheckId::RamValEvaluation)
             .map(|(p, _)| p)?;
+
+        // 如果不是 single_opening 模式，还需要获取 Final Evaluation 点（通常用于读写一致性检查的最后一跳）
         let r_val_final = if single_opening {
             None
         } else {
@@ -115,16 +130,30 @@ impl<F: JoltField> AdviceClaimReductionPhase1Params<F> {
         };
         let (r_val_eval, r_val_final) = (r_val_eval, r_val_final);
 
+        // 4. 从 Transcript 生成随机挑战标量 gamma
+        // gamma 通常用于线性组合多个多项式，将多项式校验压缩为一个
         let gamma: F = transcript.challenge_scalar();
 
+        // 5. 计算 Advice //特定// 的维度参数 (sigma_a, nu_a)
+        // Advice 的大小可能远小于主 Trace，因此其多项式变量数 (advice_vars) 可能较少
         let (sigma_a, nu_a) = DoryGlobals::advice_sigma_nu_from_max_bytes(max_advice_size_bytes);
         let advice_vars = sigma_a + nu_a;
 
+        // 6. 确定 Advice 变量在 "Cycle" (时间) 和 "Addr" (地址) 维度上的分配
+        // row_cycle 是主 Trace 中每行包含的 Cycle 变量数
         let row_cycle = DoryGlobals::cycle_row_len(log_t, sigma_main);
+
+        // 计算 Advice 中有多少变量属于 nu 部分且覆盖了 cycle 维度
         let nu_a_cycle = std::cmp::min(nu_a, row_cycle);
+        // 剩余的属于 address 维度
         let nu_a_addr = nu_a - nu_a_cycle;
 
-        // Phase 1 only needs to traverse the cycle gap if we actually need cycle-derived row bits.
+        // 7. 计算 "Dummy Rounds" (虚设轮次/填充轮次) 范围
+        // 核心逻辑：如果主 Sumcheck 协议运行 sigma_main 轮，但 Advice 只有 sigma_a 轮 (且 sigma_a < sigma_main)，
+        // 我们需要在中间插入“什么都不做”的轮次，以便将 Advice 的 Sumcheck 与主 Trace 的 Sumcheck 对齐。
+        //
+        // 范围是 [sigma_a, sigma_main)。
+        // 只有当 advice 确实使用了 cycle 维度的行变量 (nu_a_cycle > 0) 时，才需要通过这种方式跨越 gap。
         let (dummy_start, dummy_end) = if nu_a_cycle == 0 {
             (0, 0)
         } else {
@@ -150,6 +179,8 @@ impl<F: JoltField> AdviceClaimReductionPhase1Params<F> {
         })
     }
 
+    /// 判断当前 Sumcheck 轮次是否是虚设轮次。
+    /// 在虚设轮次中，Prover 通常发送常数多项式，或者 Verifier 不执行状态更新。
     #[inline]
     fn is_dummy_round(&self, local_round: usize) -> bool {
         self.dummy_start < self.dummy_end

@@ -88,26 +88,49 @@ pub struct IncClaimReductionSumcheckParams<F: JoltField> {
 }
 
 impl<F: JoltField> IncClaimReductionSumcheckParams<F> {
+    /// 初始化增量检查参数集合 (Increment Context)。
+    ///
+    /// 该函数从之前的证明步骤中收集必要的随机挑战点，用于证明 RAM 和寄存器的时间戳/增量的一致性。
+    ///
+    /// # 举例说明 (Example Context)
+    /// 假设我们要验证 RAM 的读写历史是否正确：
+    /// 1. 我们在 **Stage 2** 运行了一个 Sumcheck 协议，证明 RAM 读写的时间戳是递增的。Verifer 发送了随机点 `r_cycle_stage2`。
+    /// 2. 我们在 **Stage 4** 运行了另一个 Sumcheck，证明 RAM 在这些时刻的值是正确的。Verifer 发送了随机点 `r_cycle_stage4`。
+    ///
+    /// 现在的任务是将这些零散的证明步骤“缝合”在一起。这个函数就是“缝合针”的初始化，
+    /// 它从 `accumulator` 中把 `r_cycle_stage2` 和 `r_cycle_stage4` 取出来，并计算一个新的挑战标量 `gamma`
+    /// 用于将不同的约束线性组合起来。
     pub fn new(
         trace_len: usize,
         accumulator: &dyn OpeningAccumulator<F>,
         transcript: &mut impl Transcript,
     ) -> Self {
+        // 1. 生成全局挑战标量 gamma
+        // 这个标量用于随机线性组合 (Random Linear Combination)，将多个多项式等式压缩为一个等式进行检查。
+        // 例如：若要证明 A(x)=0 且 B(x)=0，只需证明 A(x) + gamma * B(x) = 0。
         let gamma: F = transcript.challenge_scalar();
         let gamma_sqr = gamma.square();
         let gamma_cub = gamma_sqr * gamma;
 
-        // Fetch opening points from accumulator
+        // 2. 获取 RAM 相关的随机挑战点 (Commitment: RamInc)
+        // -----------------------------------------------------------
+        // 提取 SumcheckId::RamReadWriteChecking 阶段使用的随机点。
+        // 这对应于验证 "RAM 读操作必须在最近一次写操作之后" 的逻辑。
         let (r_cycle_stage2, _) = accumulator.get_committed_polynomial_opening(
             CommittedPolynomial::RamInc,
             SumcheckId::RamReadWriteChecking,
         );
+
+        // 提取 SumcheckId::RamValEvaluation 阶段使用的随机点。
+        // 这对应于验证 "RAM 在该时刻的具体数值 (Value) 是多少"。
         let (r_cycle_stage4, _) = accumulator.get_committed_polynomial_opening(
             CommittedPolynomial::RamInc,
             SumcheckId::RamValEvaluation,
         );
 
-        // Debug assert: ValEvaluation and ValFinal have same opening point
+        // Debug Assert: 确保一致性
+        // 在 Debug 模式下，验证 ValEvaluation 和 ValFinalEvaluation 是否在同一个点上打开 RamInc 多项式。
+        // 理论上这两个阶段应该共享同一个随机点，如果不一致说明流程有 Bug。
         #[cfg(debug_assertions)]
         {
             let (r_cycle_stage4_final, _) = accumulator.get_committed_polynomial_opening(
@@ -120,18 +143,26 @@ impl<F: JoltField> IncClaimReductionSumcheckParams<F> {
             );
         }
 
+        // 3. 获取寄存器 (Register) 相关的随机挑战点 (Commitment: RdInc)
+        // -----------------------------------------------------------
+        // 提取 SumcheckId::RegistersReadWriteChecking 阶段使用的随机点。
+        // 类似于 RAM，这里验证寄存器 (Rd) 的读写时序一致性。
         let (s_cycle_stage4, _) = accumulator.get_committed_polynomial_opening(
             CommittedPolynomial::RdInc,
             SumcheckId::RegistersReadWriteChecking,
         );
+
+        // 提取 SumcheckId::RegistersValEvaluation 阶段使用的随机点。
+        // 验证寄存器 (Rd) 的具体数值。
         let (s_cycle_stage5, _) = accumulator.get_committed_polynomial_opening(
             CommittedPolynomial::RdInc,
             SumcheckId::RegistersValEvaluation,
         );
 
+        // 构建并返回包含所有必要参数的结构体
         Self {
             gamma_powers: [gamma, gamma_sqr, gamma_cub],
-            n_cycle_vars: trace_len.log_2(),
+            n_cycle_vars: trace_len.log_2(), // 变量个数 = log2(Trace长度)
             r_cycle_stage2,
             r_cycle_stage4,
             s_cycle_stage4,
@@ -210,7 +241,7 @@ impl<F: JoltField> IncClaimReductionSumcheckProver<F> {
 }
 
 impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
-    for IncClaimReductionSumcheckProver<F>
+for IncClaimReductionSumcheckProver<F>
 {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         &self.params
@@ -674,7 +705,7 @@ impl<F: JoltField> IncClaimReductionSumcheckVerifier<F> {
 }
 
 impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
-    for IncClaimReductionSumcheckVerifier<F>
+for IncClaimReductionSumcheckVerifier<F>
 {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         &self.params

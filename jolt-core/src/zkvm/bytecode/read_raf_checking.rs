@@ -126,12 +126,14 @@ pub struct BytecodeReadRafSumcheckProver<F: JoltField> {
 }
 
 impl<F: JoltField> BytecodeReadRafSumcheckProver<F> {
+
     #[tracing::instrument(skip_all, name = "BytecodeReadRafSumcheckProver::initialize")]
     pub fn initialize(
         params: BytecodeReadRafSumcheckParams<F>,
         trace: Arc<Vec<Cycle>>,
         bytecode_preprocessing: Arc<BytecodePreprocessing>,
     ) -> Self {
+        // 准备上一轮的 Claim，作为验证基准
         let claim_per_stage = [
             params.rv_claims[0] + params.gamma_powers[5] * params.raf_claim,
             params.rv_claims[1],
@@ -140,26 +142,34 @@ impl<F: JoltField> BytecodeReadRafSumcheckProver<F> {
             params.rv_claims[4],
         ];
 
-        // Two-table split-eq optimization for computing F[stage][k] = Σ_{c: PC(c)=k} eq(r_cycle, c).
+        // =================================================================================
+        // 核心算法：Split-Eq / Gruen Split 优化
+        // 目标：计算 F[stage][k] = Σ_{c: PC(c)=k} eq(r_cycle, c)
         //
-        // Double summation pattern:
-        //   F[stage][k] = Σ_{c_hi} E_hi[c_hi] × ( Σ_{c_lo : PC(c)=k} E_lo[c_lo] )
+        // 原理：利用 eq(r, c) = eq(r_hi, c_hi) * eq(r_lo, c_lo) 的张量积性质。
+        // 将总循环 T 拆分为 "c_hi (Outer)" 和 "c_lo (Inner)" 两层。
         //
-        // Inner sum (over c_lo): ADDITIONS ONLY - accumulate E_lo contributions by PC
-        // Outer sum (over c_hi): ONE multiplication per touched PC, not per cycle
+        // 1. Inner Loop (遍历 c_lo):
+        //    只进行纯加法累加。对于 block 内所有的 c_lo，通过 lookup 找到对应的 PC，
+        //    然后 accumulator[PC] += eq_lo[c_lo]。
+        //    这里完全不涉及乘法。
         //
-        // This reduces multiplications from O(T × N_STAGES) to O(touched_PCs × out_len × N_STAGES)
+        // 2. Outer Loop (遍历 c_hi):
+        //    对 Inner Loop 累加的结果进行一次性乘法。
+        //    F[PC] += eq_hi[c_hi] * accumulator[PC]。
+        //    通过这种方式，乘法次数从 T 降到了 (Touched_PCs * Sqrt(T)) 级别。
+        // =================================================================================
         let T = trace.len();
         let K = params.K;
         let log_T = params.log_T;
 
-        // Optimal split: sqrt(T) for balanced tables
+        // 最佳分割点：通常取 sqrt(T)，使内外层平衡
         let lo_bits = log_T / 2;
         let hi_bits = log_T - lo_bits;
-        let in_len: usize = 1 << lo_bits; // E_lo size (inner loop)
-        let out_len: usize = 1 << hi_bits; // E_hi size (outer loop)
+        let in_len: usize = 1 << lo_bits; // E_lo 长度 (Inner loop 大小)
+        let out_len: usize = 1 << hi_bits; // E_hi 长度 (Outer loop 大小)
 
-        // Pre-compute E_hi[stage][c_hi] and E_lo[stage][c_lo] for all stages in parallel
+        // 并行预计算 Eq table 的两部分：E_hi 和 E_lo
         let (E_hi, E_lo): ([Vec<F>; N_STAGES], [Vec<F>; N_STAGES]) = rayon::join(
             || {
                 params
@@ -175,31 +185,34 @@ impl<F: JoltField> BytecodeReadRafSumcheckProver<F> {
             },
         );
 
-        // Process by c_hi blocks, distributing work evenly among threads
+        // 并行 Map-Reduce 模式：将 c_hi 块分配给不同线程处理
         let num_threads = rayon::current_num_threads();
         let chunk_size = out_len.div_ceil(num_threads);
 
-        // Double summation: outer sum over c_hi, inner sum over c_lo
         let F: [Vec<F>; N_STAGES] = E_hi[0]
             .par_chunks(chunk_size)
             .enumerate()
             .map(|(chunk_idx, chunk)| {
-                // Per-thread accumulators for final F
+                // par_chunks 将 E_hi 切片，每个线程处理一部分 c_hi
+
+                // partial: 线程本地的最终累加结果 F[stage][k]
                 let mut partial: [Vec<F>; N_STAGES] =
                     array::from_fn(|_| unsafe_allocate_zero_vec(K));
 
-                // Per-c_hi inner accumulators (reused across c_hi iterations)
+                // inner: 用于 Inner Loop 的临时累加器。
+                // 存储 sum_{c_lo} E_lo[c_lo] for each PC within current c_hi block.
                 let mut inner: [Vec<F>; N_STAGES] = array::from_fn(|_| unsafe_allocate_zero_vec(K));
 
-                // Track which PCs were touched in this c_hi block
+                // touched: 记录当前 inner 循环中哪些 PC 被访问过，用于快速清空 inner 数组 (Sparse clear)
                 let mut touched = Vec::with_capacity(in_len);
 
                 let chunk_start = chunk_idx * chunk_size;
+                // 遍历分配给当前线程的每一個 c_hi
                 for (local_idx, _) in chunk.iter().enumerate() {
                     let c_hi = chunk_start + local_idx;
                     let c_hi_base = c_hi * in_len;
 
-                    // Clear inner accumulators for touched PCs only
+                    // 1. 重置 Inner Accumulator (仅清空非零项)
                     for &k in &touched {
                         for stage in 0..N_STAGES {
                             inner[stage][k] = F::zero();
@@ -207,27 +220,31 @@ impl<F: JoltField> BytecodeReadRafSumcheckProver<F> {
                     }
                     touched.clear();
 
-                    // INNER SUM: accumulate E_lo by PC (ADDITIONS ONLY, no multiplications)
+                    // 2. INNER SUM: 遍历 c_lo
+                    // 关键点：这里只做加法！
                     for c_lo in 0..in_len {
                         let c = c_hi_base + c_lo;
                         if c >= T {
                             break;
                         }
 
+                        // 从 Trace 中获取当前 Cycle 的 Program Counter (PC)
                         let pc = bytecode_preprocessing.get_pc(&trace[c]);
 
-                        // Track touched PCs (avoid duplicates with a simple check)
+                        // 记录访问过的 PC (避免重复 push)
                         if inner[0][pc].is_zero() {
                             touched.push(pc);
                         }
 
-                        // Accumulate E_lo contributions (addition only!)
+                        // 将 E_lo 的值累加到该 PC 对应的桶中
                         for stage in 0..N_STAGES {
                             inner[stage][pc] += E_lo[stage][c_lo];
                         }
                     }
 
-                    // OUTER SUM: multiply by E_hi and add to partial (sparse)
+                    // 3. OUTER SUM: 应用乘法权重
+                    // 也就是：Accumulator[PC] * E_hi[c_hi]
+                    // 仅遍历 touched (稀疏数组)，进一步减少计算量
                     for &k in &touched {
                         for stage in 0..N_STAGES {
                             partial[stage][k] += E_hi[stage][c_hi] * inner[stage][k];
@@ -237,6 +254,7 @@ impl<F: JoltField> BytecodeReadRafSumcheckProver<F> {
 
                 partial
             })
+            // Reduce: 将所有线程计算出的 partial F 向量按位相加，得到全局最终结果
             .reduce(
                 || array::from_fn(|_| unsafe_allocate_zero_vec(K)),
                 |mut a, b| {
@@ -252,7 +270,9 @@ impl<F: JoltField> BytecodeReadRafSumcheckProver<F> {
 
         #[cfg(test)]
         {
-            // Verify that for each stage i: sum(val_i[k] * F_i[k] * eq_i[k]) = rv_claim_i
+            // Debug 检查：
+            // 验证计算出的 F 向量是否满足 Sumcheck 定义：
+            // sum(Val(k) * F(k)) == Sum(Val(PC(t)) * Eq(r, t)) == Claim
             for i in 0..N_STAGES {
                 let computed_claim: F = (0..params.K)
                     .into_par_iter()
@@ -275,6 +295,7 @@ impl<F: JoltField> BytecodeReadRafSumcheckProver<F> {
 
         let F = F.map(MultilinearPolynomial::from);
 
+        // 创建用于后续轮次绑定的 GruenSplitEqPolynomial
         let gruen_eq_polys = params
             .r_cycles
             .each_ref()
@@ -1018,11 +1039,11 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
                 //   这些 Flags 将在下方作为指示函数（Indicator Functions，取值 0 或 1），参与到不同 Stage 的加权求和（RLC）中，
                 //   从而避免在后续计算中频繁重复解析指令。
                 let instr = instruction.normalize();
-                info!("Instruction: {:#?}", instr);
+                // info!("Instruction: {:#?}", instr);
                 let circuit_flags = instruction.circuit_flags();
                 let instr_flags = instruction.instruction_flags();
-                info!("Circuit Flags: {:#?}", circuit_flags);
-                info!("Instruction Flags: {:#?}", instr_flags);
+                // info!("Circuit Flags: {:#?}", circuit_flags);
+                // info!("Instruction Flags: {:#?}", instr_flags);
 
                 // =========================================================
                 // Stage 1: Spartan Outer Sumcheck (基础指令属性)
