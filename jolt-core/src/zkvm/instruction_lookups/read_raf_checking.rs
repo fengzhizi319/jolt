@@ -54,7 +54,7 @@ use crate::{
 };
 
 use rayon::iter::{IndexedParallelIterator, ParallelIterator};
-use tracing::info;
+// use tracing::info;
 // Instruction lookups: Read + RAF batched sumcheck
 //
 // Notation:
