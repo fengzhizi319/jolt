@@ -31,7 +31,7 @@ use allocative::Allocative;
 use allocative::FlameGraphBuilder;
 use common::jolt_device::MemoryLayout;
 use rayon::prelude::*;
-use tracing::info;
+// use tracing::info;
 use tracer::{instruction::Cycle, JoltDevice};
 
 /// Degree bound of the sumcheck round polynomials in [`ValFinalSumcheckVerifier`].

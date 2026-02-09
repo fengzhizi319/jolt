@@ -43,7 +43,7 @@ use common::constants::{REGISTER_COUNT, XLEN};
 use itertools::{zip_eq, Itertools};
 use rayon::prelude::*;
 use strum::{EnumCount, IntoEnumIterator};
-use tracing::info;
+// use tracing::info;
 use tracer::instruction::{Cycle, Instruction};
 
 /// Number of batched read-checking sumchecks bespokely
@@ -126,7 +126,11 @@ pub struct BytecodeReadRafSumcheckProver<F: JoltField> {
 }
 
 impl<F: JoltField> BytecodeReadRafSumcheckProver<F> {
-
+    ///
+    /// 它的核心任务是计算一个叫 $F(k)$ 的多项式（实际上是 5 个，对应 5 个 Stage），我们称之为 “加权频次多项式”。
+    /// 输入: 执行痕迹 (Trace)，其中记录了每个周期 $c$ 执行了哪个 PC。输出: 一个关于 ROM 地址 $k$ 的表格 $F[k]$。
+    /// 如：$$F[100] = eq(r, 1) + eq(r, 50) + eq(r, 99)$$。表示pc=100是在第 1、50、99 步执行的。
+    /// 后续计算$$\text{Total} = \sum \text{Val}(k) \cdot F(k)$$
     #[tracing::instrument(skip_all, name = "BytecodeReadRafSumcheckProver::initialize")]
     pub fn initialize(
         params: BytecodeReadRafSumcheckParams<F>,

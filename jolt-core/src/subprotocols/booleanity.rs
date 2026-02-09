@@ -238,6 +238,19 @@ impl<F: JoltField> BooleanitySumcheckProver<F> {
     /// - Compute G polynomials and RA indices in a single pass over the trace
     /// - Initialize split-eq polynomials for address (B) and cycle (D) variables
     /// - Initialize expanding table for phase 1
+
+    /// 初始化 BooleanitySumcheckProver (布尔性校验证明者)
+    ///
+    /// 主要解决的问题：
+    /// 1. **全量数据预处理**：将原始的 CPU 执行 Trace、字节码和内存布局转换为多项式形式，
+    ///    这是后续进行 Sumcheck 证明的基础。
+    /// 2. **跨维度预计算 (Optimization)**：
+    ///    本 Sumcheck 分为两个阶段（Phase 1: Address 维度, Phase 2: Cycle 维度）。
+    ///    为了在 Phase 1 高效计算，我们需要预先对 Cycle 维度进行求和（计算 G 数组），
+    ///    避免在每一轮 Phase 1 中都遍历整个 Cycle 维度，从而极大提升证明性能。
+    /// 3. **批处理权重设置**：
+    ///    我们需要同时证明几十个不同的 RA 多项式都是布尔值。为了在一个 Sumcheck 中完成，
+    ///    我们需要计算随机权重 gamma 的幂次，用于将这些多项式的约束线性组合在一起。
     #[tracing::instrument(skip_all, name = "BooleanitySumcheckProver::initialize")]
     pub fn initialize(
         params: BooleanitySumcheckParams<F>,
@@ -245,7 +258,16 @@ impl<F: JoltField> BooleanitySumcheckProver<F> {
         bytecode: &BytecodePreprocessing,
         memory_layout: &MemoryLayout,
     ) -> Self {
-        // Compute G and RA indices in a single pass over the trace
+        // =========================================================
+        // 1. 预计算核心多项式 G 和 Trace 索引
+        // ---------------------------------------------------------
+        // G[i][k] 是一个预聚合的数组。
+        // 原理：Sumcheck 公式中包含 eq(r_cycle, j)。在 Phase 1 (遍历地址 k) 时，
+        // j 相关的项是常数。我们可以预先计算 G_i(k) = sum_j (eq(r_cycle, j) * ra_i(k, j))。
+        // 这样在 Phase 1 对 k 进行 Sumcheck 时，就不需要再关心 j 维度了。
+        //
+        // ra_indices 则保存了压缩后的 Trace 信息，用于 Phase 2 恢复 ra 值。
+        // =========================================================
         let (G, ra_indices) = compute_all_G_and_ra_indices::<F>(
             trace,
             bytecode,
@@ -254,16 +276,37 @@ impl<F: JoltField> BooleanitySumcheckProver<F> {
             &params.r_cycle,
         );
 
-        // Initialize split-eq polynomials for address and cycle variables
+        // =========================================================
+        // 2. 初始化 Split-Eq 多项式
+        // ---------------------------------------------------------
+        // B: 对应地址维度 (Address) 的 eq(r_address, k)，用于 Phase 1。
+        // D: 对应时间维度 (Cycle) 的 eq(r_cycle, j)，用于 Phase 2。
+        // 使用 GruenSplitEqPolynomial 是为了通过动态规划实现 O(N) 的线性时间证明生成。
+        // =========================================================
         let B = GruenSplitEqPolynomial::new(&params.r_address, BindingOrder::LowToHigh);
         let D = GruenSplitEqPolynomial::new(&params.r_cycle, BindingOrder::LowToHigh);
 
-        // Initialize expanding table for phase 1
+        // =========================================================
+        // 3. 初始化动态规划表 (Phase 1)
+        // ---------------------------------------------------------
+        // F_table 用于在 Phase 1 过程中存储和更新中间计算结果，
+        // 配合 GruenSplitEqPolynomial 使用。
+        // =========================================================
         let k_chunk = 1 << params.log_k_chunk;
         let mut F_table = ExpandingTable::new(k_chunk, BindingOrder::LowToHigh);
         F_table.reset(F::one());
 
-        // Compute prover-only fields: gamma_powers (γ^i) and gamma_powers_inv (γ^{-i})
+        // =========================================================
+        // 4. 计算批处理系数 (Batching Coefficients)
+        // ---------------------------------------------------------
+        // 目标是证明 sum( gamma^2i * (x^2 - x) ) == 0。
+        // 这里我们预计算 gamma^i 和 gamma^(-i)。
+        //
+        // 技巧：
+        // 在 Phase 2，我们会把多项式 H_i 预先缩放为 rho_i * H_i (其中 rho_i = gamma^i)。
+        // 此时计算 (rho*H) * (rho*H - rho) = rho^2 * (H^2 - H) = gamma^2i * (H^2 - H)。
+        // 这样就把权重 gamma^2i 巧妙地融入到了多项式乘法中。
+        // =========================================================
         let num_polys = params.polynomial_types.len();
         let gamma_f: F = params.gamma.into();
         let mut gamma_powers = Vec::with_capacity(num_polys);
@@ -286,7 +329,7 @@ impl<F: JoltField> BooleanitySumcheckProver<F> {
             D,
             G,
             ra_indices,
-            H: None,
+            H: None, // H 将在 Phase 1 结束进入 Phase 2 时才初始化 (为了节省内存)
             F: F_table,
             eq_r_r: F::zero(),
             params,
@@ -526,8 +569,8 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T> for BooleanityS
 
         EqPolynomial::<F>::mle(sumcheck_challenges, &combined_r)
             * zip(&self.params.gamma_powers_square, ra_claims)
-                .map(|(gamma_2i, ra)| (ra.square() - ra) * gamma_2i)
-                .sum::<F>()
+            .map(|(gamma_2i, ra)| (ra.square() - ra) * gamma_2i)
+            .sum::<F>()
     }
 
     fn cache_openings(

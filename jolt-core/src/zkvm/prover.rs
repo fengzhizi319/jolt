@@ -1919,13 +1919,35 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             self.rw_config.needs_single_advice_opening(self.trace.len().log_2()),
         );
 
-        // 处理 Untrusted Advice (通常指读写内存 RAM)
+        // ------------------------------------------------------------------------
+        // G. 初始化不可信 Advice 归约参数 (Untrusted Advice Reduction - Phase 1)
+        // ------------------------------------------------------------------------
+        // [功能]
+        // 为不可信 Advice（即 Prover 提供的私有 Witness，通常是 RAM 的读写记录和排序后的 Trace）
+        // 准备第一阶段的归约参数。
+        //
+        // [算法原理: Offline Memory Checking 的两阶段归约]
+        // 离线内存检查的核心是证明两个多重集合相等：{Reads} ∪ {Final} == {Writes} ∪ {Init}。
+        // 在 Jolt 中，这个检查通过“Advice”机制实现。
+        // 由于直接校验巨大的 Trace (时间和空间两个维度) 开销太大，Jolt 将其分为两阶段：
+        // - Phase 1 (Stage 6): 消除不确定性最大的维度（通常是时间/Cycle维度），利用随机数 γ 将多维问题折叠。
+        // - Phase 2 (Stage 7): 处理剩下的空间/地址维度。
+        //
+        // 此处生成的 Gamma (随机挑战值) 实际上是将 Check(t, a, v) 压缩的一个关键系数。
+        // 公式概念：Claim_total = \sum_{t} (\gamma^t * Claim_t)
+        // 这样就把对所有时间步的检查，归约成了对一个聚合值的检查。
+        //
+        // [参数详解]
+        // - AdviceKind::Untrusted: 指定处理的是 RAM 读写记录（隐私数据）。
+        // - memory_layout: 内存配置，决定了 Advice 数据块的大小和结构。
+        // - transcript: 用于生成密码学安全的随机数 γ (Gamma)，确保归约过程的安全性。
         let untrusted_advice_phase1_params = AdviceClaimReductionPhase1Params::new(
             AdviceKind::Untrusted,
             &self.program_io.memory_layout,
-            self.trace.len(),
-            &self.opening_accumulator,
-            &mut self.transcript,
+            self.trace.len(),           // Trace 长度，即时间维度的大小 (T)
+            &self.opening_accumulator,  // 之前阶段产生的 Claim 累加器，作为归约的输入源
+            &mut self.transcript,       // 从这里挤出随机挑战
+            // 根据配置决定是否需要特殊的单点 Opening 优化
             self.rw_config.needs_single_advice_opening(self.trace.len().log_2()),
         );
 
@@ -1934,29 +1956,118 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         // 根据上面生成的参数，构建实际执行 Sumcheck 协议的对象。
         // =========================================================
 
+        // ------------------------------------------------------------------------
+        // 2a. 初始化字节码读取一致性检查器 (Bytecode Read RAF Prover)
+        // ------------------------------------------------------------------------
+        // [功能]
+        // 证明 CPU 在执行过程中“读取到的指令”确实来自“预设的程序代码 (Bytecode/ROM)”。
+        // 防止“代码注入攻击”或“执行非法指令”。
+        //
+        // [主要公式: Read Access Frequency (RAF) / Lookup Argument]
+        // 这里的核心思想是证明“执行流集合”包含于“ROM 集合”。
+        // 设 Program 为 {(PC_i, Inst_i)} 的集合。
+        // 设 Trace 为 {(PC_t, Inst_t)} 的执行序列。
+        //
+        // Prover 必须证明：对于 Trace 中的每一步 t，元组 (PC_t, Inst_t) 都在 Program 集合中。
+        // 具体通过比较两个多项式的评估值实现：
+        // \sum_{t \in Trace} \frac{1}{Input(PC_t, Inst_t) + \beta} == \sum_{i \in ROM} \frac{Counter_i}{Table(PC_i, Inst_i) + \beta}
+        //
+        // - Left Side: 实际执行时的“读取请求”总和。
+        // - Right Side: ROM 端的“供给”总和（Counter_i 表示第 i 条指令被执行了多少次）。
+        //
+        // [输入]
+        // - bytecode_read_raf_params: 包含随机挑战 β 和 γ。
+        // - trace: 包含实际执行时的 PC 和 Instruction。
+        // - bytecode: 包含静态的程序代码（只读真值表）。
         let bytecode_read_raf = BytecodeReadRafSumcheckProver::initialize(
             bytecode_read_raf_params,
             Arc::clone(&self.trace),
             Arc::clone(&self.preprocessing.shared.bytecode),
         );
+        // ------------------------------------------------------------------------
+        // 2b. 初始化 RAM 汉明重量布尔性检查器 (RAM Hamming Booleanity Prover)
+        // ------------------------------------------------------------------------
+        // [功能]
+        // 验证 RAM 子系统中使用的特定的辅助标志位是否严格为 0 或 1。
+        //
+        // [核心公式 / 约束]
+        // Constraint: x * (x - 1) == 0
+        //
+        // [背景]
+        // 在内存一致性检查中，经常需要统计“某操作发生了多少次”（例如：读计数、写计数）。
+        // 这些计数通常基于标志位（Flag），如果 Flag=1 表示发生，Flag=0 表示未发生。
+        // 如果恶意 Prover 将 Flag 设为 2 或 -1，虽然也是整数，但会导致计数统计（Sum）出错，
+        // 从而绕过“读写次数平衡”的检查。此检查器强制这些标志必须是布尔值。
         let ram_hamming_booleanity =
             HammingBooleanitySumcheckProver::initialize(ram_hamming_booleanity_params, &self.trace);
 
+        // ------------------------------------------------------------------------
+        // 2c. 初始化通用位有效性检查器 (Booleanity Prover)
+        // ------------------------------------------------------------------------
+        // [功能]
+        // 扫描 Trace 中所有被定义为 "Bit" 类型的数据列（包括寄存器值的二进制分解位、CPU 状态标志等），
+        // 验证它们的值确实属于 {0, 1}。
+        //
+        // [核心公式 / 约束]
+        // For all bit-columns v, for all steps t: v_{t} * (v_{t} - 1) == 0
+        //
+        // [背景 / 必要性]
+        // Jolt/Lasso 查找算法的核心是将 64 位大整数分解为多个小块（Chunks/Bits）分别查表。
+        // 这种算术化方案假设了分解出的每一位都是二进制的。
+        // 如果分解出的“某个位”是 5，根据公式 Value = \sum 2^i * bit_i，重建出的值可能依然能骗过某些检查，
+        // 但这破坏了查找表索引必须在 [0, TableSize) 范围内的前提。此步骤是系统安全性的基石。
         let booleanity = BooleanitySumcheckProver::initialize(
             booleanity_params,
             &self.trace,
-            &self.preprocessing.shared.bytecode, // 某些指令自带常数，需要 Bytecode 信息
+            &self.preprocessing.shared.bytecode, // 需要 Bytecode 信息，因为立即数分解也包含在检查范围内
             &self.program_io.memory_layout,
         );
 
+        // ------------------------------------------------------------------------
+        // 2d. 初始化 RAM 虚拟地址/分块检查器 (RAM Read Access Virtual Prover)
+        // ------------------------------------------------------------------------
+        // [功能]
+        // 验证 RAM 访问地址的分解构建逻辑。
+        // 证明：用于查表的“分块地址”（Chunks）重新组合后，确实等于 Trace 中记录的“完整 64 位物理地址”。
+        //
+        // [核心公式]
+        // Address_{trace} == \sum_{i=0}^{k} Chunk_i * (2^{chunk\_bits})^i
+        //
+        // [背景]
+        // 为了查表效率，Jolt 不会建立一个 2^64 大小的 RAM 表，而是将地址切碎查多个小表。
+        // Prover 必须证明它用来查小表的索引（Chunks）不是瞎编的，而是诚实地来自当前指令要访问的那个内存地址。
         let ram_ra_virtual = RamRaVirtualSumcheckProver::initialize(
             ram_ra_virtual_params,
             &self.trace,
             &self.program_io.memory_layout,
             &self.one_hot_params,
         );
+
+        // ------------------------------------------------------------------------
+        // 2e. 初始化指令查找表虚拟地址检查器 (Instruction Lookups Virtual Prover)
+        // ------------------------------------------------------------------------
+        // [功能]
+        // 类似于上面的 RAM 检查，但对象是“指令执行结果查找表”。
+        // 验证指令的操作数（如 rs1, rs2）被正确分解为用于查表的 Chunks。
+        //
+        // [逻辑]
+        // 比如执行 ADD r1, r2。虚拟机不是真做加法，而是用 r1, r2 的值去查 "ADD 表"。
+        // 此 Prover 保证查表用的索引确实来自 Trace 中的 r1 和 r2 数据，防止“移花接木”攻击。
         let lookups_ra_virtual =
             LookupsRaSumcheckProver::initialize(lookups_ra_virtual_params, &self.trace);
+
+        // ------------------------------------------------------------------------
+        // 2f. 初始化增量/计数器归约检查器 (Increment Reduction Prover)
+        // ------------------------------------------------------------------------
+        // [功能]
+        // 处理与全局计数器、时间戳增量或 Padding 相关的 Claim 归约。
+        // “Reduction” 意为将复杂的集合检查归约为简单的多项式评估。
+        //
+        // [背景]
+        // 在离线内存检查（Offline Memory Checking）中，为了区分同一地址的不同次写入，
+        // 通常会引入全局计数器或时间戳（Timestamp）。
+        // 此组件负责验证这些计数器相关的属性（例如：是否存在非法的跳变，或 Padding 部分是否处理正确），
+        // 它是内存一致性证明中不可或缺的辅助环节。
         let inc_reduction =
             IncClaimReductionSumcheckProver::initialize(inc_reduction_params, self.trace.clone());
 

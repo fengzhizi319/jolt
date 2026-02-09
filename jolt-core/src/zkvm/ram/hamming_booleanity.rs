@@ -73,22 +73,40 @@ pub struct HammingBooleanitySumcheckProver<F: JoltField> {
 }
 
 impl<F: JoltField> HammingBooleanitySumcheckProver<F> {
-    #[tracing::instrument(skip_all, name = "RamHammingBooleanitySumcheckProver::initialize")]
-    pub fn initialize(params: HammingBooleanitySumcheckParams<F>, trace: &[Cycle]) -> Self {
-        let H = trace
-            .par_iter()
-            .map(|cycle| cycle.ram_access().address() != 0)
-            .collect::<Vec<bool>>();
-        let H = MultilinearPolynomial::from(H);
+       #[tracing::instrument(skip_all, name = "RamHammingBooleanitySumcheckProver::initialize")]
+       /// 该 Sumcheck 的主要目的是强制约束 RAM 访问指示信号必须是布尔值（0 或 1）。
+       /// 如果没有这个约束，恶意 Prover 可能会在计算“发生了多少次 RAM 访问”时使用非 0/1 的值（例如 2 或 -1）进行欺骗，从而破坏内存一致性检查。
+       pub fn initialize(params: HammingBooleanitySumcheckParams<F>, trace: &[Cycle]) -> Self {
+           // =========================================================
+           // 1. 构建 RAM 访问指示向量 H (Indicator Vector)
+           // ---------------------------------------------------------
+           // 这里的 H(t) 代表：在第 t 个 CPU 周期，是否发生了有效的 RAM 访问。
+           // - 如果地址 != 0，视为有效访问 (1/True)。
+           // - 如果地址 == 0 (通常表示空操作或无访问)，视为无访问 (0/False)。
+           //
+           // 解决的核心问题 (Booleanity Check)：
+           // 我们必须向 Verifier 证明这个 H 向量中的每一个元素都严格属于 {0, 1}。
+           // 只有这样，后续累加 H 来计算“总访问次数”或“汉明重量”才是合法的。
+           // 证明方法是验证恒等式：H^2 - H = 0 (即 x(x-1)=0 => x=0 or 1)。
+           // =========================================================
+           let H = trace
+               .par_iter()
+               .map(|cycle| cycle.ram_access().address() != 0)
+               .collect::<Vec<bool>>();
 
-        let eq_r_cycle = GruenSplitEqPolynomial::new(&params.r_cycle.r, BindingOrder::LowToHigh);
+           // 将布尔向量转换为多线性多项式 (MLE)，作为 Sumcheck 的 Witness
+           let H = MultilinearPolynomial::from(H);
 
-        Self {
-            eq_r_cycle,
-            H,
-            params,
-        }
-    }
+           // 初始化 Eq(r_cycle, t) 多项式
+           // 用于在 Sumcheck 协议中对所有时间步 t 进行加权求和
+           let eq_r_cycle = GruenSplitEqPolynomial::new(&params.r_cycle.r, BindingOrder::LowToHigh);
+
+           Self {
+               eq_r_cycle,
+               H,
+               params,
+           }
+       }
 }
 
 impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
