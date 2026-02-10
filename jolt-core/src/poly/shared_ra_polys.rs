@@ -234,9 +234,16 @@ pub fn compute_all_G_and_ra_indices<F: JoltField>(
     r_cycle: &[F::Challenge],
 ) -> (Vec<Vec<F>>, Vec<RaIndices>) {
     let T = trace.len();
-    // Pre-allocate ra_indices
+    // 预分配用于存储每一步 Trace 对应的索引数据的向量 (RaIndices)。
+    // 使用 unsafe_allocate_zero_vec 避免默认初始化的开销，
+    // 因为 RaIndices 的零值位模式是合法的（只要不包含非法的 enum tag）。
     let mut ra_indices: Vec<RaIndices> = unsafe_allocate_zero_vec(T);
 
+    // 调用核心实现函数。
+    // 关键点：传入了 Some(&mut ra_indices)。
+    // 这指示 impl 函数在遍历 Trace 计算 G 值（加权和）的同时，
+    // 将解析出的指令/内存 chunk 索引直接写入到 ra_indices 中。
+    // 这种“单次遍历 (Single-pass)”设计避免了为了获取索引而对巨大的 Trace 进行第二次遍历。
     let G = compute_all_G_impl::<F>(
         trace,
         bytecode,
@@ -246,6 +253,7 @@ pub fn compute_all_G_and_ra_indices<F: JoltField>(
         Some(&mut ra_indices),
     );
 
+    // 返回计算出的多项式评估值 G 和 填充好的索引数据
     (G, ra_indices)
 }
 
@@ -255,87 +263,112 @@ pub fn compute_all_G_and_ra_indices<F: JoltField>(
 /// This is safe because each cycle index is visited exactly once (disjoint writes).
 #[inline(always)]
 fn compute_all_G_impl<F: JoltField>(
-    trace: &[Cycle],
-    bytecode: &BytecodePreprocessing,
-    memory_layout: &MemoryLayout,
-    one_hot_params: &OneHotParams,
-    r_cycle: &[F::Challenge],
-    ra_indices: Option<&mut [RaIndices]>,
-) -> Vec<Vec<F>> {
-    // Convert to usize for thread safety (usize is Send + Sync, raw pointers are not Sync)
+    trace: &[Cycle],                   // 执行痕迹
+    bytecode: &BytecodePreprocessing,  // 预处理字节码
+    memory_layout: &MemoryLayout,      // 内存布局
+    one_hot_params: &OneHotParams,     // 切片参数 (如 K=256)
+    r_cycle: &[F::Challenge],          // Sumcheck 时间维度的随机挑战点
+    ra_indices: Option<&mut [RaIndices]>, // (可选) 用于输出提取出的切片索引
+) -> Vec<Vec<F>> { // 返回计算好的 G 表: G[poly_idx][value_k]
+
+    // ----------------------------------------------------------------
+    // 1. 线程安全准备
+    // ----------------------------------------------------------------
+    // 将可变引用转换为 usize (原始指针地址)，以便在 Rayon 并行闭包中传递。
+    // Rust 的安全机制通常禁止跨线程共享可变引用，但这里我们会手动保证互斥写入。
     let ra_ptr_usize: usize = ra_indices.map(|s| s.as_mut_ptr() as usize).unwrap_or(0);
-    // Verify bounds once at the start
+    // 检查参数边界
     assert_ra_bounds(one_hot_params);
 
-    let K = one_hot_params.k_chunk;
+    let K = one_hot_params.k_chunk; // 值域大小 (通常 256)
+    // 各类数据的切片数量
     let instruction_d = one_hot_params.instruction_d;
     let bytecode_d = one_hot_params.bytecode_d;
     let ram_d = one_hot_params.ram_d;
-    let N = instruction_d + bytecode_d + ram_d;
-    let T = trace.len();
+    let N = instruction_d + bytecode_d + ram_d; // 总多项式数量
+    let T = trace.len(); // Trace 长度
 
-    // Two-table split-eq:
-    // EqPolynomial::evals uses big-endian bit order: r_cycle[0] is MSB, r_cycle[last] is LSB.
-    // To get contiguous blocks in the cycle index, we split off the LSB half (suffix) as E_lo.
+    // ----------------------------------------------------------------
+    // 2. Split-Eq 准备 (双重求和优化)
+    // ----------------------------------------------------------------
+    // 将随机点 r_cycle 拆分为高位和低位，分别计算 Eq 表。
+    // 这是为了把 O(T) 次乘法转化为 O(sqrt(T)) 次乘法。
     let log_T = r_cycle.len();
     let lo_bits = log_T / 2;
     let hi_bits = log_T - lo_bits;
     let (r_hi, r_lo) = r_cycle.split_at(hi_bits);
 
+    // 并行计算 E_hi 和 E_lo
+    // E_lo 大小约 sqrt(T)，E_hi 大小约 sqrt(T)
     let (E_hi, E_lo) = rayon::join(
         || EqPolynomial::<F>::evals(r_hi),
         || EqPolynomial::<F>::evals(r_lo),
     );
 
-    let in_len = E_lo.len(); // 2^lo_bits
+    let in_len = E_lo.len(); // 内层循环长度 (2^lo_bits)
 
-    // Split E_hi into exactly num_threads chunks to minimize allocations
-    // Each thread allocates ONE partial_G and processes its entire chunk.
+    // ----------------------------------------------------------------
+    // 3. 并行 Map-Reduce 核心逻辑
+    // ----------------------------------------------------------------
     let num_threads = rayon::current_num_threads();
-    let out_len = E_hi.len(); // 2^hi_bits
+    let out_len = E_hi.len(); // 外层循环长度
     let chunk_size = out_len.div_ceil(num_threads);
 
-    // Parallel map over thread chunks using deferred reduction
+    // 对 E_hi 进行分块，每个线程处理一块 E_hi (即一批高位时间)
     E_hi.par_chunks(chunk_size)
         .enumerate()
         .map(|(chunk_idx, chunk)| {
-            // Allocate separate arrays per polynomial type
+            // --- 线程局部变量分配 ---
+
+            // partial_*: 存储最终加权结果 (需要乘法)
+            // 初始化为 0
             let mut partial_instruction: Vec<Vec<F>> = (0..instruction_d)
                 .map(|_| unsafe_allocate_zero_vec(K))
                 .collect();
+            // ... (bytecode 和 ram 的分配省略，同上)
             let mut partial_bytecode: Vec<Vec<F>> = (0..bytecode_d)
                 .map(|_| unsafe_allocate_zero_vec(K))
                 .collect();
             let mut partial_ram: Vec<Vec<F>> =
                 (0..ram_d).map(|_| unsafe_allocate_zero_vec(K)).collect();
 
-            // Reusable local unreduced accumulators (5-limb) and touched flags
+            // local_*: 存储内层循环的累加结果 (只做加法)
+            // 使用 Unreduced<5> 类型：这是关键优化，允许累加 5 次才做一次取模，减少开销。
             let mut local_instruction: Vec<Vec<F::Unreduced<5>>> = (0..instruction_d)
                 .map(|_| unsafe_allocate_zero_vec(K))
                 .collect();
+            // ... (同上)
             let mut local_bytecode: Vec<Vec<F::Unreduced<5>>> = (0..bytecode_d)
                 .map(|_| unsafe_allocate_zero_vec(K))
                 .collect();
             let mut local_ram: Vec<Vec<F::Unreduced<5>>> =
                 (0..ram_d).map(|_| unsafe_allocate_zero_vec(K)).collect();
+
+            // touched_*: 稀疏集 (Sparse Set)
+            // 记录哪些值 k 在当前循环中被访问过，避免遍历整个大小为 K 的数组来清零。
             let mut touched_instruction: Vec<FixedBitSet> =
                 vec![FixedBitSet::with_capacity(K); instruction_d];
+            // ...
             let mut touched_bytecode: Vec<FixedBitSet> =
                 vec![FixedBitSet::with_capacity(K); bytecode_d];
             let mut touched_ram: Vec<FixedBitSet> = vec![FixedBitSet::with_capacity(K); ram_d];
 
             let chunk_start = chunk_idx * chunk_size;
-            for (local_idx, &e_hi) in chunk.iter().enumerate() {
-                let c_hi = chunk_start + local_idx;
-                let c_hi_base = c_hi * in_len;
 
-                // Clear touched flags and local accumulators for this c_hi
+            // --- 遍历外层块 (High Bits of Time) ---
+            for (local_idx, &e_hi) in chunk.iter().enumerate() {
+                let c_hi = chunk_start + local_idx; // 当前高位时间索引
+                let c_hi_base = c_hi * in_len;      // 当前块的起始绝对时间
+
+                // 3.1 清理上一轮的脏数据 (Reset accumulators)
+                // 利用 touched set 只清空非零项，极快。
                 for i in 0..instruction_d {
                     for k in touched_instruction[i].ones() {
                         local_instruction[i][k] = Default::default();
                     }
                     touched_instruction[i].clear();
                 }
+                // ... (bytecode/ram 清理代码略)
                 for i in 0..bytecode_d {
                     for k in touched_bytecode[i].ones() {
                         local_bytecode[i][k] = Default::default();
@@ -349,39 +382,42 @@ fn compute_all_G_impl<F: JoltField>(
                     touched_ram[i].clear();
                 }
 
-                // Sequential over c_lo (contiguous cycles for this c_hi)
+                // 3.2 内层循环 (Low Bits of Time) - 只有加法！
                 for c_lo in 0..in_len {
-                    let j = c_hi_base + c_lo;
+                    let j = c_hi_base + c_lo; // 绝对时间索引 j
                     if j >= T {
                         break;
                     }
 
-                    // Get 4-limb unreduced representation
+                    // 获取 E_lo[c_lo] 的值 (权重)
                     let add = *E_lo[c_lo].as_unreduced_ref();
 
+                    // 从 Trace 中提取所有切片索引 (关键逻辑)
+                    // RaIndices 包含：指令切片、字节码切片、RAM切片
                     let ra_idx =
                         RaIndices::from_cycle(&trace[j], bytecode, memory_layout, one_hot_params);
 
-                    // Write ra_indices if collecting (disjoint write, each j visited once)
+                    // 如果需要，保存提取出的索引 (Phase 2 用)
                     if ra_ptr_usize != 0 {
-                        // SAFETY: Each j value is unique across all parallel iterations,
-                        // so this write is to a disjoint index. No data race possible.
+                        // SAFETY: j 在所有并行线程中是唯一的，不会发生数据竞争。
                         unsafe {
                             let ra_ptr = ra_ptr_usize as *mut RaIndices;
                             *ra_ptr.add(j) = ra_idx;
                         }
                     }
 
-                    // InstructionRa contributions (unreduced accumulation)
+                    // --- 累加权重到对应的桶 (Binning) ---
+
+                    // 处理 Instruction Chunks
                     for i in 0..instruction_d {
-                        let k = ra_idx.instruction[i] as usize;
+                        let k = ra_idx.instruction[i] as usize; // 切片值 k
                         if !touched_instruction[i].contains(k) {
-                            touched_instruction[i].insert(k);
+                            touched_instruction[i].insert(k); // 标记 k 被触碰
                         }
-                        local_instruction[i][k] += add;
+                        local_instruction[i][k] += add; // 累加 E_lo
                     }
 
-                    // BytecodeRa contributions (unreduced accumulation)
+                    // 处理 Bytecode Chunks
                     for i in 0..bytecode_d {
                         let k = ra_idx.bytecode[i] as usize;
                         if !touched_bytecode[i].contains(k) {
@@ -390,7 +426,7 @@ fn compute_all_G_impl<F: JoltField>(
                         local_bytecode[i][k] += add;
                     }
 
-                    // RamRa contributions (may be None, unreduced accumulation)
+                    // 处理 RAM Chunks (可能有 None，表示无 RAM 操作)
                     for i in 0..ram_d {
                         if let Some(k) = ra_idx.ram[i] {
                             let k = k as usize;
@@ -402,13 +438,17 @@ fn compute_all_G_impl<F: JoltField>(
                     }
                 }
 
-                // Barrett reduce and scale by E_hi[c_hi], only for touched indices
+                // 3.3 外层折叠 (High Bits Contribution) - 只有这里做乘法！
+                // 遍历刚才内层循环触碰过的所有 k
                 for i in 0..instruction_d {
                     for k in touched_instruction[i].ones() {
+                        // Barrett Reduction: 将累加了多次的大数取模归一化
                         let reduced = F::from_barrett_reduce::<5>(local_instruction[i][k]);
+                        // 核心公式: G[k] += E_hi * sum(E_lo)
                         partial_instruction[i][k] += e_hi * reduced;
                     }
                 }
+                // ... (bytecode/ram 折叠代码略，逻辑同上)
                 for i in 0..bytecode_d {
                     for k in touched_bytecode[i].ones() {
                         let reduced = F::from_barrett_reduce::<5>(local_bytecode[i][k]);
@@ -423,13 +463,17 @@ fn compute_all_G_impl<F: JoltField>(
                 }
             }
 
-            // Combine into single Vec<Vec<F>> in order: instruction, bytecode, ram
+            // 合并当前线程的结果
             let mut result: Vec<Vec<F>> = Vec::with_capacity(N);
             result.extend(partial_instruction);
             result.extend(partial_bytecode);
             result.extend(partial_ram);
             result
         })
+        // ----------------------------------------------------------------
+        // 4. Reduce 阶段
+        // ----------------------------------------------------------------
+        // 将所有并行线程计算出的 partial_G 向量相加，得到全局唯一的 G 表
         .reduce(
             || (0..N).map(|_| unsafe_allocate_zero_vec::<F>(K)).collect(),
             |mut a, b| {
