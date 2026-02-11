@@ -102,29 +102,70 @@ const N_STAGES: usize = 5;
 pub struct BytecodeReadRafSumcheckProver<F: JoltField> {
     /// Per-stage address MLEs F_i(k) built from eq(r_cycle_stage_i, (chunk_index, j)),
     /// bound high-to-low during the address-binding phase.
+    ///
+    /// 每个阶段的地址多线性扩张 (MLE) F_i(k)。
+    /// 这里的 F[stage][k] 代表了“加权频次表”。对于给定的 ROM 地址 k，
+    /// F[k] = sum_{t where PC(t)=k} eq(r_cycle, t)。
+    /// 也就是说，它统计了地址 k 在整个执行 trace 中被访问了多少次，并未每一次访问赋予了一个基于时间的随机权重 eq(r, t)。
+    /// 在地址绑定阶段（前 log_K 轮），这些多项式会被从高位到低位逐轮折叠（bound）。
     F: [MultilinearPolynomial<F>; N_STAGES],
+
     /// Chunked RA polynomials over address variables (one per dimension `d`), used to form
     /// the product ∏_i ra_i during the cycle-binding phase.
+    ///
+    /// 分块的 RA (Read Access) 多项式，定义在地址变量上。
+    /// 这里的 `ra` 实际上存储的是 trace 中每一行对应的 PC 的二进制位的分块表示。
+    /// 在周期绑定阶段（后 log_T 轮）使用，我们需要证明 trace 中的 PC 与我们声称的地址相符。
+    /// 它用于构建指示函数：当且仅当 cycle t 的地址等于特定的 k 时，值为 1。
     ra: Vec<RaPolynomial<u8, F>>,
+
     /// Binding challenges for the first log_K variables of the sumcheck
+    ///
+    /// 存储 Sumcheck 前 log_K 轮（地址绑定阶段）收到的 Verifier 随机挑战数。
+    /// 这些随机数共同确定了最终的随机地址 r_address。
     r_address_prime: Vec<F::Challenge>,
+
     /// Per-stage Gruen-split eq polynomials over cycle vars (low-to-high binding order).
+    ///
+    /// 每个阶段针对周期变量（Cycle variables）的 Gruen-split Eq 多项式。
+    /// 在 Sumcheck 的后 log_T 轮（时间绑定阶段），我们需要计算 eq(r_cycle, t)。
+    /// Gruen-split 是一种高效维护 eq 多项式折叠状态的技术，这里的绑定顺序是从低位到高位。
     gruen_eq_polys: [GruenSplitEqPolynomial<F>; N_STAGES],
+
     /// Previous-round claims s_i(0)+s_i(1) per stage, needed for degree-3 univariate recovery.
+    ///
+    /// 每个阶段上一轮的 claim 值（s_i(0) + s_i(1)）。
+    /// 在构建当前轮次的 3 次单变量多项式时，需要用到上一轮的 sum 信息来恢复系数。
     prev_round_claims: [F; N_STAGES],
+
     /// Round polynomials per stage for advancing to the next claim at r_j.
+    ///
+    /// 每个阶段当前轮次生成的单变量多项式。
+    /// Prover 计算出这些多项式后发送给 Verifier，并在进入下一轮前用随机点 r_j 进行评估以更新 Claim。
     prev_round_polys: Option<[UniPoly<F>; N_STAGES]>,
+
     /// Final sumcheck claims of stage Val polynomials (with RAF Int folded where applicable).
+    ///
+    /// 阶段 Val 多项式的最终 Sumcheck Claim（在适用处折叠了 RAF Int 多项式）。
+    /// 在地址绑定阶段结束时（前 log_K 轮结束），静态的 Val(k) 多项式已经被完全折叠成一个标量值：Val(r_address)。
+    /// 这个值将在剩下的 log_T 轮中作为常数系数乘在 Eq 多项式上。
     bound_val_evals: Option<[F; N_STAGES]>,
+
     /// Trace for computing PCs on the fly in init_log_t_rounds.
+    ///
+    /// 原始执行痕迹，用于在 init_log_t_rounds 中通过 trace索引 实时计算 PC。
+    /// 由于内存限制，我们可能不会显式存储完整的 PC 列表，而是持有 trace 的引用按需计算。
     #[allocative(skip)]
     trace: Arc<Vec<Cycle>>,
+
     /// Bytecode preprocessing for computing PCs.
+    ///
+    /// 字节码预处理信息，用于将 Trace 中的 pc 索引映射回实际的指令地址。
     #[allocative(skip)]
     bytecode_preprocessing: Arc<BytecodePreprocessing>,
+
     pub params: BytecodeReadRafSumcheckParams<F>,
 }
-
 impl<F: JoltField> BytecodeReadRafSumcheckProver<F> {
     ///
     /// 它的核心任务是计算一个叫 $F(k)$ 的多项式（实际上是 5 个，对应 5 个 Stage），我们称之为 “加权频次多项式”。

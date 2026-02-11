@@ -261,6 +261,12 @@ impl<F: JoltField> BooleanitySumcheckProver<F> {
         // =========================================================
         // 1. 预计算核心多项式 G 和 Trace 索引
         // ---------------------------------------------------------
+        // [功能]
+        // 这是 "Time-to-Space" 的降维打击。
+        // 输入：长度为 T 的 Trace（按时间排序）。
+        // 输出：长度为 K 的 G 表（按数值 k 聚合）。
+        // G[i][k] 存储了：在整个 Trace 执行过程中，第 i 个检查项的值等于 k 的所有时刻，
+        //                 Verifier 给出的随机权重 eq(r_cycle, t) 的总和。
         // G[i][k] 是一个预聚合的数组。
         // 原理：Sumcheck 公式中包含 eq(r_cycle, j)。在 Phase 1 (遍历地址 k) 时，
         // j 相关的项是常数。我们可以预先计算 G_i(k) = sum_j (eq(r_cycle, j) * ra_i(k, j))。
@@ -283,6 +289,13 @@ impl<F: JoltField> BooleanitySumcheckProver<F> {
         // D: 对应时间维度 (Cycle) 的 eq(r_cycle, j)，用于 Phase 2。
         // 使用 GruenSplitEqPolynomial 是为了通过动态规划实现 O(N) 的线性时间证明生成。
         // =========================================================
+        // [功能]
+        // 初始化用于快速求值的 Eq 多项式结构。
+        // Jolt 使用 Gruen 算法，能在 O(N) 时间内完成 Sumcheck 的一轮，而不是 O(N log N)。
+        //
+        // B (Bound to Address): 用于 Phase 1。 Sumcheck 是对地址 k (0..255) 进行折叠。
+        // D (Bound to Cycle):   用于 Phase 2。 Sumcheck 是对时间 t 进行折叠。
+        // =========================================================
         let B = GruenSplitEqPolynomial::new(&params.r_address, BindingOrder::LowToHigh);
         let D = GruenSplitEqPolynomial::new(&params.r_cycle, BindingOrder::LowToHigh);
 
@@ -291,6 +304,11 @@ impl<F: JoltField> BooleanitySumcheckProver<F> {
         // ---------------------------------------------------------
         // F_table 用于在 Phase 1 过程中存储和更新中间计算结果，
         // 配合 GruenSplitEqPolynomial 使用。
+        // [功能]
+        // 这是一个用于存储 Sumcheck 中间状态的 DP 表。
+        // 在 Phase 1，我们是对多项式 G(k) 进行 Sumcheck。
+        // F_table[k] 初始设为 1，随着 Sumcheck 轮次推进，它会存储已经被绑定的变量的部分求值结果。
+        // 这种做法避免了每次重新分配内存。
         // =========================================================
         let k_chunk = 1 << params.log_k_chunk;
         let mut F_table = ExpandingTable::new(k_chunk, BindingOrder::LowToHigh);
@@ -306,6 +324,22 @@ impl<F: JoltField> BooleanitySumcheckProver<F> {
         // 在 Phase 2，我们会把多项式 H_i 预先缩放为 rho_i * H_i (其中 rho_i = gamma^i)。
         // 此时计算 (rho*H) * (rho*H - rho) = rho^2 * (H^2 - H) = gamma^2i * (H^2 - H)。
         // 这样就把权重 gamma^2i 巧妙地融入到了多项式乘法中。
+        //
+        // [功能]
+        // 准备随机线性组合 (RLC) 的系数。
+        // 我们有几十个列要检查 (num_polys)。
+        // Verifier 给了一个随机数 gamma。
+        // 我们生成 powers: [1, gamma, gamma^2, gamma^3 ...]
+        //
+        // [数学技巧]
+        // 我们不直接计算 gamma^i * (x^2 - x)。
+        // 而是定义新变量 y = gamma^i * x。
+        // 那么 y * (y - gamma^i) = gamma^2i * x^2 - gamma^2i * x = gamma^2i * (x^2 - x)。
+        // 这使得加权求和变得更容易处理。
+        //
+        // gamma_powers: 用于正向计算。
+        // gamma_powers_inv: 用于逆向恢复原始值 (如果需要 debug 或特殊处理)。
+        // =========================================================
         // =========================================================
         let num_polys = params.polynomial_types.len();
         let gamma_f: F = params.gamma.into();
@@ -319,9 +353,11 @@ impl<F: JoltField> BooleanitySumcheckProver<F> {
                     .inverse()
                     .expect("gamma_powers[i] is nonzero (gamma != 0)"),
             );
-            rho_i *= gamma_f;
+            rho_i *= gamma_f;// rho_{i+1} = rho_i * gamma
         }
-
+        // [返回]
+        // H 被设为 None：这是为了省内存。H 是原始 Trace 数据的多项式形式。
+        // 在 Phase 1 我们只需要 G 表。等 Phase 1 结束了，我们再根据 ra_indices 生成 H。
         Self {
             gamma_powers,
             gamma_powers_inv,
