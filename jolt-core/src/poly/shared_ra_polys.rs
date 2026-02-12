@@ -39,6 +39,7 @@ use crate::zkvm::ram::remap_address;
 use common::constants::XLEN;
 use common::jolt_device::MemoryLayout;
 use rayon::prelude::*;
+use tracing::info;
 use tracer::instruction::Cycle;
 
 /// Maximum number of instruction RA chunks (lookup index splits into at most 32 chunks)
@@ -116,13 +117,37 @@ impl Zero for RaIndices {
 impl RaIndices {
     /// Compute all RA chunk indices for a single cycle.
     #[inline]
+    /// 将一个 CPU 执行周期 (Cycle) 的数据转换为用于查表证明的索引切片 (RaIndices)
     pub fn from_cycle(
-        cycle: &Cycle,
-        bytecode: &BytecodePreprocessing,
-        memory_layout: &MemoryLayout,
-        one_hot_params: &OneHotParams,
+        cycle: &Cycle,                   // 输入: 当前 CPU 周期的完整状态 (寄存器、内存、指令等)
+        bytecode: &BytecodePreprocessing,// 输入: 预处理的字节码信息 (用于快速查找 PC 等)
+        memory_layout: &MemoryLayout,    // 输入: 内存布局配置 (用于物理地址到证明地址的重映射)
+        one_hot_params: &OneHotParams,   // 输入: 切分参数 (定义了切成几块、每块多大)
     ) -> Self {
-        // Debug assertions for bounds (use assert_ra_bounds once at bulk operation start)
+        // info!("one_hot_params={:#?}",one_hot_params);
+        /*
+        one_hot_params=OneHotParams {
+            log_k_chunk: 4,
+            lookups_ra_virtual_log_k_chunk: 16,
+            k_chunk: 16,
+            bytecode_k: 2048,
+            ram_k: 8192,
+            instruction_d: 32,
+            bytecode_d: 3,
+            ram_d: 4,
+            instruction_shifts:[124,120,116,112,108,104,100,96,92,88,84,80,76,72,68,64,60,56,52,48,44,40,36,32,28,24,20,16,12,8,4,0],
+            ram_shifts: [12,8,4,0],
+            bytecode_shifts: [8,4,0,
+        }
+
+         */
+        // =========================================================
+        // 1. 安全性断言 (Bounds Check)
+        // ---------------------------------------------------------
+        // 确保参数中要求的切分数量 (d) 没有超过硬编码的数组上限 (MAX_..._D)。
+        // 这样做是为了避免在每一步都进行动态内存分配 (Vec)，而是使用栈上的固定大小数组，
+        // 从而极大提升性能 (Jolt 对性能极其敏感)。
+        // =========================================================
         debug_assert!(
             one_hot_params.instruction_d <= MAX_INSTRUCTION_D,
             "instruction_d {} exceeds MAX_INSTRUCTION_D {}",
@@ -142,28 +167,64 @@ impl RaIndices {
             MAX_RAM_D
         );
 
-        // Instruction indices from lookup index
+        // =========================================================
+        // 2. 提取指令运算索引 (Instruction Indices)
+        // ---------------------------------------------------------
+        // 目的: 获取用于 ALU 查表的操作数切片。
+        // 逻辑:
+        // a. to_lookup_index: 将指令的操作数 (如 rs1, rs2, rd) 组合成一个大整数 "Lookup Index"。
+        //    例如对于 ADD 指令，Index = rs1 || rs2 (拼接)。
+        // b. 循环切分: 按照 one_hot_params 定义的规则，将大整数切成多个 8-bit 小块。
+        // =========================================================
         let lookup_index = LookupQuery::<XLEN>::to_lookup_index(cycle);
-        let mut instruction = [0u8; MAX_INSTRUCTION_D];
+        // info!("lookup_index={:#?}", lookup_index);
+        let mut instruction = [0u8; MAX_INSTRUCTION_D]; // 初始化固定大小数组
         for i in 0..one_hot_params.instruction_d {
+            // 提取第 i 个切片 (Chunk i)
             instruction[i] = one_hot_params.lookup_index_chunk(lookup_index, i);
         }
 
-        // Bytecode indices from PC
+        // =========================================================
+        // 3. 提取字节码/ROM 索引 (Bytecode Indices)
+        // ---------------------------------------------------------
+        // 目的: 获取用于证明 "代码一致性" 的 PC 切片。
+        // 逻辑:
+        // a. get_pc: 获取当前指令的程序计数器 PC。
+        // b. 循环切分: 将 PC (可能还有指令编码) 切分成小块。
+        //    这用于后续证明 "我在 PC 处执行的指令确实是 ROM[PC]"。
+        // =========================================================
         let pc = bytecode.get_pc(cycle);
+        // info!("pc={:#?}", pc);
         let mut bytecode_arr = [0u8; MAX_BYTECODE_D];
         for i in 0..one_hot_params.bytecode_d {
             bytecode_arr[i] = one_hot_params.bytecode_pc_chunk(pc, i);
         }
+        // info!("bytecode_arr={:#?}", bytecode_arr);
 
-        // RAM indices from remapped address (None for non-memory cycles)
+        // =========================================================
+        // 4. 提取 RAM 内存索引 (RAM Indices)
+        // ---------------------------------------------------------
+        // 目的: 获取用于内存读写证明的地址切片。
+        // 逻辑:
+        // a. 获取原始物理地址 (address)。
+        // b. 重映射 (remap): 将物理地址转换为证明系统内部使用的虚拟地址 (Canonical Address)。
+        //    如果指令不访问内存 (如 ADD)，remap 可能会返回 None 或特定值。
+        // c. 循环切分: 如果地址存在 (Some)，则切分；否则填 None。
+        //    None 在后续 G 表统计中会被忽略。
+        // =========================================================
         let address = cycle.ram_access().address() as u64;
         let remapped = remap_address(address, memory_layout);
         let mut ram = [None; MAX_RAM_D];
         for i in 0..one_hot_params.ram_d {
+            // map 处理 Option: 如果 remapped 是 Some(addr)，则执行闭包切分；如果是 None，则返回 None。
             ram[i] = remapped.map(|a| one_hot_params.ram_address_chunk(a, i));
         }
 
+        // =========================================================
+        // 5. 返回结果
+        // ---------------------------------------------------------
+        // 将三类切片打包返回。这个结构体将被放入 G 表统计器中。
+        // =========================================================
         Self {
             instruction,
             bytecode: bytecode_arr,

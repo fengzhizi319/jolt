@@ -345,42 +345,63 @@ struct IncClaimReductionPhase1State<F: JoltField> {
 impl<F: JoltField> IncClaimReductionPhase1State<F> {
     #[tracing::instrument(skip_all, name = "IncClaimReductionPhase1State::initialize")]
     fn initialize(trace: Arc<Vec<Cycle>>, params: &IncClaimReductionSumcheckParams<F>) -> Self {
+        // ---------------------------------------------------------
+        // 1. 维度计算与拆分
+        // ---------------------------------------------------------
         let n_vars = params.n_cycle_vars;
-        let prefix_n_vars = n_vars / 2;
-        let suffix_n_vars = n_vars - prefix_n_vars;
-        let prefix_len = 1 << prefix_n_vars;
-        let suffix_len = 1 << suffix_n_vars;
+        // 将变量数对半拆分，例如 20 bits -> 10 bits (prefix) + 10 bits (suffix)
+        let prefix_n_vars = n_vars / 2;       // 对应低位 (Lo) 索引
+        let suffix_n_vars = n_vars - prefix_n_vars; // 对应高位 (Hi) 索引
+        let prefix_len = 1 << prefix_n_vars;  // P 和 Q 数组的长度 (sqrt(N))
+        let suffix_len = 1 << suffix_n_vars;  // 内层循环折叠的长度
 
-        // Split each opening point into hi (suffix) and lo (prefix)
-        // Big-endian: hi is first half, lo is second half
+        // ---------------------------------------------------------
+        // 2. 拆分随机挑战点 (Challenges)
+        // ---------------------------------------------------------
+        // Verifier 提供的随机点 r 也被拆分为高位部分 (hi) 和低位部分 (lo)。
+        // split_at: 将随机向量切开。
         let (r2_hi, r2_lo) = params.r_cycle_stage2.split_at(suffix_n_vars);
         let (r4_hi, r4_lo) = params.r_cycle_stage4.split_at(suffix_n_vars);
         let (s4_hi, s4_lo) = params.s_cycle_stage4.split_at(suffix_n_vars);
         let (s5_hi, s5_lo) = params.s_cycle_stage5.split_at(suffix_n_vars);
 
-        // P buffers: prefix eq evaluations
+        // ---------------------------------------------------------
+        // 3. 预计算 P 多项式 (Prefix Eq)
+        // ---------------------------------------------------------
+        // P[i] = eq(r_lo, i)。
+        // 这些将在后续的 Sumcheck Phase 2 中作为系数使用。
         let P_ram_0 = EqPolynomial::evals(&r2_lo.r);
         let P_ram_1 = EqPolynomial::evals(&r4_lo.r);
         let P_rd_0 = EqPolynomial::evals(&s4_lo.r);
         let P_rd_1 = EqPolynomial::evals(&s5_lo.r);
 
-        // Suffix eq evaluations (for computing Q)
+        // ---------------------------------------------------------
+        // 4. 预计算高位 Eq 表 (Suffix Eq)
+        // ---------------------------------------------------------
+        // 用于在本次函数中计算 Q。
+        // eq_hi[j] = eq(r_hi, j)。
         let eq_r2_hi = EqPolynomial::evals(&r2_hi.r);
         let eq_r4_hi = EqPolynomial::evals(&r4_hi.r);
         let eq_s4_hi = EqPolynomial::evals(&s4_hi.r);
         let eq_s5_hi = EqPolynomial::evals(&s5_hi.r);
 
-        // Q buffers: sum over suffix indices
+        // ---------------------------------------------------------
+        // 5. 分配 Q 多项式内存
+        // ---------------------------------------------------------
+        // Q[i] 将存储第 i 个 prefix 对应的所有 suffix 的加权和。
+        // 使用 unsafe_allocate_zero_vec 进行快速且未初始化的内存分配（随后会被覆盖或累加）。
         let mut Q_ram_0 = unsafe_allocate_zero_vec(prefix_len);
         let mut Q_ram_1 = unsafe_allocate_zero_vec(prefix_len);
         let mut Q_rd_0 = unsafe_allocate_zero_vec(prefix_len);
         let mut Q_rd_1 = unsafe_allocate_zero_vec(prefix_len);
 
-        // Right-size chunks based on number of threads
-        // Use ceiling division to ensure roughly equal work per thread
+        // ---------------------------------------------------------
+        // 6. 并行计算折叠多项式 Q (核心逻辑)
+        // ---------------------------------------------------------
         let num_threads = rayon::current_num_threads();
         let chunk_size = prefix_len.div_ceil(num_threads).max(1);
 
+        // 并行遍历 Q 的每一个块 (对应 prefix/lo 索引)
         (
             Q_ram_0.par_chunks_mut(chunk_size),
             Q_ram_1.par_chunks_mut(chunk_size),
@@ -390,34 +411,46 @@ impl<F: JoltField> IncClaimReductionPhase1State<F> {
             .into_par_iter()
             .enumerate()
             .for_each(|(chunk_i, (q_ram_0, q_ram_1, q_rd_0, q_rd_1))| {
+                // 遍历当前块内的每一个 prefix 索引 (i)
                 for i in 0..q_ram_0.len() {
+                    // 计算全局 prefix 索引 x_lo
                     let x_lo = chunk_i * chunk_size + i;
 
+                    // 初始化累加器 (使用 SIMD 优化的 Acc6S 类型)
                     let mut acc_ram_0: Acc6S<F> = Acc6S::zero();
                     let mut acc_ram_1: Acc6S<F> = Acc6S::zero();
                     let mut acc_rd_0: Acc6S<F> = Acc6S::zero();
                     let mut acc_rd_1: Acc6S<F> = Acc6S::zero();
 
+                    // 内层循环: 遍历所有高位 suffix 索引 (x_hi)
+                    // 这里执行了折叠操作: Q[x_lo] += Inc[x_lo, x_hi] * eq_hi[x_hi]
                     for x_hi in 0..suffix_len {
+                        // 组合得到 Trace 的绝对索引 x
+                        // x = x_lo + (x_hi * 2^prefix_bits)
                         let x = x_lo + (x_hi << prefix_n_vars);
                         let cycle = &trace[x];
 
-                        // RamInc = post_value - pre_value for RAM writes
+                        // --- 计算 RAM 写入增量 ---
+                        // 如果是写操作，增量 = 新值 - 旧值；否则为 0。
                         let ram_inc: S64 = match cycle.ram_access() {
                             RAMAccess::Write(w) => s64_from_diff_u64s(w.post_value, w.pre_value),
                             _ => S64::from(0i64),
                         };
 
-                        // RdInc = post_value - pre_value for rd writes
+                        // --- 计算 RD (寄存器) 写入增量 ---
+                        // 增量 = 新寄存器值 - 旧寄存器值
                         let (_, pre_rd, post_rd) = cycle.rd_write().unwrap_or_default();
                         let rd_inc: S64 = s64_from_diff_u64s(post_rd, pre_rd);
 
+                        // --- 累加 (Fused Multiply-Add) ---
+                        // acc += eq_hi * inc
                         acc_ram_0.fmadd(&eq_r2_hi[x_hi], &ram_inc);
                         acc_ram_1.fmadd(&eq_r4_hi[x_hi], &ram_inc);
                         acc_rd_0.fmadd(&eq_s4_hi[x_hi], &rd_inc);
                         acc_rd_1.fmadd(&eq_s5_hi[x_hi], &rd_inc);
                     }
 
+                    // 将累加结果进行 Barrett Reduction (取模) 并存入 Q
                     q_ram_0[i] = acc_ram_0.barrett_reduce();
                     q_ram_1[i] = acc_ram_1.barrett_reduce();
                     q_rd_0[i] = acc_rd_0.barrett_reduce();

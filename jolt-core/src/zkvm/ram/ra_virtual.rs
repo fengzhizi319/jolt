@@ -169,34 +169,70 @@ pub struct RamRaVirtualSumcheckProver<F: JoltField> {
 
 impl<F: JoltField> RamRaVirtualSumcheckProver<F> {
     #[tracing::instrument(skip_all, name = "RamRaVirtualSumcheckProver::initialize")]
+    /// 初始化 RAM 地址虚拟化证明器
+    /// 核心任务：将 Trace 中的大地址切分，并计算每个切片相对于 Verifier 挑战 r 的 Eq 值。
     pub fn initialize(
-        params: RamRaVirtualParams<F>,
-        trace: &[Cycle],
-        memory_layout: &MemoryLayout,
-        one_hot_params: &OneHotParams,
+        params: RamRaVirtualParams<F>, // 包含 Verifier 的随机挑战 r_address (已切分) 和 r_cycle
+        trace: &[Cycle],               // 执行痕迹，包含每一步的 RAM 操作
+        memory_layout: &MemoryLayout,  // 内存布局 (用于地址重映射)
+        one_hot_params: &OneHotParams, // 切分参数 (例如 d=8, chunk_size=8 bits)
     ) -> Self {
-        // Precompute EQ tables for each address chunk
+        // =========================================================
+        // 步骤 1: 预计算 Eq 表 (Precompute EQ Tables)
+        // ---------------------------------------------------------
+        // Verifier 发来的大随机数 r_address 已经被切分成了 params.r_address_chunks。
+        // 对于每一个切片 i (比如第 0 个字节)，我们计算它在所有可能值 (0..255) 上的 eq 值。
+        // eq_tables[i][val] = eq(r_chunk_i, val)
+        // 这是一个极小的表 (例如 size 256)，查表速度极快。
+        // =========================================================
         let eq_tables: Vec<Vec<F>> = params
             .r_address_chunks
             .iter()
             .map(|chunk| EqPolynomial::evals(chunk))
             .collect();
 
-        // Create eq polynomial with Gruen optimization for r_cycle_reduced
+        // =========================================================
+        // 步骤 2: 初始化时间维度的 Eq 多项式,创建针对周期的 Eq 多项式
+        // ---------------------------------------------------------
+        // 用于 Sumcheck 中对 Trace 的时间轴 (Cycle) 进行折叠。
+        // 使用 Gruen 优化算法，可以在 O(1) 时间内更新 sumcheck 状态。
+        // GruenSplitEqPolynomial 是一种优化的 Eq 多项式实现，用于处理 log_T 维度的 r_cycle 随机点。
+        // 它对应公式中的 eq(r_cycle, c)。
+        // =========================================================
         let eq_poly = GruenSplitEqPolynomial::new(&params.r_cycle.r, BindingOrder::LowToHigh);
 
-        // Create ra_i polynomials for each decomposition chunk
+        // =========================================================
+        // 步骤 3: 构建切片多项式 (Create RA Polynomials),并行创建 ra_i 多项式
+        // ---------------------------------------------------------
+        // 地址被切分为 d 段，每一段生成一个 polynomial。
+        // 这里是核心：把 Trace 里的地址切碎，并绑定到 Eq 表上。
+        // 我们需要生成 d 个多项式 (ra_i_polys)，每个对应地址的一个切片位置。
+        // =========================================================
         let ra_i_polys: Vec<RaPolynomial<u8, F>> = (0..params.d)
-            .into_par_iter()
-            .zip(eq_tables.into_par_iter())
+            .into_par_iter() // 并行处理每个切片维度 (0..7)
+            .zip(eq_tables.into_par_iter()) // 携带对应的 Eq 表
             .map(|(i, eq_table)| {
+                // 3.1 提取 Trace 中所有周期的第 i 个切片值
+                // 此闭包并行处理每一列（每一个 chunk 维度）
                 let ra_i_indices: Vec<Option<u8>> = trace
                     .par_iter()
                     .map(|cycle| {
+                        // 从 trace 中获取当前周期的内存地址，并根据内存布局进行映射
+                        // remap_address: 将物理地址映射到规范的 Proof 地址空间
+                        // one_hot_params.ram_address_chunk: 提取地址的第 i 个 chunk (如第 i 个字节)
                         remap_address(cycle.ram_access().address() as u64, memory_layout)
                             .map(|address| one_hot_params.ram_address_chunk(address, i))
                     })
                     .collect();
+
+                // 3.2 构造 RaPolynomial,RaPolynomial 实际上是一个 lookup 的封装。
+                // 这个多项式并不存储具体的数值，而是存储了 "索引 (indices)" 和 "查表逻辑 (eq_table)"。
+                // 当 Sumcheck 需要求值时，它会查表：Value[t] = eq_table[ indices[t] ]
+                // 物理含义：在时刻 t，第 i 个切片的 Eq 值是多少？
+
+                // 它的评估逻辑是：对于 trace 中的第 c 个元素（即 chunk 值 val），
+                // 其多项式值为 eq_table[val]。
+                // 数学会意为：eq(r_address_i, actual_chunk_at_cycle_c)
                 RaPolynomial::new(Arc::new(ra_i_indices), eq_table)
             })
             .collect();

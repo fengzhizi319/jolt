@@ -247,35 +247,62 @@ pub struct AdviceClaimReductionPhase1Prover<F: JoltField> {
 
 impl<F: JoltField> AdviceClaimReductionPhase1Prover<F> {
     pub fn initialize(
-        params: AdviceClaimReductionPhase1Params<F>,
-        advice_poly: MultilinearPolynomial<F>,
+        params: AdviceClaimReductionPhase1Params<F>, // 包含随机挑战点 r_eval, r_final 和权重 gamma
+        advice_poly: MultilinearPolynomial<F>,       // Prover 持有的 Advice 数据多项式 A(x)
     ) -> Self {
+        // 1. 获取随机权重 gamma (用于 RLC)
         let gamma = params.gamma;
+
+        // 2. 计算第一个点的 Eq 向量: E1 = eq(r_eval, x)
+        // 这是为了验证 A(r_eval) 的值
         let eq_eval = EqPolynomial::evals(&params.r_val_eval.r);
+
+        // 3. 构建组合的 Eq 多项式 (Batching)
         let eq_poly = if params.single_opening {
+            // [情况 A] 只需要验证一个点
+            // 直接使用 E1
             MultilinearPolynomial::from(eq_eval)
         } else {
+            // [情况 B] 需要同时验证两个点 (r_eval 和 r_final)
+            // 这是 Jolt 内存检查的典型情况。
+
+            // 获取第二个随机点 r_final
             let r_final = params
                 .r_val_final
                 .as_ref()
                 .expect("r_val_final must exist when !single_opening");
+
+            // 计算第二个点的 Eq 向量并缩放: E2 = eq(r_final, x) * gamma
+            // evals_with_scaling 能够在生成 eq 值的过程中直接乘上 gamma，效率更高
             let eq_final = EqPolynomial::evals_with_scaling(&r_final.r, Some(gamma));
+
+            // 向量加法: Combined = E1 + E2
+            // 即 Combined[x] = eq(r_eval, x) + gamma * eq(r_final, x)
+            // 使用并行迭代器 (par_iter) 加速向量加法
             let combined: Vec<F> = eq_eval
                 .par_iter()
                 .zip(eq_final.par_iter())
                 .map(|(e1, e2)| *e1 + e2)
                 .collect();
+
+            // 将组合后的向量转换为多项式对象
             MultilinearPolynomial::from(combined)
         };
 
+        // 4. 计算 Sumcheck 过程中的辅助常数
+        // two_inv: 1/2，用于 Sumcheck 折叠时的平均值计算
         let two_inv = F::from_u64(2).inverse().unwrap();
+
+        // 计算是否有 "Dummy Rounds" (填充轮次)
+        // 如果 Trace 长度不是完全的 2^N，或者 Sumcheck 提前停止，需要处理缩放因子
         let dummy_after = params.log_t.saturating_sub(params.num_rounds());
-        let after_scale = F::one().mul_pow_2(dummy_after);
+        let after_scale = F::one().mul_pow_2(dummy_after); // 2^dummy_after
         let after_inv_scale = after_scale.inverse().unwrap();
+
         Self {
             params,
-            advice_poly,
-            eq_poly,
+            advice_poly, // 原始数据 A(x)
+            eq_poly,     // 组合后的系数 Q(x)
             scale: F::one(),
             inv_scale: F::one(),
             after_scale,
