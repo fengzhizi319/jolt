@@ -246,6 +246,23 @@ pub struct AdviceClaimReductionPhase1Prover<F: JoltField> {
 }
 
 impl<F: JoltField> AdviceClaimReductionPhase1Prover<F> {
+    /// 初始化 Advice Sumcheck 第二阶段的 Prover。
+    ///
+    /// # 数学原理
+    ///
+    /// 在 Phase 2 中，我们需要处理剩余的 Advice 变量（对应于地址位）。
+    /// 此时，Advice 变量的前半部分（对应于周期/时间位）已经被 Phase 1 的随机点固定。
+    ///
+    /// 设 Advice 多项式为 $A(x_{cycle}, x_{addr})$。
+    /// 设 Eq 多项式为 $Q(x) = eq(r_{eval}, x) + \gamma \cdot eq(r_{final}, x)$。
+    ///
+    /// 此函数执行以下操作：
+    /// 1. 构造组合后的 $Q(x)$。
+    /// 2. 利用 Phase 1 确定的随机点 $r_{bind}$ (即 `params.cycle_bind_le`)，对 $A$ 和 $Q$ 进行部分求值/固定：
+    ///    $$ A'(x_{addr}) \leftarrow A(r_{bind}, x_{addr}) $$
+    ///    $$ Q'(x_{addr}) \leftarrow Q(r_{bind}, x_{addr}) $$
+    ///
+    /// 最终返回的 Prover 将在 $x_{addr}$ 维度上运行 Sumcheck。
     pub fn initialize(
         params: AdviceClaimReductionPhase1Params<F>, // 包含随机挑战点 r_eval, r_final 和权重 gamma
         advice_poly: MultilinearPolynomial<F>,       // Prover 持有的 Advice 数据多项式 A(x)
@@ -259,11 +276,14 @@ impl<F: JoltField> AdviceClaimReductionPhase1Prover<F> {
 
         // 3. 构建组合的 Eq 多项式 (Batching)
         let eq_poly = if params.single_opening {
+            // 如果只需单点校验，直接使用 eq(r_eval)
             // [情况 A] 只需要验证一个点
             // 直接使用 E1
             MultilinearPolynomial::from(eq_eval)
         } else {
             // [情况 B] 需要同时验证两个点 (r_eval 和 r_final)
+            // 如果需要双点校验 (r_eval 和 r_final)，计算线性组合：
+            // Q(x) = eq(r_eval, x) + gamma * eq(r_final, x)
             // 这是 Jolt 内存检查的典型情况。
 
             // 获取第二个随机点 r_final
@@ -296,6 +316,7 @@ impl<F: JoltField> AdviceClaimReductionPhase1Prover<F> {
         // 计算是否有 "Dummy Rounds" (填充轮次)
         // 如果 Trace 长度不是完全的 2^N，或者 Sumcheck 提前停止，需要处理缩放因子
         let dummy_after = params.log_t.saturating_sub(params.num_rounds());
+        // after_scale 用于处理 Sumcheck 批处理中的填充轮次（dummy rounds）
         let after_scale = F::one().mul_pow_2(dummy_after); // 2^dummy_after
         let after_inv_scale = after_scale.inverse().unwrap();
 

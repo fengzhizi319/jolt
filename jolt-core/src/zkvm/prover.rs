@@ -2061,14 +2061,13 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         // 2f. 初始化增量/计数器归约检查器 (Increment Reduction Prover)
         // ------------------------------------------------------------------------
         // [功能]
-        // 处理与全局计数器、时间戳增量或 Padding 相关的 Claim 归约。
+        // 把RAM变化以及rd寄存器的变化归约成增量（Increment）的形式，并验证这些增量的正确性。
         // “Reduction” 意为将复杂的集合检查归约为简单的多项式评估。
         //
         // [背景]
-        // 在离线内存检查（Offline Memory Checking）中，为了区分同一地址的不同次写入，
-        // 通常会引入全局计数器或时间戳（Timestamp）。
-        // 此组件负责验证这些计数器相关的属性（例如：是否存在非法的跳变，或 Padding 部分是否处理正确），
-        // 它是内存一致性证明中不可或缺的辅助环节。
+        // Jolt 系统为了证明 RAM/寄存器的状态是正确的，核心利用了以下数学性质：
+        // $$\text{FinalValue} = \text{InitValue} + \sum (\text{WrittenValue} - \text{OldValue}) $$
+        // 只要保证所有的写入操作所产生的增量（post - pre）被正确累加，那么内存的总状态在数值上就是守恒的。
         let inc_reduction =
             IncClaimReductionSumcheckProver::initialize(inc_reduction_params, self.trace.clone());
 
@@ -2100,7 +2099,23 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
 
         // (省略了 Debug 用于打印内存使用的代码块 ...)
         #[cfg(feature = "allocative")]
-        { /* ... print heap usage ... */ }
+        {
+            print_data_structure_heap_usage("BytecodeReadRafSumcheckProver", &bytecode_read_raf);
+            print_data_structure_heap_usage("BooleanitySumcheckProver", &booleanity);
+            print_data_structure_heap_usage(
+                "ram HammingBooleanitySumcheckProver",
+                &ram_hamming_booleanity,
+            );
+            print_data_structure_heap_usage("RamRaSumcheckProver", &ram_ra_virtual);
+            print_data_structure_heap_usage("LookupsRaSumcheckProver", &lookups_ra_virtual);
+            print_data_structure_heap_usage("IncClaimReductionSumcheckProver", &inc_reduction);
+            if let Some(ref advice) = self.advice_reduction_prover_trusted {
+                print_data_structure_heap_usage("AdviceClaimReductionProver(trusted)", advice);
+            }
+            if let Some(ref advice) = self.advice_reduction_prover_untrusted {
+                print_data_structure_heap_usage("AdviceClaimReductionProver(untrusted)", advice);
+            }
+        }
 
         // =========================================================
         // 3. 打包实例进行批量证明 (Batching)

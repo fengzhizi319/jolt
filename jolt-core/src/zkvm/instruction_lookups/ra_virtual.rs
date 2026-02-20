@@ -174,54 +174,75 @@ pub struct InstructionRaSumcheckProver<F: JoltField> {
 impl<F: JoltField> InstructionRaSumcheckProver<F> {
     #[tracing::instrument(skip_all, name = "InstructionRaSumcheckProver::initialize")]
     pub fn initialize(params: InstructionRaSumcheckParams<F>, trace: &[Cycle]) -> Self {
-        // Compute r_address_chunks with proper padding
+        // =========================================================
+        // 1. 计算拆分后的 r_address
+        // Verifier 发来一个针对整个查表空间的随机挑战点 r_address。
+        // 将其拆分为对应每个 chunk 维度的小随机点数组 r_address_chunks。
+        // =========================================================
         let r_address_chunks = params
             .one_hot_params
             .compute_r_address_chunks::<F>(&params.r_address.r);
 
+        // =========================================================
+        // 2. 提取 Trace 中的切片 (Indices)
+        // 遍历整个执行痕迹，把操作数大整数转化为查表用的 chunk 数组。
+        // H_indices[i][t] 表示：在维度 i，时刻 t 的 chunk 值 (如 0~255)。
+        // =========================================================
         let H_indices: Vec<Vec<Option<u8>>> = (0..params.one_hot_params.instruction_d)
             .map(|i| {
                 trace
                     .par_iter()
                     .map(|cycle| {
+                        // to_lookup_index: 取出 rs1, rs2 等组合成大整数
                         let lookup_index = LookupQuery::<XLEN>::to_lookup_index(cycle);
+                        // 提取出第 i 个 byte 切片
                         Some(params.one_hot_params.lookup_index_chunk(lookup_index, i))
                     })
                     .collect()
             })
             .collect();
 
+        // c: 每个虚拟查找(比如一次 ADD)需要多少个物理多项式切片组合
         let n_committed_per_virtual = params.n_committed_per_virtual;
+        // gamma 幂次数组: [1, gamma, gamma^2, ...]
         let gamma_powers = &params.gamma_powers;
 
+        // =========================================================
+        // 3. 构建惰性查表多项式 (RaPolynomials) 及 Gamma 预缩放优化
+        // =========================================================
         let ra_i_polys = H_indices
-            .into_par_iter()
+            .into_par_iter() // 并行处理每一列
             .enumerate()
             .map(|(i, lookup_indices)| {
-                // Pre-scale the first committed polynomial in each virtual batch by γ^batch.
-                //
-                // This pushes the γ weight *inside* the product term so we can form
-                // (Σ γ^i · ∏ ra_{i,*}) before multiplying by split-eq's inner weights e_in,
-                // allowing a single split-eq fold for the whole sumcheck message.
+                // 核心优化：预缩放。
+                // 如果当前维度 i 是一组切片 (batch) 的第一个 (i % c == 0)
                 let scaling_factor = if i % n_committed_per_virtual == 0 {
-                    let batch = i / n_committed_per_virtual;
-                    let gamma = gamma_powers[batch];
+                    let batch = i / n_committed_per_virtual; // 计算属于第几个 batch
+                    let gamma = gamma_powers[batch];         // 取出对应的权重 gamma^b
                     if gamma != F::one() {
                         Some(gamma)
                     } else {
                         None
                     }
                 } else {
-                    None
+                    None // 组内的其他切片不缩放
                 };
+
+                // evals_with_scaling: 计算 eq(r, x) 的查表字典 (大小 256)。
+                // 如果 scaling_factor 存在，字典里的每个值预先乘以 gamma。
                 let eq_evals =
                     EqPolynomial::evals_with_scaling(&r_address_chunks[i], scaling_factor);
+
+                // RaPolynomial 不存具体的域元素，只存索引 `lookup_indices` 和字典 `eq_evals`。
+                // 每次需要求值时，执行：eq_evals[ lookup_indices[t] ]
                 RaPolynomial::new(Arc::new(lookup_indices), eq_evals)
             })
             .collect();
 
+        // 4. 返回初始化好的 Prover 实例
         Self {
             ra_i_polys,
+            // 绑定到时间维度的快速 Eq 多项式 (Gruen 优化)，用于 O(N) 验证
             eq_poly: GruenSplitEqPolynomial::new(&params.r_cycle.r, BindingOrder::LowToHigh),
             params,
         }
