@@ -2613,6 +2613,7 @@ mod tests {
     #[test]
     #[serial]
     fn fib_e2e_dory() {
+
         // tracing_subscriber::fmt::init();
         let _ = tracing_subscriber::fmt().try_init();
         // 1. 初始化宿主程序：加载 "fibonacci-guest" 二进制文件。
