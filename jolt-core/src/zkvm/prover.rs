@@ -2170,24 +2170,57 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
     }
 
     /// Stage 7: HammingWeight + ClaimReduction sumcheck (only log_k_chunk rounds).
+    /// ======================================================================================
+    /// 函数功能说明：`prove_stage7` (Jolt zkVM 证明流水线 - 第 7 阶段)
+    ///
+    /// 【核心目的】
+    /// 本函数执行 Jolt 证明体系中 Sumcheck 协议的最后一次批量归约，主要处理“结构性与空间性”约束。
+    /// 它的输出将被直接送入多项式承诺方案（PCS）进行最终的密码学开点验证。
+    ///
+    /// 【解决的两个主要问题】
+    /// 1. 汉明重量检查 (Hamming Weight Check)：
+    ///    - 前置条件：Stage 6 已经证明了标志位向量 $V = (v_1, \dots, v_n)$ 满足布尔性（即 $v_i \in \{0, 1\}$）。
+    ///    - 本阶段目标：证明 $\sum_{i=1}^{n} v_i = 1$。结合 Stage 6，这绝对保证了向量是 One-Hot 编码的，
+    ///      从而确保 CPU 同一时刻只能处于一种合法状态（例如只解码出一条确定的指令）。
+    ///
+    /// 2. 辅助输入归约 - 第二阶段 (Advice Reduction Phase 2)：
+    ///    - 前置条件：Advice 数据被建模为二维多项式 $A(t, s)$，其中 $t$ 为时间/Cycle，$s$ 为空间/地址。
+    ///      Stage 6 已经完成了时间维度 $t$ 的 Sumcheck，并生成了随机挑战 $\gamma$。
+    ///    - 本阶段目标：利用 $\gamma$，在空间维度 $s$ 上完成剩余的 Sumcheck 归约，确保非确定性计算
+    ///      （如外部哈希结果、除法商数）在内存地址映射上的正确性和一致性。
+    ///
+    /// 【工程优化亮点】
+    /// - 批量处理 (Batching)：将 HW 检查和 Advice 检查打包为同一个多项式实例集合，通过一次遍历完成运算。
+    /// ======================================================================================
     #[tracing::instrument(skip_all)]
     fn prove_stage7(&mut self) -> SumcheckInstanceProof<F, ProofTranscript> {
+        // 【性能监控】
+        // 在非 WASM 目标平台下，打印 Stage 7 刚开始时的内存使用情况。
+        // zkVM 的 Prover 通常非常消耗内存，因此 Jolt 在各个关键阶段都埋点了内存监控，
+        // 以便在开发和实际运行中追踪内存峰值 (Peak Memory)。
         #[cfg(not(target_arch = "wasm32"))]
         print_current_memory_usage("Stage 7 baseline");
 
-        // 1. 初始化汉明重量（One-Hot）检查参数 (Hamming Weight Check):
-        // Jolt 架构极度依赖 One-Hot 编码（例如指令解码，同一时刻只能是一个指令）。
-        // 此步骤验证特定向量的汉明重量是否为 1（即所有位中只有一个 1，其余为 0）。
-        // 注意：前面的 Stage 6 (Booleanity) 已经证明了这些值是 0 或 1。
-        // 这里证明的是 sum(flags) == 1。
-        // r_cycle 和 r_addr_bool 等随机点是从之前的 Booleanity opening 中提取的，用于关联这两个阶段。
+        // ========================================================================
+        // 1. 汉明重量检查 (Hamming Weight Check)
+        // ========================================================================
+        // 目标：证明某些向量（如 CPU 指令解码标志位）是 One-Hot 的（只有一个 1，其余全为 0）。
+        // 前提：在 Stage 6 的布尔性（Booleanity）检查中，系统已经证明了向量中的每个元素 $v_i \in \{0, 1\}$。
+        // 当前：既然元素只能是 0 或 1，我们只需证明它们的总和为 1，即 sum v_i = 1。
+
+        // 构造归约参数 (Reduction Params)：
+        // 这里将 One-Hot 参数与当前的open累加器 (opening_accumulator) 结合，
+        // 并将相关的随机挑战绑定到转录本 (transcript) 中，采用 Fiat-Shamir 启发式确保非交互性。
         let hw_params = HammingWeightClaimReductionParams::new(
             &self.one_hot_params,
             &self.opening_accumulator,
             &mut self.transcript,
         );
 
-        // 初始化汉明重量证明器
+        // 初始化证明器 (Prover)：
+        // 传入执行轨迹 (trace) 和预处理数据 (preprocessing.shared)。
+        // 这个证明器在底层会维护多线性多项式的状态，准备好在一系列超立方体（Boolean Hypercube）
+        // 顶点上进行 Sumcheck 协议的折叠。
         let hw_prover = HammingWeightClaimReductionProver::initialize(
             hw_params,
             &self.trace,
@@ -2198,43 +2231,56 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         #[cfg(feature = "allocative")]
         print_data_structure_heap_usage("HammingWeightClaimReductionProver", &hw_prover);
 
-        // 2. 准备批量证明实例 (Batching):
-        // 主要包含汉明重量检查。
-        // 这里的 Sumcheck 通常只涉及 "Address" 相关的 rounds (log_k_chunk)，
-        // 因为时间维度通常已经在前序步骤处理或归约了。
+        // ========================================================================
+        // 2. 准备批量 Sumcheck 实例 (Batching Setup)
+        // ========================================================================
+        // 将不同的约束打包到一个向量中。
+        // 使用 Box<dyn SumcheckInstanceProver> 实现了多态，因为接下来我们要把
+        // 汉明重量证明器（HW Prover）和辅助输入证明器（Advice Prover）放在一起批量处理。
+        // 这极大地减少了多项式遍历的开销。
         let mut instances: Vec<Box<dyn SumcheckInstanceProver<F, ProofTranscript>>> =
             vec![Box::new(hw_prover)];
 
-        // 3. 添加 Advice (辅助输入) 归约 - 第二阶段 (Phase 2):
-        // 如果存在 Advice 数据，我们需要完成在 Stage 6 启动的验证流程。
-        // Stage 6 (Phase 1) 处理了 "Time/Cycle" 维度的归约。
-        // Stage 7 (Phase 2) 处理 "Address/Space" 维度的归约。
-        // 也就是验证：Confirm(Address) -> Value。
+        // ========================================================================
+        // 3. 辅助输入归约 - 第二阶段 (Advice Reduction Phase 2)
+        // ========================================================================
+        // 概念：Advice 是 Prover 提供的额外提示（如非确定性计算的结果），需要被严格校验。
+        // 维度拆解：Advice 通常被视为二维数据 A(time, space_address)。
+        //   - Phase 1 (Stage 6): 已经在“时间/Cycle”维度上进行了折叠，生成了随机挑战 gamma。
+        //   - Phase 2 (当前): 利用 gamma，在“空间/地址”维度上进行归约验证。
 
-        // 处理可信 Advice (Trusted Advice)
+        // 3.1 处理可信辅助输入 (Trusted Advice)
+        // Trusted Advice 通常指的是由预处理阶段或可信设置生成的、与程序内存布局强相关的辅助数据。
         if let Some(gamma) = self.advice_reduction_gamma_trusted {
+            // 构建 Phase 2 的参数，传入内存布局和轨迹长度。
+            // rw_config 检查是否需要对 advice 进行单次开启。
             if let Some(params) = AdviceClaimReductionPhase2Params::new(
                 AdviceKind::Trusted,
                 &self.program_io.memory_layout,
                 self.trace.len(),
-                gamma, // 使用 Stage 6 生成的随机挑战 gamma
+                gamma, // 核心：使用前一阶段生成的随机挑战将多个约束线性组合
                 &self.opening_accumulator,
                 self.rw_config
                     .needs_single_advice_opening(self.trace.len().log_2()),
             ) {
-                // 克隆多项式以进行 Sumcheck（该过程可能具有破坏性或需要独立的所有权）
+                // 克隆多项式：Sumcheck 过程中的折叠操作 (fold) 会原地修改多项式的数据结构，
+                // 为了防止破坏原始数据，这里必须进行 clone。
                 let poly = self
                     .advice
                     .trusted_advice_polynomial
                     .clone()
                     .expect("trusted advice phase2 params exist but polynomial is missing");
+
+                // 将初始化好的 Advice Prover 加入批量实例向量中
                 instances.push(Box::new(AdviceClaimReductionPhase2Prover::initialize(
                     params, poly,
                 )));
             }
         }
 
-        // 处理不可信 Advice (Untrusted Advice / Witness)
+        // 3.2 处理不可信辅助输入 (Untrusted Advice)
+        // Untrusted Advice 是纯粹由 Prover 提供的 witness 数据，Verifier 必须对其进行完整校验。
+        // 逻辑与上方 Trusted Advice 基本一致。
         if let Some(gamma) = self.advice_reduction_gamma_untrusted {
             if let Some(params) = AdviceClaimReductionPhase2Params::new(
                 AdviceKind::Untrusted,
@@ -2256,25 +2302,40 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             }
         }
 
+        // 记录 Proving 开始的火焰图 (Flamegraph)，用于性能剖析
         #[cfg(feature = "allocative")]
         write_instance_flamegraph_svg(&instances, "stage7_start_flamechart.svg");
         tracing::info!("Stage 7 proving");
 
-        // 4. 执行批量 Sumcheck (Prove):
-        // 这一步将汉明重量约束和 Advice 地址约束归约到 `opening_accumulator`。
-        // 此后，Verifier 只需要检查 Accumulator 中的点评估值。
+        // ========================================================================
+        // 4. 执行批量 Sumcheck (Batched Sumcheck Execution)
+        // ========================================================================
+        // 核心密码学操作：
+        // 这里将上面收集到的所有实例 (HW 和 Advice) 进行一次统一的 Sumcheck。
+        // 1. Prover 逐轮计算多项式在一维上的和，并发送给 Verifier (Transcript)。
+        // 2. Verifier (通过 Transcript) 提供随机挑战，Prover 折叠多项式。
+        // 3. 最终，原本复杂的全局约束被“归约 (Reduce)”到 opening_accumulator 里的几个随机点上的求值。
         let (sumcheck_proof, _) = BatchedSumcheck::prove(
+            // 将 Box 转换为需要的可变引用迭代器
             instances.iter_mut().map(|v| &mut **v as _).collect(),
-            &mut self.opening_accumulator,
-            &mut self.transcript,
+            &mut self.opening_accumulator, // 更新累加器，供后续 PCS (Polynomial Commitment Scheme) 使用
+            &mut self.transcript,          // 将证明过程写入 Transcript，确保 Fiat-Shamir 安全性
         );
 
+        // 记录 Proving 结束的火焰图
         #[cfg(feature = "allocative")]
         write_instance_flamegraph_svg(&instances, "stage7_end_flamechart.svg");
 
-        // 后台释放资源
+        // ========================================================================
+        // 5. 工程优化：后台资源释放 (Background Drop)
+        // ========================================================================
+        // `instances` 中包含了巨大（可能数 GB）的多项式数据（之前 clone 的）。
+        // 在主线程中释放 (Drop) 这些庞大的 Vec/结构体会导致明显的阻塞 (CPU 停顿)。
+        // Jolt 采用将其转移到后台线程进行析构的策略，使得当前证明流水线能立刻返回，
+        // 从而大幅降低 Prover 的延迟。
         drop_in_background_thread(instances);
 
+        // 返回当前阶段生成的 Sumcheck 证明
         sumcheck_proof
     }
 
@@ -2298,6 +2359,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
             self.padded_trace_len,
             DoryContext::Main,
         );
+
 
         // 1. 获取统一的 Opening Point (验证点)。
         // 这个点来自 Stage 7 (HammingWeightClaimReduction)。
@@ -2613,10 +2675,16 @@ mod tests {
     #[test]
     #[serial]
     fn fib_e2e_dory() {
-        //test
+        //设置打印 DEBUG+INFO
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("debug"))
+            .finish();
+        let _ = tracing::subscriber::set_global_default(subscriber);
 
-        // tracing_subscriber::fmt::init();
-        let _ = tracing_subscriber::fmt().try_init();
+
+        //设置打印INFO
+        // let _ = tracing_subscriber::fmt().try_init();
+
         // 1. 初始化宿主程序：加载 "fibonacci-guest" 二进制文件。
         let mut program = host::Program::new("fibonacci-guest");
 
@@ -2695,6 +2763,15 @@ mod tests {
     #[test]
     #[serial]
     fn small_trace_e2e_dory() {
+        //设置打印 DEBUG+INFO
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("debug"))
+            .finish();
+        let _ = tracing::subscriber::set_global_default(subscriber);
+
+
+        //设置打印INFO
+        // let _ = tracing_subscriber::fmt().try_init();
         let mut program = host::Program::new("fibonacci-guest");
         let inputs = postcard::to_stdvec(&5u32).unwrap();
         let (bytecode, init_memory_state, _) = program.decode();
@@ -2749,6 +2826,15 @@ mod tests {
     #[test]
     #[serial]
     fn sha3_e2e_dory() {
+        //设置打印 DEBUG+INFO
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("debug"))
+            .finish();
+        let _ = tracing::subscriber::set_global_default(subscriber);
+
+
+        //设置打印INFO
+        // let _ = tracing_subscriber::fmt().try_init();
         // Ensure SHA3 inline library is linked and auto-registered
         #[cfg(feature = "host")]
         use jolt_inlines_keccak256 as _;

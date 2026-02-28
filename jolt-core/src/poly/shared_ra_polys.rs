@@ -39,7 +39,6 @@ use crate::zkvm::ram::remap_address;
 use common::constants::XLEN;
 use common::jolt_device::MemoryLayout;
 use rayon::prelude::*;
-use tracing::info;
 use tracer::instruction::Cycle;
 
 /// Maximum number of instruction RA chunks (lookup index splits into at most 32 chunks)
