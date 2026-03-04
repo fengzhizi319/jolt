@@ -173,30 +173,84 @@ impl<F: JoltField> RLCPolynomial<F> {
     #[tracing::instrument(skip_all)]
     pub fn new_streaming(
         one_hot_params: OneHotParams,
-        preprocessing: Arc<RLCStreamingData>,
-        trace_source: TraceSource,
-        poly_ids: Vec<CommittedPolynomial>,
-        coefficients: &[F],
-        mut advice_poly_map: HashMap<CommittedPolynomial, MultilinearPolynomial<F>>,
+        preprocessing: Arc<RLCStreamingData>, // 包含 Bytecode 和内存布局，用于辅助计算地址
+        trace_source: TraceSource,            // Trace 数据源（可以是内存中的 Vec<Cycle> 或磁盘上的迭代器）
+        poly_ids: Vec<CommittedPolynomial>,   // 需要组合的多项式 ID 列表
+        coefficients: &[F],                   // 对应的随机系数 (Gamma Powers)
+        mut advice_poly_map: HashMap<CommittedPolynomial, MultilinearPolynomial<F>>, // 较小的、已存在内存中的辅助多项式
     ) -> Self {
+        // 确保每个多项式 ID 都有对应的系数
         debug_assert_eq!(poly_ids.len(), coefficients.len());
 
+        // 1. 初始化三个分类容器
+        /*
+           【核心原理：以计算换空间 (Time-Space Tradeoff)】
+
+           Q: 为什么我们在这里丢弃实际的多项式值，而只存储元数据？
+           A: 为了适应超大规模的 Trace（可能包含数十亿行），这在内存中完全存不下。
+
+           Q: 既然要丢掉，那为何开始的时候（在 Prover 阶段）要生成多线形多项式的点值？
+           A: 因为点值在两个不同阶段都有用，但每次用完就得丢，否则内存爆炸：
+              1.【Commitment Phase (第一次生成)】：
+                 - 目的：生成承诺（Fingerprint）。
+                 - 状态：Prover 需要完整的点值来计算 Commitment。算完一块，丢一块。
+
+              2.【Opening / Sumcheck Phase (第二次生成 - 当前阶段)】：
+                 - 目的：计算并证明 P(r)。
+                 - 场景：Verifier 给出了随机挑战点 r。
+                 - 任务：Prover 需要计算多项式在 r 点的值 P(r)，以及相关的证明辅助值（如 Dory 中的 vector-matrix product）。
+                 - 实现：RLCPolynomial 不存值，而是存“配方”。当需要算 P(r) 相关数据时，
+                   它会根据配方再次流式遍历 Trace，实时还原出数值并与 r 进行运算。
+
+           总结：主要是为了在计算 P(r) 的过程中，避免维持一个巨大的 O(N) 数组。
+        */
+
+        // A类容器：Trace 衍生的密集多项式 (Dense)
+        // 存储 (ID, 系数) 对。
+        // 它们的值通常是 Trace 中前后两个状态的差值 (post - pre)
+        // 例子：Read/Write 计数器的增量。
+        // 解释：不需要存这个数组，只需要遍历 Trace 时做减法即可得到。
         let mut dense_polys = Vec::new();
+
+        // B类容器：Trace 衍生的独热多项式 (One-Hot)
+        // 存储 (ID, 系数) 对。
+        // 它们的值用于内存一致性检查，指示某个 Chunk 的值是否等于索引 k。
+        // 重新计算公式：Value(t, k) = 1 if chunk(trace[t]) == k else 0
         let mut onehot_polys = Vec::new();
+
+        // C类容器：内存常驻辅助多项式 (Advice)
+        // 存储 (系数, 多项式实体) 对。
+        // 这些多项式通常很小（与 Trace 长度无关或只占很小比例），且不直接通过简单的 Trace 公式生成，
+        // 所以我们保留它们的实体在内存中。
         let mut advice_polys = Vec::new();
 
+        // 2. 遍历所有请求，进行分类分流
         for (poly_id, coeff) in poly_ids.iter().zip(coefficients.iter()) {
             match poly_id {
+                // A类：密集多项式 (Dense)
+                // 这些多项式的值是 Trace 中前后两个状态的差值 (post - pre)
+                // 例子：Read/Write 计数器的增量。
+                // 解释：不需要存这个数组，只需要遍历 Trace 时做减法即可得到。
                 CommittedPolynomial::RdInc | CommittedPolynomial::RamInc => {
                     dense_polys.push((*poly_id, *coeff));
                 }
+
+                // B类：独热多项式 (One-Hot)
+                // 这些多项式的值涉及将数值拆分为 chunk，用于离线内存检查
+                // 例子：指令查找、内存读写一致性。
+                // 解释：不需要存巨大的 0/1 矩阵。只需要遍历 Trace，拿到数值算出它属于哪个 Chunk (k)，
+                // 那么在 k 位置就是 1，其他位置是 0。
                 CommittedPolynomial::InstructionRa(_)
                 | CommittedPolynomial::BytecodeRa(_)
                 | CommittedPolynomial::RamRa(_) => {
                     onehot_polys.push((*poly_id, *coeff));
                 }
+
+                // C类：辅助多项式 (Advice)
+                // 这些不依赖 Trace 流，而是独立的较小多项式
                 CommittedPolynomial::TrustedAdvice | CommittedPolynomial::UntrustedAdvice => {
-                    // Advice polynomials are passed in directly (not streamed from trace)
+                    // 如果 map 中存在该多项式，将其取出 (move) 并保存
+                    // 注意：这里保存的是实体数据 (MultilinearPolynomial)，因为它们体积小，不需要流式优化
                     if advice_poly_map.contains_key(poly_id) {
                         advice_polys.push((*coeff, advice_poly_map.remove(poly_id).unwrap()));
                     }
@@ -204,9 +258,17 @@ impl<F: JoltField> RLCPolynomial<F> {
             }
         }
 
+        // 3. 构建 RLCPolynomial 对象
         Self {
-            dense_rlc: vec![],   // Not materialized in streaming mode
-            one_hot_rlc: vec![], // Not materialized in streaming mode
+            // 关键点：对于流式 RLC，我们不在此处生成巨大的 dense_rlc/one_hot_rlc 向量。
+            // 设置为空 vec![] 以节省内存。
+            dense_rlc: vec![],
+            one_hot_rlc: vec![],
+
+            // 4. 填充流式上下文
+            // 将分类好的元数据和数据源封装到 StreamingRLCContext 中。
+            // 后续的 commit_rows 或 vector_matrix_product 会利用这个上下文
+            // 实时从 trace_source 读取数据并根据 coefficients 动态计算。
             streaming_context: Some(Arc::new(StreamingRLCContext {
                 dense_polys,
                 onehot_polys,

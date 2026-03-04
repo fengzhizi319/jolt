@@ -243,27 +243,44 @@ pub struct DoryOpeningState<F: JoltField> {
 }
 
 impl<F: JoltField> DoryOpeningState<F> {
-    /// Build streaming RLC polynomial from this state.
-    /// Streams directly from trace - no witness regeneration needed.
-    /// Advice polynomials are passed separately (not streamed from trace).
+    /// 构建流式 RLC (随机线性组合) 多项式。
+    /// 该多项式直接从 Trace 源流式读取数据，因此不需要重新生成巨大的 Witness 数据占用内存。
+    /// Advice 多项式（辅助多项式）体积较小，作为单独的参数传入，不在流中处理。
     #[tracing::instrument(skip_all)]
     pub fn build_streaming_rlc<PCS: CommitmentScheme<Field = F>>(
         &self,
         one_hot_params: OneHotParams,
         trace_source: TraceSource,
         rlc_streaming_data: Arc<RLCStreamingData>,
+        // opening_hints: 每个独立多项式的打开证明线索（即 Witness）
         mut opening_hints: HashMap<CommittedPolynomial, PCS::OpeningProofHint>,
+        // advice_polys: 较小的辅助多项式，直接保存在内存中
         advice_polys: HashMap<CommittedPolynomial, MultilinearPolynomial<F>>,
     ) -> (MultilinearPolynomial<F>, PCS::OpeningProofHint) {
-        // Accumulate gamma coefficients per polynomial
+
+        // 1. 聚合系数 (Accumulate gamma coefficients)
+        // 遍历所有的 (gamma, polynomial) 对。
+        // 如果同一个多项式出现多次（例如在不同的 Sumcheck 步骤中被用到），
+        // 我们将其对应的 gamma 值加在一起。
+        // 原理：a*P(x) + b*P(x) = (a+b)*P(x)
         let mut rlc_map = BTreeMap::new();
         for (gamma, (poly, _claim)) in self.gamma_powers.iter().zip(self.polynomial_claims.iter()) {
+            // *gamma 是当前的随机挑战系数
+            // *poly 是多项式的唯一标识符
             *rlc_map.entry(*poly).or_insert(F::zero()) += *gamma;
         }
 
+        // 2. 解构 Map 为向量
+        // poly_ids:  参与组合的所有唯一多项式 ID 列表
+        // coeffs:    对应的组合系数列表
         let (poly_ids, coeffs): (Vec<CommittedPolynomial>, Vec<F>) =
             rlc_map.iter().map(|(k, v)| (*k, *v)).unzip();
 
+        // 3. 构建虚拟 RLC 多项式对象
+        // 这里并没有执行大规模的加法运算。
+        // RLCPolynomial::new_streaming 创建了一个“惰性”对象。
+        // 只有当后续代码调用这个 joint_poly 的 evaluate 或迭代方法时，
+        // 它才会根据 poly_ids 去 trace_source 读取数据，并乘以 coeffs 进行求和。
         let joint_poly = MultilinearPolynomial::RLC(RLCPolynomial::new_streaming(
             one_hot_params,
             rlc_streaming_data,
@@ -273,13 +290,19 @@ impl<F: JoltField> DoryOpeningState<F> {
             advice_polys,
         ));
 
+        // 4. 提取对应的 Proof Hints
+        // 根据 rlc_map 中的 key，从传入的 opening_hints 中取出对应的 hint。
         let hints: Vec<PCS::OpeningProofHint> = rlc_map
             .into_keys()
             .map(|k| opening_hints.remove(&k).unwrap())
             .collect();
 
+        // 5. 组合 Hints
+        // 利用承诺方案的同态性质，将多个 Hint 按照相同的 coeffs 线性组合成一个单一的 Hint。
+        // 这样 Verifier 只需要验证这一个组合后的 Hint。
         let hint = PCS::combine_hints(hints, &coeffs);
 
+        // 返回组合后的虚拟多项式和组合后的证明线索
         (joint_poly, hint)
     }
 }
