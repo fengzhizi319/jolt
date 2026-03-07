@@ -100,40 +100,61 @@ impl CommitmentScheme for DoryCommitmentScheme {
     }
 
     fn prove<ProofTranscript: Transcript>(
-        setup: &Self::ProverSetup,
-        poly: &MultilinearPolynomial<ark_bn254::Fr>,
-        opening_point: &[<ark_bn254::Fr as JoltField>::Challenge],
-        hint: Option<Self::OpeningProofHint>,
-        transcript: &mut ProofTranscript,
+        setup: &Self::ProverSetup,                    // 公共参数 (SRS: Structured Reference String)
+        poly: &MultilinearPolynomial<ark_bn254::Fr>,  // 实际的多项式数据 (系数向量)
+        opening_point: &[<ark_bn254::Fr as JoltField>::Challenge], // 挑战点 r (Verifier 给出的随机点)
+        hint: Option<Self::OpeningProofHint>,         // 提示信息，包含之前计算好的 Tier 1 行承诺 (Row Commitments)
+        transcript: &mut ProofTranscript,             // Fiat-Shamir 变换用的 Transcript
     ) -> Self::Proof {
+        // 性能追踪埋点
         let _span = trace_span!("DoryCommitmentScheme::prove").entered();
 
+        // 1. 获取或重算行承诺 (Row Commitments)
+        // 这是 Dory 的关键优化。在 Commit 阶段，我们已经计算过每一行的 G1 承诺点。
+        // 为了节省时间，我们将由于这一步计算产生的中间结果作为 `hint` 传递进来。
+        // 如果没有 hint（这种情况很少见，通常意味着逻辑错误或非生产环境），则必须重新计算，非常耗时。
         let row_commitments = hint.unwrap_or_else(|| {
             let (_commitment, row_commitments) = Self::commit(poly, setup);
             row_commitments
         });
 
+        // 2. 获取矩阵维度参数
+        // DoryGlobals 维护了全局配置，定义了多项式被视为矩阵时的形状 (Rows x Cols)
         let num_cols = DoryGlobals::get_num_columns();
         let num_rows = DoryGlobals::get_max_num_rows();
-        let sigma = num_cols.log_2();
+        // nu: 行变量个数 (log2 of rows)
         let nu = num_rows.log_2();
+        // sigma: 列变量个数 (log2 of cols)
+        let sigma = num_cols.log_2();
 
-        // Dory uses the opposite endian-ness as Jolt
+        // 3. 变量序转换 (Endianness Adjustment)
+        // Jolt 和 Dory/Arkworks 对多项式变量的排列顺序定义是相反的。
+        // Jolt 通常使用 Big-Endian（高位优先），而底层库可能使用 Little-Endian（低位优先）。
+        // 必须反转挑战点的顺序，否则相当于求值求到了错误的坐标点上。
         let ark_point: Vec<ArkFr> = opening_point
             .iter()
-            .rev()  // Reverse the order for Dory
+            .rev()  // <--- 关键：反转变量顺序适配 Dory 库
             .map(|p| {
+                // 将 Jolt 的 Field 元素转换为 Arkworks 的 Field 元素
                 let f_val: ark_bn254::Fr = (*p).into();
                 jolt_to_ark(&f_val)
             })
             .collect();
 
+        // 4. Transcript 适配
+        // 将 Jolt 的通用 Transcript 包装成 Dory 库所需的特定格式
         let mut dory_transcript = JoltToDoryTranscript::<ProofTranscript>::new(transcript);
 
+        // 5. 调用底层 Dory 库生成证明
+        // 这里执行真正的密码学计算：
+        // - poly: 原始数据
+        // - ark_point: 挑战点
+        // - row_commitments: 之前算好的行承诺（作为证据基石）
+        // - nu, sigma: 维度参数
         dory::prove::<ArkFr, BN254, JoltG1Routines, JoltG2Routines, _, _>(
             poly,
             &ark_point,
-            row_commitments,
+            row_commitments, // 传入行承诺，证明过程会依赖它
             nu,
             sigma,
             setup,

@@ -260,9 +260,11 @@ impl<F: JoltField> DoryOpeningState<F> {
 
         // 1. 聚合系数 (Accumulate gamma coefficients)
         // 遍历所有的 (gamma, polynomial) 对。
-        // 如果同一个多项式出现多次（例如在不同的 Sumcheck 步骤中被用到），
+        // 如果同一个trace列多项式出现多次（例如在不同的 Sumcheck 步骤中被用到），
         // 我们将其对应的 gamma 值加在一起。
         // 原理：a*P(x) + b*P(x) = (a+b)*P(x)
+        // rlc_map 的 Key 是列的 ID (trace 中的哪一列)，Value 是聚合后的随机系数
+
         let mut rlc_map = BTreeMap::new();
         for (gamma, (poly, _claim)) in self.gamma_powers.iter().zip(self.polynomial_claims.iter()) {
             // *gamma 是当前的随机挑战系数

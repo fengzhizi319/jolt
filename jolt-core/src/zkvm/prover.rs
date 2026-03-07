@@ -572,6 +572,12 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
 
         // 1. 生成并提交 Witness 多项式：
         // 计算执行轨迹（Trace）相关的多项式，进行承诺（Commit），并生成打开证明的提示（Hints）。
+        // =========================================================
+        // [内存证明步骤 1: 承诺]
+        // 对执行轨迹进行承诺。这包含所有的内存操作(读/写标志, 地址, 值)。
+        // 此时 Trace 中的 Memory Access 信息被固定下来。
+        // =========================================================
+
         let (commitments, mut opening_proof_hints) = self.generate_and_commit_witness_polynomials();
 
         // 2. 处理 Advice（辅助输入）：
@@ -581,6 +587,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         self.generate_and_commit_trusted_advice();
 
         // 将 Advice 相关的打开提示（Hints）加入集合，以便在 Stage 8 的批量打开中使用。
+        // 收集 Hints 供最后 Dory 验证使用
         if let Some(hint) = self.advice.trusted_advice_hint.take() {
             opening_proof_hints.insert(CommittedPolynomial::TrustedAdvice, hint);
         }
@@ -589,6 +596,17 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         }
 
         // --- 执行各个阶段的 Sumcheck 证明协议 ---
+        // Stage 1 & 2: 指令查找 (Instruction Lookups) - 确保 Trace 中的 Opcode 正确执行
+
+        // =========================================================
+        // [查表计算步骤 1: 指令解码与标志位证明] (Stage 1 & 2)
+        // 查表的前提是知道每个 Cycle 到底执行了什么指令（是 ADD 还是 MUL？）。
+        // 这些阶段证明了 instruction flags 的正确性。
+        // Prover 这里的任务是：
+        // 1. 证明 Flag 多项式的 well-formedness。
+        // 2. 将关于 "Instruction Lookup" 的大声明拆解为一元多项式跳跃检查 (Unit-Skip)。
+        // =========================================================
+
 
         // Stage 1: 主要处理指令查找（Instruction Lookups）相关的一元跳跃（UniSkip）证明。
         let (stage1_uni_skip_first_round_proof, stage1_sumcheck_proof) = self.prove_stage1();
@@ -600,12 +618,63 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         let stage3_sumcheck_proof = self.prove_stage3();
 
         // Stage 4: 内存（RAM）和寄存器的读写一致性检查（Read/Write Checking），以及值评估（Val Evaluation）。
+        // =========================================================
+        // [内存证明步骤 2: 核心一致性检查] (Stage 4)
+        // 这是内存证明最关键的一步。也是 "读取旧状态 -> 写入新状态" 逻辑执行验证的地方。
+        // 1. RAM Read/Write Checking:
+        //    使用离线内存检查算法(Offline Memory Checking)。
+        //    Prover 构造读写指纹的多项式，证明:
+        //    Set(Init_RAM + Writes + Reads) == Permutation(Address_Sorted_Operations)
+        //    这保证了每次读操作都对应正确的写操作。
+        // 2. Registers Read/Write Checking:
+        //    这里同时也证明了寄存器文件的一致性(寄存器也是一种小型的 RAM)。
+        // 这里的 prove_stage4 实现了 Offline Memory Checking 算法：
+        // 1. 读取旧状态 (Read Old State):
+        //    验证在此次操作中读取的值 v_old，等于上一次该地址写入的值。
+        //    (对应元组 (a, v_old, t_old))
+        // 2. 写入新状态 (Write New State):
+        //    验证在此次操作后该地址的状态更新为 v_new。
+        //    如果操作是 READ，代码逻辑保证 v_new == v_old。
+        //    (对应元组 (a, v_new, t_new))
+        // Prover 在这里构建 Grand Product (连乘积) 多项式，证明：
+        // "所有读取操作获取的值" 集合 == "所有写入操作产生的值" 集合。
+        // =========================================================
+
         let stage4_sumcheck_proof = self.prove_stage4();
 
         // Stage 5: 寄存器值评估、RAM Read-Access (RA) Claim 归约、指令 Read-RAF 检查。
+
+        // =========================================================
+        // [内存证明步骤 3: 数值与地址归约] (Stage 5)
+        // Stage 4 验证了逻辑关系，Stage 5 验证数据本身。
+        // 1. RAM RA (Read-Access) Claim Reduction:
+        //    将 Stage 4 中产生的关于内存地址的大查询(64-bit)，
+        //    拆分为小的 Chunk 或 Bit 级查询，准备喂给 Lasso 查找表。
+        // 2. Register Val Evaluation: 因为寄存器值也是 64 位，也在这里处理。
+        // =========================================================
+
+        // =========================================================
+        // [查表计算步骤 2: Lasso 查表归约与分块处理] (Stage 5 也是查表核心)
+        // Jolt 使用 Lasso 查找参数来避免巨大的查找表。
+        // 对于 Instruction Lookups (如算术运算表):
+        // 1. "Instruction Read-RAF Checking": 读取指令的操作数。
+        // 2. 将 64-bit 操作数切分为小的 Chunks (如 16-bit)。
+        // 3. 证明 "Lookup(Chunk_i) 的组合" == "Claimed_Output"。
+        // 这里的 InstructionReadRafSumcheckProver 负责计算：
+        // "对于所有 Trace，操作数切片后的频率和查找表多项式是否匹配"。
+        // =========================================================
+
         let stage5_sumcheck_proof = self.prove_stage5();
 
         // Stage 6: 字节码读取检查、布尔性校验（Booleanity）、RAM RA 虚拟化检查以及 Advice Claim 归约的第一阶段。
+
+        // =========================================================
+        // [内存证明步骤 4: 虚拟化与 Advice] (Stage 6)
+        // 1. RAM RA Virtualization:
+        //    继续处理内存地址的虚拟化映射，验证地址分解的正确性。
+        // =========================================================
+
+
         let stage6_sumcheck_proof = self.prove_stage6();
 
         // Stage 7: 汉明权重（Hamming Weight）检查以及 Advice Claim 归约的第二阶段。
@@ -613,6 +682,23 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
 
         // Stage 8: 联合打开证明 (Joint Opening Proof)。
         // 使用 Dory 协议对之前所有阶段产生的多项式承诺点进行批量验证。
+
+        // =========================================================
+        // [内存证明步骤 5: 最终验证] (Stage 8)
+        // 联合打开证明 (Joint Opening Proof)。
+        // 所有的内存检查最终都归结为多项式在随机点上的值。
+        // 这里使用 Dory 协议，一次性证明上述所有 Stage 产生的 Evaluation Claim
+        // 确实是基于最开始 Commit 的那个 Trace (步骤 1) 计算出来的。
+        // =========================================================
+
+        // =========================================================
+        // [查表计算步骤 4: 最终点值验证] (Stage 8)
+        // 所有查表过程中产生的多项式（Opcode Flags, Chunks, Lookups counts）
+        // 最终都需要在随机点 r 处打开。这一步是把所有查表逻辑的正确性
+        // "锚定" 到最初的 Commitments 上。
+        // =========================================================
+
+
         let joint_opening_proof = self.prove_stage8(opening_proof_hints);
 
         // 测试环境下，断言所有虚拟打开（Virtual Openings）都已被证明，防止逻辑遗漏。
@@ -1536,6 +1622,11 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         //
         // 此步骤生成用于验证 "Read-Write Consistency" 的参数，
         // 确保每次读取寄存器得到的值，都是上一次写入该寄存器的值。
+        // ========================================================================
+        // [逻辑映射: 寄存器堆的 (a, v, t) 追踪]
+        // 寄存器虽小，但原理同 RAM。
+        // 这里准备验证：对于寄存器操作 i，v_{i, new} (本次写入) 将成为下一次读取该寄存器时的 v_{next, old}。
+        // ========================================================================
         let registers_read_write_checking_params = RegistersReadWriteCheckingParams::new(
             self.trace.len(),
             &self.opening_accumulator,
@@ -1546,13 +1637,20 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         // ========================================================================
         // 2. 累积 Advice (Accumulate Advice)
         // ========================================================================
-        // [算法原理: Advice Commitment & Fiat-Shamir]
-        // 在离线内存检查中，Prover 需要提供额外的 "Advice"（建议/辅助信息）。
-        // 最关键的 Advice 是 "按地址排序的 Trace" (Sorted Trace)。
+        // [核心逻辑: 链接 "读取旧状态" 与 "写入新状态"]
         //
-        // Verifier 无法自己排序（计算量太大），所以 Prover 提供排序后的数据。
-        // 此函数将这些 Advice 多项式（untrusted）进行承诺，并混入 Transcript，
-        // 以便 Verifier 生成随机挑战，防止 Prover 伪造排序数据。
+        //  "读取旧状态 (a, v_old, t_old)" 这一步，严重依赖于这里加载的数据。
+        // Jolt 预先生成了一个 "按地址排序的 Trace" (Advice)，在这个排序后的列表中，
+        // 同一个地址 a 的所有访问是相邻的。
+        //
+        // 因此，对于列表中的第 k 项操作：
+        // - 它代表 "写入新状态 (a, v_new, t_new)"。
+        // - 而列表中的第 k-1 项操作，天然就是该地址的 "上一次状态"，即 (a, v_old, t_old)。
+        //
+        // prover_accumulate_advice 将这个排序关系（即 t_old 到 t_new 的链接）
+        // 注入到证明系统中，是验证 "读到的 v_old 等于上次写入的 v" 的关键数据源。
+        // ========================================================================
+
         prover_accumulate_advice(
             &self.advice.untrusted_advice_polynomial, // Prover 提供的辅助多项式（如排序后的内存访问）
             &self.advice.trusted_advice_polynomial,   // 可信的系统多项式
@@ -1573,6 +1671,10 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         // Jolt 将 RAM 检查拆分为不同部分以优化性能。
 
         // a. RAM 值评估 (Val Evaluation)
+        // [逻辑映射: 验证初始状态 v_old]
+        // 如果某地址是第一次被访问，它的 "旧状态" v_old 必须来自于 "初始内存 (Init RAM)"。
+        // 这里负责验证针对初始内存的读取操作是否正确。
+
         // 这通常涉及验证内存的 "初始状态 (Init)" 或特定时间点的正确性。
         // one_hot_params 暗示这里可能使用了 One-Hot 编码来处理地址匹配，
         // 或者用于验证读操作命中了正确的内存单元。
@@ -1594,10 +1696,14 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         // ========================================================================
         // 4. 初始化具体的 Prover 实例 (Initialize Provers)
         // ========================================================================
+        // 在这里，Sumcheck 协议正式初始化，它将验证所有 (a, v, t) 元组构成的多重集合等式：
+        // {Init} ∪ {Write New} == {Read Old} ∪ {Final}
 
         // 4a. 寄存器读写一致性 Prover
-        // [算法原理: Grand Product Argument]
-        // 构建连乘积多项式，证明寄存器的访问记录在时间维度和空间（地址）维度上是一致的。
+        // [算法原理: Grand Product Argument]，构建连乘积多项式，证明寄存器的访问记录在时间维度和空间（地址）维度上是一致的。
+        // 验证寄存器的读写逻辑：v_new = (is_read ? v_old : written_value)
+
+
         let registers_read_write_checking = RegistersReadWriteCheckingProver::initialize(
             registers_read_write_checking_params,
             self.trace.clone(),

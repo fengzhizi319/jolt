@@ -1317,62 +1317,92 @@ impl<F: JoltField> InstructionReadRafSumcheckProver<F> {
     /// - For each c_hi, iterate sequentially over c_lo for cache locality
     /// - Use unreduced 5-limb accumulation within each c_hi block
     #[tracing::instrument(skip_all, name = "ReadRafSumcheckProver::compute_flag_claims")]
+    /// 计算 Table Flags 和 RAF Flag 在随机点 r_cycle 处的评估值
+    ///
+    /// **输入**: r_cycle (Verifier 发送的时间维度随机挑战点)
+    /// **输出**:
+    ///   1. Vec<F>: 每个查找表类型的 Flag 多项式评估值。如果 Vec[ADD] = v，意味着 "ADD 表的使用情况在 r 处的加权和为 v"。
+    ///   2. F: RAF (非交错操作数) Flag 的多项式评估值。
     fn compute_flag_claims(&self, r_cycle: &OpeningPoint<BIG_ENDIAN, F>) -> (Vec<F>, F) {
-        let T = self.trace.len();
-        let num_tables = LookupTables::<XLEN>::COUNT;
+        let T = self.trace.len(); // Trace 总长度 (总 Cycle 数)
+        let num_tables = LookupTables::<XLEN>::COUNT; // 系统中定义的查找表总数 (如 ADD, MUL, SUB 等)
 
-        // Split-eq: divide r_cycle into MSB (hi) and LSB (lo) halves
+        // ==========================================
+        // 1. Split-Eq 准备阶段
+        // ==========================================
+        // 将随机点 r_cycle 拆分为高位 (hi) 和低位 (lo) 两部分。
+        // 目的是利用公式 eq(r, t) = eq(r_hi, t_hi) * eq(r_lo, t_lo) 将计算矩阵化。
         let log_T = r_cycle.len();
         let lo_bits = log_T / 2;
         let hi_bits = log_T - lo_bits;
         let (r_hi, r_lo) = r_cycle.r.split_at(hi_bits);
 
+        // 并行预计算两个较小的 Eq 表：
+        // E_hi 大小约为 sqrt(T)，存储 eq(r_hi, 0..2^hi)
+        // E_lo 大小约为 sqrt(T)，存储 eq(r_lo, 0..2^lo)
         let (E_hi, E_lo) = rayon::join(
             || EqPolynomial::<F>::evals(r_hi),
             || EqPolynomial::<F>::evals(r_lo),
         );
 
-        let in_len = E_lo.len();
+        let in_len = E_lo.len(); // 块大小 (对应低位比特数)
 
-        // Parallel over E_hi chunks
+        // ==========================================
+        // 2. 并行计算核心逻辑
+        // ==========================================
         let num_threads = rayon::current_num_threads();
         let out_len = E_hi.len();
+        // 按照 E_hi (高位块) 进行并行切分
         let chunk_size = out_len.div_ceil(num_threads).max(1);
 
+        // E_hi 代表"大块"的时间段，这里并行遍历每一个大块
         E_hi.par_chunks(chunk_size)
             .enumerate()
             .map(|(chunk_idx, chunk)| {
-                // Partial accumulators for this thread (field elements)
+                // --- 线程局部累加器 ---
+                // partial_flags: 存储该线程负责的时间段内，各 Table Flag 的贡献值
                 let mut partial_flags: Vec<F> = vec![F::zero(); num_tables];
                 let mut partial_raf: F = F::zero();
 
+                // 计算该线程负责的全局起始大块索引
                 let chunk_start = chunk_idx * chunk_size;
-                for (local_idx, &e_hi) in chunk.iter().enumerate() {
-                    let c_hi = chunk_start + local_idx;
-                    let c_hi_base = c_hi * in_len;
 
-                    // Local unreduced accumulators for this c_hi (5-limb)
+                // 遍历分配给当前线程的每一个高位索引 (c_hi)
+                for (local_idx, &e_hi) in chunk.iter().enumerate() {
+                    let c_hi = chunk_start + local_idx; // 当前的高位索引
+                    let c_hi_base = c_hi * in_len;      // 当前高位对应的 Trace 起始位置
+
+                    // 使用"未归约"(Unreduced) 的累加器，减少模运算开销 (性能优化关键点)
+                    // 5-limb 是针对特定 Field 的优化表示
                     let mut local_flags: Vec<F::Unreduced<5>> =
                         vec![F::Unreduced::<5>::zero(); num_tables];
                     let mut local_raf: F::Unreduced<5> = F::Unreduced::<5>::zero();
 
-                    // Sequential over c_lo (contiguous cycles for this c_hi)
+                    // --- 内层循环 (Cache Friendly) ---
+                    // 顺序遍历当前大块内的所有小步骤 (c_lo)
+                    // 这里的内存访问是连续的 (trace[j], trace[j+1]...)，极大提高了效率
                     for c_lo in 0..in_len {
-                        let j = c_hi_base + c_lo;
+                        let j = c_hi_base + c_lo; // 计算绝对 Cycle 索引 t
                         if j >= T {
-                            break;
+                            break; // 处理 Trace 长度非 2 的幂次的情况
                         }
 
                         let cycle = &self.trace[j];
+                        // 获取当前时刻 t 的低位 Eq 权重: eq(r_lo, t_lo)
                         let e_lo_unreduced = *E_lo[c_lo].as_unreduced_ref();
 
-                        // Accumulate table flag
+                        // [逻辑 A]: 计算 Table Flags
+                        // 如果 Cycle j 使用了某个查找表 (如 ADD)，则对应的 Flag 为 1
+                        // 此时我们在累加器中加上当前的权重 e_lo_unreduced
+                        // 公式项：1 * eq(t)
                         if let Some(table) = cycle.lookup_table() {
                             let t_idx = LookupTables::<XLEN>::enum_index(&table);
                             local_flags[t_idx] += e_lo_unreduced;
                         }
 
-                        // Accumulate RAF flag (identity = not interleaved)
+                        // [逻辑 B]: 计算 RAF Flag (Identity Path)
+                        // RAF (Read/Arithmetic/Flag) 逻辑中，Identity 路径通常对应非交错操作
+                        // 如果当前指令不是 interleaved (是普通 64bit 操作)，则 Flag 为 1
                         if !cycle
                             .instruction()
                             .circuit_flags()
@@ -1382,7 +1412,10 @@ impl<F: JoltField> InstructionReadRafSumcheckProver<F> {
                         }
                     }
 
-                    // Reduce and scale by e_hi
+                    // --- 归约与合并 ---
+                    // 到这里，local_accumulators 包含了 sum(eq_lo) for valid cycles
+                    // 现在需要乘以高位权重 eq_hi 并累加到线程总和中
+                    // 贡献 = eq_hi * (sum_{lo} eq_lo * flag)
                     for t_idx in 0..num_tables {
                         let reduced = F::from_barrett_reduce::<5>(local_flags[t_idx]);
                         partial_flags[t_idx] += e_hi * reduced;
@@ -1393,9 +1426,14 @@ impl<F: JoltField> InstructionReadRafSumcheckProver<F> {
 
                 (partial_flags, partial_raf)
             })
+            // ==========================================
+            // 3. 全局归约 (Reduce)
+            // ==========================================
+            // 将所有线程计算出的 partial_flags 和 partial_raf 加在一起
             .reduce(
                 || (vec![F::zero(); num_tables], F::zero()),
                 |(mut a_flags, a_raf), (b_flags, b_raf)| {
+                    // 向量加法
                     for (a, b) in a_flags.iter_mut().zip(b_flags.iter()) {
                         *a += *b;
                     }
@@ -1677,7 +1715,7 @@ mod tests {
         let _r_cycle: Vec<<Fr as JoltField>::Challenge> =
             verifier_transcript.challenge_vector_optimized::<Fr>(LOG_T);
 
-        // 计算 Eq 多项式在 r_cycle 处的评估值，即 [eq(r_cycle, 0), ..., eq(r_cycle, T-1)]
+        // 计算 Eq 多项式在 r_cycle 处的评估值，即 [eq(r_cycle, 0), ..., eq(r_cycle, T-1)]，用来计算p(r)
         let eq_r_cycle = EqPolynomial::<Fr>::evals(&r_cycle);
 
         // 5. 手动计算预期的各个 Claim (Ground Truth)
