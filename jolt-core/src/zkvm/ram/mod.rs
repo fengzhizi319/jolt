@@ -241,40 +241,77 @@ pub fn populate_memory_states(
 /// Otherwise opens at TWO points:
 /// 1. `r_address_rw` from `RamVal`/`RamReadWriteChecking` - used by `ValEvaluationSumcheck`
 /// 2. `r_address_raf` from `RamValFinal`/`RamOutputCheck` - used by `ValFinalSumcheck`
+/// 将 Advice 多项式（可信和不可信）累积到 Prover 的打开累加器中。
+///
+/// Advice 多项式通常代表了内存的某些特定状态（如只读代码段、初始内存值等）。
+/// 内存检查协议需要验证：
+/// 1. `RamValEvaluation`: check(Initial_State)
+/// 2. `RamValFinalEvaluation`: check(Final_State)
+/// 这两个检查都需要读取 Advice 多项式的值。
+///
+/// 根据 `single_opening` 标志：
+/// - 如果为 true（通常涉及阶段优化）：只在一个点 `r_address_rw` 打开。
+/// - 否则（标准流程）：在两个点打开：
+///   1. `r_address_rw`: 来自 `RamReadWriteChecking`，用于验证初始值（ValEvaluation）。
+///   2. `r_address_raf`: 来自 `RamOutputCheck`，用于验证最终值（ValFinal）。
 pub fn prover_accumulate_advice<F: JoltField>(
-    untrusted_advice_polynomial: &Option<MultilinearPolynomial<F>>,
-    trusted_advice_polynomial: &Option<MultilinearPolynomial<F>>,
+    untrusted_advice_polynomial: &Option<MultilinearPolynomial<F>>, // 不可信 Advice（如排序后的 Trace，或动态生成的初始内存）
+    trusted_advice_polynomial: &Option<MultilinearPolynomial<F>>,   // 可信 Advice（如预编译的 ROM/字节码）
     memory_layout: &MemoryLayout,
     one_hot_params: &OneHotParams,
-    opening_accumulator: &mut ProverOpeningAccumulator<F>,
+    opening_accumulator: &mut ProverOpeningAccumulator<F>, // 用于收集待验证的 (Point, Value) 对
     transcript: &mut impl Transcript,
     single_opening: bool,
 ) {
+    // RAM 地址空间的总变量数 (log2(K))
     let total_variables = one_hot_params.ram_k.log_2();
 
-    // Get r_address_rw from RamVal/RamReadWriteChecking (used by ValEvaluation)
+    // =========================================================
+    // 步骤 1: 获取读写检查阶段产生的随机挑战点 (r_address_rw)
+    // =========================================================
+    // `RamReadWriteChecking` 阶段已经确定了一个随机点 r_rw。
+    // `ValEvaluation` (值评估) 必须使用相同的地址点来确保证明的一致性。
+    // 这里我们从累加器中把这个点取出来。
     let (r_rw, _) = opening_accumulator.get_virtual_polynomial_opening(
-        VirtualPolynomial::RamVal,
-        SumcheckId::RamReadWriteChecking,
+        VirtualPolynomial::RamVal,       // 对应内存值的虚拟多项式
+        SumcheckId::RamReadWriteChecking, // 对应的 Sumcheck ID
     );
+    // 截取 r 向量的前半部分，作为地址的随机挑战点 r_address
     let (r_address_rw, _) = r_rw.split_at(total_variables);
 
+    // 辅助闭包：计算 Advice 多项式在特定随机点上的值
+    // Advice 通常只覆盖内存的一部分（例如只用了 1MB，而地址空间是 4GB），
+    // 所以只需要用到随机点 r 的一部分（低位）。
     let compute_advice_opening = |advice_poly: &MultilinearPolynomial<F>,
                                   r_address: &OpeningPoint<BIG_ENDIAN, F>,
                                   max_advice_size: usize| {
+        // 计算 Advice 实际覆盖的大小对应的变量数 (log2(Size))
         let advice_variables = (max_advice_size / 8).next_power_of_two().log_2();
+
+        // 截取 r_address 的后半部分（低有效位）进行评估
+        // 例如：如果地址是 64位，但在该 Advice 块内只用到了低 10位偏移。
         let eval = advice_poly.evaluate(&r_address.r[total_variables - advice_variables..]);
+
+        // 构造一个新的 OpeningPoint 对象用于返回
         let mut advice_point = r_address.clone();
         advice_point.r = r_address.r[total_variables - advice_variables..].to_vec();
         (advice_point, eval)
     };
 
+    // =========================================================
+    // 步骤 2: 处理不可信 Advice (Untrusted Advice)
+    // =========================================================
+    // 这通常是 Prover 为本次执行提供的辅助数据。
     if let Some(ref untrusted_advice_poly) = untrusted_advice_polynomial {
         let max_size = memory_layout.max_untrusted_advice_size as usize;
 
-        // Opening at r_address_rw (for ValEvaluation)
+        // 2.1: 在 r_address_rw 点打开
+        // 目的：为 RamValEvaluationSumcheck 提供数据，证明“初始状态”正确。
         let (point_rw, eval_rw) =
             compute_advice_opening(untrusted_advice_poly, &r_address_rw, max_size);
+
+        // 将这个打开声明 (Opening Claim) 加入累加器。
+        // 稍后会使用 Dory 协议批量验证：Prover 声称 poly(point_rw) = eval_rw 是否为真。
         opening_accumulator.append_untrusted_advice(
             transcript,
             SumcheckId::RamValEvaluation,
@@ -282,14 +319,20 @@ pub fn prover_accumulate_advice<F: JoltField>(
             eval_rw,
         );
 
-        // Opening at r_address_raf (for ValFinalEvaluation) - only if points differ
+        // 2.2: 在 r_address_raf 点打开 (仅当不是 single_opening 时)
+        // 目的：为 ValFinalSumcheck 提供数据，证明“最终状态”正确。
         if !single_opening {
+            // 获取 RamOutputCheck (Stage 2) 产生的随机点 r_raf
             let (r_raf, _) = opening_accumulator.get_virtual_polynomial_opening(
                 VirtualPolynomial::RamValFinal,
                 SumcheckId::RamOutputCheck,
             );
+
+            // 计算 Advice 在 r_raf 处的评估值
             let (point_raf, eval_raf) =
                 compute_advice_opening(untrusted_advice_poly, &r_raf, max_size);
+
+            // 加入证明队列
             opening_accumulator.append_untrusted_advice(
                 transcript,
                 SumcheckId::RamValFinalEvaluation,
@@ -299,10 +342,15 @@ pub fn prover_accumulate_advice<F: JoltField>(
         }
     }
 
+    // =========================================================
+    // 步骤 3: 处理可信 Advice (Trusted Advice)
+    // =========================================================
+    // 这通常是只读内存、ROM 或程序代码，是预处理阶段确定的。
+    // 处理逻辑同上。
     if let Some(ref trusted_advice_poly) = trusted_advice_polynomial {
         let max_size = memory_layout.max_trusted_advice_size as usize;
 
-        // Opening at r_address_rw (for ValEvaluation)
+        // 3.1: 在 r_address_rw 点打开 (用于初始状态校验)
         let (point_rw, eval_rw) =
             compute_advice_opening(trusted_advice_poly, &r_address_rw, max_size);
         opening_accumulator.append_trusted_advice(
@@ -312,7 +360,7 @@ pub fn prover_accumulate_advice<F: JoltField>(
             eval_rw,
         );
 
-        // Opening at r_address_raf (for ValFinalEvaluation) - only if points differ
+        // 3.2: 在 r_address_raf 点打开 (用于最终状态校验)
         if !single_opening {
             let (r_raf, _) = opening_accumulator.get_virtual_polynomial_opening(
                 VirtualPolynomial::RamValFinal,

@@ -1425,7 +1425,7 @@ JoltCpuProver<'a, F, PCS, ProofTranscript>
         (first_round_proof, sumcheck_proof)
     }
 
-    /// 执行第三阶段的 Sumcheck 证明（Stage 3 Proving）。
+    /// 执行第三阶段的 Sumcheck 证明（Stage 3 Proving）。 
     ///
     /// # 作用
     /// Stage 3 聚焦于 **Spartan Internal Consistency（内部一致性）**。

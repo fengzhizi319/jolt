@@ -98,13 +98,48 @@ impl<F: JoltField> ReadWriteMatrixCycleMajor<F, RamCycleMajorEntry<F>> {
     /// Creates a new `ReadWriteMatrixCycleMajor` to represent the ra and Val polynomials
     /// for the RAM read/write checking sumcheck.
     #[tracing::instrument(skip_all, name = "ReadWriteMatrixCycleMajor::new")]
+
+    /// Creates a new `ReadWriteMatrixCycleMajor` to represent the ra and Val polynomials
+    /// for the RAM read/write checking sumcheck.
+    ///
+    /// [中文解释]
+    /// 该函数将线性的执行轨迹（trace）转换为稀疏矩阵表示（Entries），用于后续的 RAM 读写一致性 Sumcheck。
+    /// 这里的“Matrix”概念上是一个 [Addresses x Cycles] 的矩阵，但由于它是极度稀疏的
+    /// （大多数指令不访问内存，或只访问特定地址），我们只存储非零的 Entry。
+    ///
+    /// # 作用
+    /// 1. **过滤**：剔除没有 RAM 操作的指令（如 ADD, SUB 等寄存器操作）。
+    /// 2. **映射**：将 Trace 中的 `RAMAccess` 转换为矩阵条目 `RamCycleMajorEntry`。
+    /// 3. **初始化**：绑定初始内存状态 `val_init`。
+    ///
+    /// # 举例说明
+    /// 假设内存地址 0x10 初始值为 100。
+    /// 1. **Cycle 0**: `ADD R1, R2` (无内存访问) -> **不生成 Entry**。
+    /// 2. **Cycle 5**: `LW R1, 0x10` (读取 0x10) -> 生成 Entry:
+    ///    - row: 5 (时间)
+    ///    - col: map(0x10) (地址索引)
+    ///    - val_coeff: 100, prev: 100, next: 100 (读操作不改变状态)
+    /// 3. **Cycle 8**: `SW 200, 0x10` (写入 200 到 0x10) -> 生成 Entry:
+    ///    - row: 8 (时间)
+    ///    - col: map(0x10) (地址索引)
+    ///    - val_coeff: 100 (写入前的旧值), prev: 100, next: 200 (状态流转)
+    #[tracing::instrument(skip_all, name = "ReadWriteMatrixCycleMajor::new")]
     pub fn new(trace: &[Cycle], val_init: Vec<F>, memory_layout: &MemoryLayout) -> Self {
+        // 使用并行迭代器 (par_iter) 提高处理长 Trace 的效率
         let entries: Vec<_> = trace
             .par_iter()
-            .enumerate()
-            .filter_map(|(j, cycle)| RamCycleMajorEntry::from_cycle(cycle, j, memory_layout))
+            .enumerate() // 获取指令的序号，即 "时间戳" (j)
+            .filter_map(|(j, cycle)| {
+                // 调用 Entry 的构造函数。
+                // 如果当前 cycle 是 RAM 读/写操作，返回 Some(Entry)；
+                // 如果是纯计算指令，返回 None，被 filter_map 过滤掉。
+                RamCycleMajorEntry::from_cycle(cycle, j, memory_layout)
+            })
             .collect();
 
+        // 返回构建好的稀疏矩阵结构体
+        // entries: 按时间顺序排列的内存访问记录
+        // val_init: 内存的初始“快照”（Time=0 时的状态）
         ReadWriteMatrixCycleMajor {
             entries,
             val_init: val_init.into(),
