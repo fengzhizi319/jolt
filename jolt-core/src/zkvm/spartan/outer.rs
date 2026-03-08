@@ -13,20 +13,26 @@ use crate::poly::eq_poly::EqPolynomial;
 use crate::poly::lagrange_poly::LagrangePolynomial;
 use crate::poly::multilinear_polynomial::{BindingOrder, PolynomialBinding};
 use crate::poly::multiquadratic_poly::MultiquadraticPolynomial;
+#[cfg(feature = "zk")]
+use crate::poly::opening_proof::OpeningId;
 use crate::poly::opening_proof::{
     OpeningAccumulator, OpeningPoint, ProverOpeningAccumulator, SumcheckId,
     VerifierOpeningAccumulator, BIG_ENDIAN, LITTLE_ENDIAN,
 };
 use crate::poly::split_eq_poly::GruenSplitEqPolynomial;
 use crate::poly::unipoly::UniPoly;
+#[cfg(feature = "zk")]
+use crate::subprotocols::blindfold::{
+    InputClaimConstraint, OutputClaimConstraint, ProductTerm, ValueSource,
+};
 use crate::subprotocols::streaming_sumcheck::{
-    LinearSumcheckStage, SharedStreamingSumcheckState, StreamingSumcheck, StreamingSumcheckWindow,
+    LinearSumcheckStage, StreamingSumcheck, StreamingSumcheckWindow,
 };
 use crate::subprotocols::sumcheck_prover::SumcheckInstanceProver;
 use crate::subprotocols::sumcheck_verifier::{SumcheckInstanceParams, SumcheckInstanceVerifier};
 use crate::subprotocols::univariate_skip::build_uniskip_first_round_poly;
 use crate::transcripts::Transcript;
-use crate::utils::accumulation::{Acc5U, Acc6S, Acc7S, Acc8S};
+use crate::utils::accumulation::{FullAccumS, MedAccumS, SmallAccumU, WideAccumS};
 use crate::utils::expanding_table::ExpandingTable;
 use crate::utils::math::Math;
 #[cfg(feature = "allocative")]
@@ -34,6 +40,10 @@ use crate::utils::profiling::print_data_structure_heap_usage;
 use crate::utils::thread::unsafe_allocate_zero_vec;
 use crate::zkvm::bytecode::BytecodePreprocessing;
 use crate::zkvm::r1cs::constraints::OUTER_FIRST_ROUND_POLY_DEGREE_BOUND;
+#[cfg(feature = "zk")]
+use crate::zkvm::r1cs::constraints::{R1CS_CONSTRAINTS_FIRST_GROUP, R1CS_CONSTRAINTS_SECOND_GROUP};
+#[cfg(feature = "zk")]
+use crate::zkvm::r1cs::inputs::NUM_R1CS_INPUTS;
 use crate::zkvm::r1cs::key::UniformSpartanKey;
 use crate::zkvm::r1cs::{
     constraints::{
@@ -112,6 +122,28 @@ impl<F: JoltField> SumcheckInstanceParams<F> for OuterUniSkipParams<F> {
     ) -> OpeningPoint<BIG_ENDIAN, F> {
         challenges.to_vec().into()
     }
+
+    #[cfg(feature = "zk")]
+    fn input_claim_constraint(&self) -> InputClaimConstraint {
+        InputClaimConstraint::default()
+    }
+
+    #[cfg(feature = "zk")]
+    fn input_constraint_challenge_values(&self, _: &dyn OpeningAccumulator<F>) -> Vec<F> {
+        Vec::new()
+    }
+
+    #[cfg(feature = "zk")]
+    fn output_claim_constraint(&self) -> Option<OutputClaimConstraint> {
+        // Uni-skip output = evaluation at challenge r0, stored as UnivariateSkip opening
+        let opening = OpeningId::virt(VirtualPolynomial::UnivariateSkip, SumcheckId::SpartanOuter);
+        Some(OutputClaimConstraint::direct(opening))
+    }
+
+    #[cfg(feature = "zk")]
+    fn output_constraint_challenge_values(&self, _sumcheck_challenges: &[F::Challenge]) -> Vec<F> {
+        Vec::new()
+    }
 }
 
 /// Uni-skip instance for Spartan outer sumcheck, computing the first-round polynomial only.
@@ -128,53 +160,26 @@ pub struct OuterUniSkipProver<F: JoltField> {
 
 impl<F: JoltField> OuterUniSkipProver<F> {
     #[tracing::instrument(skip_all, name = "OuterUniSkipInstanceProver::initialize")]
-    /// 初始化 OuterUniSkipInstance 证明者实例。
-    ///
-    /// 该函数是在 Sumcheck 协议开始前调用的，用于准备证明所需的数据结构。
-    /// 它主要负责根据验证者提供的随机挑战点 `tau`，预先计算 Trace 多项式在这一点的评估值。
-    ///
-    /// # 参数
-    ///
-    /// * `params`: 包含协议参数，最重要的是 `tau` (随机挑战向量，通常来自上一轮 Sumcheck 或 Fiat-Shamir 变换)。
-    /// * `trace`: 程序的执行轨迹 (Execution Trace)，包含了每一步的 CPU 状态 (Cycle)。
-    /// * `bytecode_preprocessing`: 对程序字节码的静态预处理信息 (如指令解码信息)，用于辅助多项式评估。
-    ///
-    /// # 返回值
-    ///
-    /// 返回一个初始化的 `Self` (即 `OuterUniSkipInstance`)，包含后续 Sumcheck 步骤所需的所有状态。
     pub fn initialize(
         params: OuterUniSkipParams<F>,
         trace: &[Cycle],
         bytecode_preprocessing: &BytecodePreprocessing,
     ) -> Self {
-        // 核心步骤：计算扩展评估值 (Extended Evaluations)。
-        // 算法逻辑：
-        // 这里的 `tau` 是一个多线性扩展的随机挑战点（Random Challenge Point）。
-        // 函数会根据 Bytecode 信息和动态的 Trace 数据，计算出相关多项式（可能是由 Trace 列构成的多项式）
-        // 在该随机点 `tau` 上的值 (或者其某种形式的投影/扩展)。得到sum-check矩阵，正常情况下矩阵所有点都为0
-        // 这些值是后续进行线性时间 Sumcheck (Linear-time Sumcheck) 的基础。
-        // "Univariate Skip" 暗示这里可能涉及对 Trace 中某些行或逻辑的跳过处理，或者是一种基于单变量多项式的优化技术。
-        //计算g1(10)，g1(-1),g1(11),g1(-2),g1(12),g1(-3),g1(13),g1(-4),g1(14),g1(-5),即在扩展点上的值
         let extended = Self::compute_univariate_skip_extended_evals(
-            bytecode_preprocessing, // 用于确定每行 Trace 对应的具体计算逻辑（指令行为）
-            trace,                  // 实际的 Witness 数据
-            &params.tau,            // 随机评估点
+            bytecode_preprocessing,
+            trace,
+            &params.tau,
         );
 
-        // 构建实例结构体
         let instance = Self {
-            params,                  // 保存参数以便后续轮次使用
-            extended_evals: extended,// 保存计算好的评估值，Sumcheck 过程中会不断折叠(fold)这些值
-            r0: None,                // 初始化状态，r0 可能用于存储某一轮的随机数，此时尚未生成
-            uni_poly: None,          // 初始化状态，缓存当前轮次生成的单变量多项式
+            params,
+            extended_evals: extended,
+            r0: None,
+            uni_poly: None,
         };
 
-        // 调试/性能分析：
-        // 如果开启了 "allocative" 特性，则打印该结构体的堆内存使用情况。
-        // 这对于优化大规模 ZK 证明器的内存消耗非常重要。
         #[cfg(feature = "allocative")]
         print_data_structure_heap_usage("OuterUniSkipInstance", &instance);
-
         instance
     }
 
@@ -192,123 +197,66 @@ impl<F: JoltField> OuterUniSkipProver<F> {
     ///
     /// \sum_{x_in'} eq(tau_in, (x_in', 0)) * Az(x_out, x_in', 0, y) * Bz(x_out, x_in', 0, y)
     ///     + eq(tau_in, (x_in', 1)) * Az(x_out, x_in', 1, y) * Bz(x_out, x_in', 1, y)
-    /// 计算单变量跳跃多项式（univariate skip polynomial）在扩展域上的评估值。（-1，5，-2，4，-3）
-    ///
-    /// 目标是计算：
-    /// t_1(y) = \sum_{x_out} eq(tau_out, x_out) * \sum_{x_in} eq(tau_in, x_in) * Az(x_out, x_in, y) * Bz(x_out, x_in, y)
-    ///
-    /// 其中：
-    /// - y: 在扩展域 {−D..D} 中的点（基窗口之外）。
-    /// - x_in 的最后一个比特对应约束的分组（Group Index）。这意味着我们将约束分为了两半。
-    /// - x_in 的其余比特与 x_out 组合，对应实际的 Trace 步骤（Step Index）。
-    ///
-    /// 具体的计算逻辑如下：
-    /// \sum_{x_in'} eq(tau_in, (x_in', 0)) * Az(x_out, x_in', 0, y) * Bz(x_out, x_in', 0, y)
-    ///     + eq(tau_in, (x_in', 1)) * Az(x_out, x_in', 1, y) * Bz(x_out, x_in', 1, y)
     fn compute_univariate_skip_extended_evals(
-        bytecode_preprocessing: &BytecodePreprocessing, // 预处理数据（包含矩阵 A, B, C 的结构信息）
-        trace: &[Cycle],                                // 执行轨迹（CPU 每一周期的状态）
-        tau: &[F::Challenge],                           // Sum-Check 的随机挑战点向量
-    ) -> [F; OUTER_UNIVARIATE_SKIP_DEGREE] {            // 返回值：多项式在特定点（通常是 0, 1, ...）的评估值
-
-        // -------------------------------------------------------------------
-        // 1. 初始化 Gruen 分裂 Eq 多项式生成器，建立缓存预计算表
-        // -------------------------------------------------------------------
-        // 原理：eq(τ, x) 可以分解为 eq(τ_high, x_high) * eq(τ_low, x_low)。
-
+        bytecode_preprocessing: &BytecodePreprocessing,
+        trace: &[Cycle],
+        tau: &[F::Challenge],
+    ) -> [F; OUTER_UNIVARIATE_SKIP_DEGREE] {
+        // Build split-eq over full τ; new_with_scaling drops the last variable (τ_high) for the split,
+        // and we carry an outer scaling factor (R^2) via current_scalar.
         let split_eq = GruenSplitEqPolynomial::<F>::new_with_scaling(
             tau,
             BindingOrder::LowToHigh,
-            Some(F::MONTGOMERY_R_SQUARE), // 初始乘子设为 R^2，用于抵消蒙哥马利约简的因子
+            Some(F::MONTGOMERY_R_SQUARE),
         );
-
-        // 获取当前的外部缩放因子（此处初始为 R^2，用于修正后续蒙哥马利约简的系数）
-        let outer_scale = split_eq.get_current_scalar();
-
-        // -------------------------------------------------------------------
-        // 2. 计算维度与并行参数
-        // -------------------------------------------------------------------
-        let e_out = split_eq.E_out_current();
-        let e_in = split_eq.E_in_current();
-        let out_len = e_out.len();
-        let in_len = e_in.len();
+        let outer_scale = split_eq.get_current_scalar(); // = R^2 at this stage
 
         let num_x_in_bits = split_eq.E_in_current_len().log_2();
+        let num_x_in_prime_bits = num_x_in_bits.saturating_sub(1); // ignore last bit (group index)
 
-        // num_x_in_prime_bits: 真实的 Trace 索引在 "In" 部分占用的比特数。
-        // 关键点：因为 Jolt 将约束分为两组，使用索引的最低位 (LSB) 作为选择位。
-        // 所以，实际映射到 Trace 行号的比特数需要减 1。
-        let num_x_in_prime_bits = num_x_in_bits.saturating_sub(1);
+        split_eq
+            .par_fold_out_in(
+                || [FullAccumS::<F>::zero(); OUTER_UNIVARIATE_SKIP_DEGREE],
+                |inner, g, x_in, e_in| {
+                    // Decode (x_out, x_in') from g and choose group by the last x_in bit
+                    let x_out = g >> num_x_in_bits;
+                    let x_in_prime = x_in >> 1;
+                    let base_step_idx = (x_out << num_x_in_prime_bits) | x_in_prime;
 
-        // -------------------------------------------------------------------
-        // 3. 串行折叠 (Serial Fold)
-        // -------------------------------------------------------------------
+                    let row_inputs = R1CSCycleInputs::from_trace::<F>(
+                        bytecode_preprocessing,
+                        trace,
+                        base_step_idx,
+                    );
+                    let eval = R1CSEval::<F>::from_cycle_inputs(&row_inputs);
 
-        let mut final_acc = [F::zero(); OUTER_UNIVARIATE_SKIP_DEGREE];
-        // info!("Starting univariate-skip extended evals computation: out_len = {}, in_len = {}", out_len, in_len);//out_len = 32, in_len = 32
-        // 遍历 External 变量组合 (x_out)
-        for x_out in 0..out_len {
-            let mut inner_acc = [Acc8S::<F>::zero(); OUTER_UNIVARIATE_SKIP_DEGREE];
-
-            // 遍历 Internal 变量组合 (x_in)
-            for x_in in 0..in_len {
-                let e_in_val = e_in[x_in];
-                // info!("Processing x_out = {}, x_in = {}, e_in_val = {}", x_out, x_in, e_in_val);
-
-                // --- 步骤 I: 索引解码 (Mapping) ---
-                // x_out 是高位索引
-                // x_in_prime 是低位索引中属于 "行号" 的部分
-                let x_in_prime = x_in >> 1;
-
-                // 拼接高位和低位，算出当前是在处理 Trace 的第几行 (Cycle Index)
-                let base_step_idx = (x_out << num_x_in_prime_bits) | x_in_prime;
-                // info!("Processing x_out = {}, x_in = {}, base_step_idx = {}", x_out, x_in, base_step_idx);
-
-                // --- 步骤 II: 实时计算 Az, Bz (On-the-fly) ---
-                let row_inputs = R1CSCycleInputs::from_trace::<F>(
-                    bytecode_preprocessing,
-                    trace,
-                    base_step_idx,
-                );
-
-                let eval = R1CSEval::<F>::from_cycle_inputs(&row_inputs);
-
-                // --- 步骤 III: 分组选择 (Group Selection) ---
-                let is_group1 = (x_in & 1) == 1;
-                // info!("is_group1 = {}", is_group1);
-
-                // --- 步骤 IV: 累加多项式评估值 ---
-                for j in 0..OUTER_UNIVARIATE_SKIP_DEGREE {
-                    let prod_s192 = if !is_group1 {
-                       // info!("Using first group for j = {}", j);
-                        eval.extended_azbz_product_first_group(j)
-                    } else {
-                        // info!("Using second group for j = {}", j);
-                        eval.extended_azbz_product_second_group(j)
-                    };
-
-                    inner_acc[j].fmadd(&e_in_val, &prod_s192);
-                    // info!("inner_acc[j] = {:?}", inner_acc[j]);
-                }
-            }
-
-            // 归约当前 External 块的结果
-            let e_out_val = e_out[x_out];
-            // info!("inner_acc[j] = {:#?}", inner_acc);
-            for j in 0..OUTER_UNIVARIATE_SKIP_DEGREE {
-                let reduced = inner_acc[j].montgomery_reduce();
-                // 乘以外部权重 e_out 并累加到总和
-                final_acc[j] += e_out_val * reduced;
-            }
-            // info!("final_acc = {:#?}", final_acc);
-        }
-
-
-        // 4. 最终修正
-        final_acc.map(|x| x * outer_scale)
+                    let is_group1 = (x_in & 1) == 1;
+                    for j in 0..OUTER_UNIVARIATE_SKIP_DEGREE {
+                        let prod_s192 = if !is_group1 {
+                            eval.extended_azbz_product_first_group(j)
+                        } else {
+                            eval.extended_azbz_product_second_group(j)
+                        };
+                        inner[j].fmadd(&e_in, &prod_s192);
+                    }
+                },
+                |_x_out, e_out, inner| {
+                    let mut out = [F::UnreducedProductAccum::zero(); OUTER_UNIVARIATE_SKIP_DEGREE];
+                    for j in 0..OUTER_UNIVARIATE_SKIP_DEGREE {
+                        let reduced = inner[j].montgomery_reduce();
+                        out[j] = e_out.mul_to_product_accum(reduced);
+                    }
+                    out
+                },
+                |mut a, b| {
+                    for j in 0..OUTER_UNIVARIATE_SKIP_DEGREE {
+                        a[j] += b[j];
+                    }
+                    a
+                },
+            )
+            .map(|x| F::reduce_product_accum(x) * outer_scale)
     }
-
-    
 }
 
 impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterUniSkipProver<F> {
@@ -343,7 +291,6 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterUniSkipP
     fn cache_openings(
         &self,
         accumulator: &mut ProverOpeningAccumulator<F>,
-        transcript: &mut T,
         sumcheck_challenges: &[F::Challenge],
     ) {
         let opening_point = self.params.normalize_opening_point(sumcheck_challenges);
@@ -351,7 +298,6 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterUniSkipP
         let claim = self.uni_poly.as_ref().unwrap().evaluate(&opening_point[0]);
 
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::UnivariateSkip,
             SumcheckId::SpartanOuter,
             opening_point,
@@ -392,13 +338,11 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T> for OuterUniSki
     fn cache_openings(
         &self,
         accumulator: &mut VerifierOpeningAccumulator<F>,
-        transcript: &mut T,
         sumcheck_challenges: &[<F as JoltField>::Challenge],
     ) {
         let opening_point = self.params.normalize_opening_point(sumcheck_challenges);
         debug_assert_eq!(opening_point.len(), 1);
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::UnivariateSkip,
             SumcheckId::SpartanOuter,
             opening_point,
@@ -406,6 +350,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T> for OuterUniSki
     }
 }
 
+#[derive(Allocative, Clone)]
 pub struct OuterRemainingSumcheckParams<F: JoltField> {
     /// Number of cycle bits for splitting opening points (consistent across prover/verifier)
     /// Total number of rounds is `1 + num_cycles_bits`
@@ -419,7 +364,7 @@ pub struct OuterRemainingSumcheckParams<F: JoltField> {
 impl<F: JoltField> OuterRemainingSumcheckParams<F> {
     pub fn new(
         trace_len: usize,
-        uni_skip_params: OuterUniSkipParams<F>,
+        uni_skip_params: &OuterUniSkipParams<F>,
         opening_accumulator: &dyn OpeningAccumulator<F>,
     ) -> Self {
         let (r_uni_skip, _) = opening_accumulator.get_virtual_polynomial_opening(
@@ -431,7 +376,7 @@ impl<F: JoltField> OuterRemainingSumcheckParams<F> {
 
         Self {
             num_cycles_bits: trace_len.log_2(),
-            tau: uni_skip_params.tau,
+            tau: uni_skip_params.tau.clone(),
             r0,
         }
     }
@@ -461,6 +406,267 @@ impl<F: JoltField> SumcheckInstanceParams<F> for OuterRemainingSumcheckParams<F>
         );
         uni_skip_claim
     }
+
+    #[cfg(feature = "zk")]
+    fn input_claim_constraint(&self) -> InputClaimConstraint {
+        let opening = OpeningId::virt(VirtualPolynomial::UnivariateSkip, SumcheckId::SpartanOuter);
+        InputClaimConstraint::direct(opening)
+    }
+
+    #[cfg(feature = "zk")]
+    fn input_constraint_challenge_values(&self, _: &dyn OpeningAccumulator<F>) -> Vec<F> {
+        Vec::new()
+    }
+
+    #[cfg(feature = "zk")]
+    fn output_claim_constraint(&self) -> Option<OutputClaimConstraint> {
+        // output = tau_kernel * Az * Bz
+        // where Az = Σ_j az_coeff[j] * z[j] + az_const
+        //       Bz = Σ_j bz_coeff[j] * z[j] + bz_const
+        //
+        // Expanding: output = Σ_{i,j} (tau * az[i] * bz[j]) * z_i * z_j
+        //                   + Σ_i (tau * (az[i]*bz_c + az_c*bz[i])) * z_i
+        //                   + tau * az_c * bz_c
+        //
+        // Build structural template by iterating R1CS constraints to find
+        // which input indices appear in A-sides and B-sides.
+
+        use std::collections::BTreeSet;
+        let mut a_indices = BTreeSet::new();
+        let mut b_indices = BTreeSet::new();
+        let mut a_has_const = false;
+        let mut b_has_const = false;
+
+        for group in [
+            R1CS_CONSTRAINTS_FIRST_GROUP.as_slice(),
+            R1CS_CONSTRAINTS_SECOND_GROUP.as_slice(),
+        ] {
+            for constraint in group {
+                constraint.cons.a.for_each_term(|idx, _| {
+                    a_indices.insert(idx);
+                });
+                if constraint.cons.a.const_term().is_some() {
+                    a_has_const = true;
+                }
+                constraint.cons.b.for_each_term(|idx, _| {
+                    b_indices.insert(idx);
+                });
+                if constraint.cons.b.const_term().is_some() {
+                    b_has_const = true;
+                }
+            }
+        }
+
+        let a_indices: Vec<usize> = a_indices.into_iter().collect();
+        let b_indices: Vec<usize> = b_indices.into_iter().collect();
+
+        let mut terms = Vec::new();
+        let mut challenge_idx = 0;
+
+        // Quadratic terms: tau * az[i] * bz[j] * z_i * z_j
+        for &a_idx in &a_indices {
+            let a_opening = OpeningId::virt(
+                VirtualPolynomial::from(&ALL_R1CS_INPUTS[a_idx]),
+                SumcheckId::SpartanOuter,
+            );
+            for &b_idx in &b_indices {
+                let b_opening = OpeningId::virt(
+                    VirtualPolynomial::from(&ALL_R1CS_INPUTS[b_idx]),
+                    SumcheckId::SpartanOuter,
+                );
+                terms.push(ProductTerm::scaled(
+                    ValueSource::Challenge(challenge_idx),
+                    vec![
+                        ValueSource::Opening(a_opening),
+                        ValueSource::Opening(b_opening),
+                    ],
+                ));
+                challenge_idx += 1;
+            }
+        }
+
+        // Linear terms: tau * (az[i]*bz_c + az_c*bz[i]) * z_i
+        // Collect all unique indices from both sides
+        let mut all_indices = BTreeSet::new();
+        for &idx in &a_indices {
+            all_indices.insert(idx);
+        }
+        for &idx in &b_indices {
+            all_indices.insert(idx);
+        }
+        let all_indices: Vec<usize> = all_indices.into_iter().collect();
+
+        if a_has_const || b_has_const {
+            for &idx in &all_indices {
+                let opening = OpeningId::virt(
+                    VirtualPolynomial::from(&ALL_R1CS_INPUTS[idx]),
+                    SumcheckId::SpartanOuter,
+                );
+                terms.push(ProductTerm::scaled(
+                    ValueSource::Challenge(challenge_idx),
+                    vec![ValueSource::Opening(opening)],
+                ));
+                challenge_idx += 1;
+            }
+        }
+
+        // Constant term: tau * az_c * bz_c
+        if a_has_const && b_has_const {
+            terms.push(ProductTerm::single(ValueSource::Challenge(challenge_idx)));
+        }
+
+        Some(OutputClaimConstraint::sum_of_products(terms))
+    }
+
+    #[cfg(feature = "zk")]
+    fn output_constraint_challenge_values(&self, sumcheck_challenges: &[F::Challenge]) -> Vec<F> {
+        use std::collections::BTreeSet;
+
+        let r_stream = sumcheck_challenges[0];
+
+        // Lagrange weights at r0
+        let w = LagrangePolynomial::<F>::evals::<F::Challenge, OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE>(
+            &self.r0,
+        );
+
+        // Compute per-input-index coefficients for Az and Bz
+        let mut az_g0 = [F::zero(); NUM_R1CS_INPUTS];
+        let mut bz_g0 = [F::zero(); NUM_R1CS_INPUTS];
+        let mut az_g0_const = F::zero();
+        let mut bz_g0_const = F::zero();
+
+        for (i, constraint) in R1CS_CONSTRAINTS_FIRST_GROUP.iter().enumerate() {
+            constraint.cons.a.for_each_term(|idx, coeff| {
+                az_g0[idx] += w[i] * F::from_i128(coeff);
+            });
+            if let Some(c) = constraint.cons.a.const_term() {
+                az_g0_const += w[i] * F::from_i128(c);
+            }
+            constraint.cons.b.for_each_term(|idx, coeff| {
+                bz_g0[idx] += w[i] * F::from_i128(coeff);
+            });
+            if let Some(c) = constraint.cons.b.const_term() {
+                bz_g0_const += w[i] * F::from_i128(c);
+            }
+        }
+
+        let mut az_g1 = [F::zero(); NUM_R1CS_INPUTS];
+        let mut bz_g1 = [F::zero(); NUM_R1CS_INPUTS];
+        let mut az_g1_const = F::zero();
+        let mut bz_g1_const = F::zero();
+
+        let g2_len = core::cmp::min(
+            R1CS_CONSTRAINTS_SECOND_GROUP.len(),
+            OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE,
+        );
+        for i in 0..g2_len {
+            let constraint = &R1CS_CONSTRAINTS_SECOND_GROUP[i];
+            constraint.cons.a.for_each_term(|idx, coeff| {
+                az_g1[idx] += w[i] * F::from_i128(coeff);
+            });
+            if let Some(c) = constraint.cons.a.const_term() {
+                az_g1_const += w[i] * F::from_i128(c);
+            }
+            constraint.cons.b.for_each_term(|idx, coeff| {
+                bz_g1[idx] += w[i] * F::from_i128(coeff);
+            });
+            if let Some(c) = constraint.cons.b.const_term() {
+                bz_g1_const += w[i] * F::from_i128(c);
+            }
+        }
+
+        // Blend groups: az = az_g0 + r_stream * (az_g1 - az_g0)
+        let r_stream_f: F = r_stream.into();
+        let mut az_coeff = [F::zero(); NUM_R1CS_INPUTS];
+        let mut bz_coeff = [F::zero(); NUM_R1CS_INPUTS];
+        for j in 0..NUM_R1CS_INPUTS {
+            az_coeff[j] = az_g0[j] + r_stream_f * (az_g1[j] - az_g0[j]);
+            bz_coeff[j] = bz_g0[j] + r_stream_f * (bz_g1[j] - bz_g0[j]);
+        }
+        let az_const = az_g0_const + r_stream_f * (az_g1_const - az_g0_const);
+        let bz_const = bz_g0_const + r_stream_f * (bz_g1_const - bz_g0_const);
+
+        // Compute tau_kernel
+        let tau = &self.tau;
+        let tau_high = &tau[tau.len() - 1];
+        let tau_high_bound_r0 = LagrangePolynomial::<F>::lagrange_kernel::<
+            F::Challenge,
+            OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE,
+        >(tau_high, &self.r0);
+        let tau_low = &tau[..tau.len() - 1];
+        let r_tail_reversed: Vec<F::Challenge> =
+            sumcheck_challenges.iter().rev().copied().collect();
+        let tau_kernel = tau_high_bound_r0 * EqPolynomial::mle(tau_low, &r_tail_reversed);
+
+        // Collect structural index sets (must match output_claim_constraint order)
+        let mut a_set = BTreeSet::new();
+        let mut b_set = BTreeSet::new();
+        let mut a_has_const = false;
+        let mut b_has_const = false;
+
+        for group in [
+            R1CS_CONSTRAINTS_FIRST_GROUP.as_slice(),
+            R1CS_CONSTRAINTS_SECOND_GROUP.as_slice(),
+        ] {
+            for constraint in group {
+                constraint.cons.a.for_each_term(|idx, _| {
+                    a_set.insert(idx);
+                });
+                if constraint.cons.a.const_term().is_some() {
+                    a_has_const = true;
+                }
+                constraint.cons.b.for_each_term(|idx, _| {
+                    b_set.insert(idx);
+                });
+                if constraint.cons.b.const_term().is_some() {
+                    b_has_const = true;
+                }
+            }
+        }
+
+        let a_indices: Vec<usize> = a_set.iter().copied().collect();
+        let b_indices: Vec<usize> = b_set.iter().copied().collect();
+
+        let mut challenges = Vec::new();
+
+        // Quadratic: tau * az[i] * bz[j]
+        for &a_idx in &a_indices {
+            for &b_idx in &b_indices {
+                challenges.push(tau_kernel * az_coeff[a_idx] * bz_coeff[b_idx]);
+            }
+        }
+
+        // Linear: tau * (az[i]*bz_const + az_const*bz[i])
+        if a_has_const || b_has_const {
+            let mut all_indices = BTreeSet::new();
+            for &idx in &a_indices {
+                all_indices.insert(idx);
+            }
+            for &idx in &b_indices {
+                all_indices.insert(idx);
+            }
+            for idx in all_indices {
+                let from_a = if b_has_const {
+                    az_coeff[idx] * bz_const
+                } else {
+                    F::zero()
+                };
+                let from_b = if a_has_const {
+                    az_const * bz_coeff[idx]
+                } else {
+                    F::zero()
+                };
+                challenges.push(tau_kernel * (from_a + from_b));
+            }
+        }
+
+        // Constant: tau * az_const * bz_const
+        if a_has_const && b_has_const {
+            challenges.push(tau_kernel * az_const * bz_const);
+        }
+
+        challenges
+    }
 }
 
 pub struct OuterRemainingSumcheckVerifier<F: JoltField> {
@@ -472,7 +678,7 @@ impl<F: JoltField> OuterRemainingSumcheckVerifier<F> {
     pub fn new(
         key: UniformSpartanKey<F>,
         trace_len: usize,
-        uni_skip_params: OuterUniSkipParams<F>,
+        uni_skip_params: &OuterUniSkipParams<F>,
         opening_accumulator: &VerifierOpeningAccumulator<F>,
     ) -> Self {
         let params =
@@ -482,7 +688,7 @@ impl<F: JoltField> OuterRemainingSumcheckVerifier<F> {
 }
 
 impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
-for OuterRemainingSumcheckVerifier<F>
+    for OuterRemainingSumcheckVerifier<F>
 {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         &self.params
@@ -522,13 +728,11 @@ for OuterRemainingSumcheckVerifier<F>
     fn cache_openings(
         &self,
         accumulator: &mut VerifierOpeningAccumulator<F>,
-        transcript: &mut T,
         sumcheck_challenges: &[F::Challenge],
     ) {
         let r_cycle = self.params.normalize_opening_point(sumcheck_challenges);
         for input in &ALL_R1CS_INPUTS {
             accumulator.append_virtual(
-                transcript,
                 VirtualPolynomial::from(input),
                 SumcheckId::SpartanOuter,
                 r_cycle.clone(),
@@ -537,48 +741,8 @@ for OuterRemainingSumcheckVerifier<F>
     }
 }
 
-#[derive(Allocative, Clone)]
-pub struct OuterStreamingProverParams<F: JoltField> {
-    /// Number of cycle bits for splitting opening points
-    /// Total number of rounds equals num_cycles_bits
-    pub num_cycles_bits: usize,
-    /// The univariate-skip first round challenge
-    pub r0_uniskip: F::Challenge,
-}
-
-impl<F: JoltField> OuterStreamingProverParams<F> {
-    fn new(
-        uni_skip_params: &OuterUniSkipParams<F>,
-        opening_accumulator: &ProverOpeningAccumulator<F>,
-    ) -> Self {
-        let (r_uni_skip, _) = opening_accumulator.get_virtual_polynomial_opening(
-            VirtualPolynomial::UnivariateSkip,
-            SumcheckId::SpartanOuter,
-        );
-        debug_assert_eq!(r_uni_skip.len(), 1);
-        // tau.len() = num_rows_bits() = num_cycle_vars + 2
-        // num_cycles_bits = num_cycle_vars = tau.len() - 2
-        Self {
-            num_cycles_bits: uni_skip_params.tau.len() - 2,
-            r0_uniskip: r_uni_skip[0],
-        }
-    }
-
-    fn num_rounds(&self) -> usize {
-        // Total rounds = 1 + num_cycles_bits (one extra for streaming window)
-        1 + self.num_cycles_bits
-    }
-
-    fn get_inputs_opening_point(
-        sumcheck_challenges: &[F::Challenge],
-    ) -> OpeningPoint<BIG_ENDIAN, F> {
-        let r_cycle = sumcheck_challenges[1..].to_vec();
-        OpeningPoint::<LITTLE_ENDIAN, F>::new(r_cycle).match_endianness()
-    }
-}
-
 pub type OuterRemainingStreamingSumcheck<F, S> =
-StreamingSumcheck<F, S, OuterSharedState<F>, OuterStreamingWindow<F>, OuterLinearStage<F>>;
+    StreamingSumcheck<F, S, OuterSharedState<F>, OuterStreamingWindow<F>, OuterLinearStage<F>>;
 
 #[derive(Allocative)]
 pub struct OuterSharedState<F: JoltField> {
@@ -591,7 +755,7 @@ pub struct OuterSharedState<F: JoltField> {
     r_grid: ExpandingTable<F>,
     #[allocative(skip)]
     lagrange_evals_r0: [F; OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE],
-    pub params: OuterStreamingProverParams<F>,
+    pub params: OuterRemainingSumcheckParams<F>,
 }
 
 impl<F: JoltField> OuterSharedState<F> {
@@ -603,8 +767,9 @@ impl<F: JoltField> OuterSharedState<F> {
         opening_accumulator: &ProverOpeningAccumulator<F>,
     ) -> Self {
         let bytecode_preprocessing = bytecode_preprocessing.clone();
-        let outer_params = OuterStreamingProverParams::new(uni_skip_params, opening_accumulator);
-        let r0 = outer_params.r0_uniskip;
+        let outer_params =
+            OuterRemainingSumcheckParams::new(trace.len(), uni_skip_params, opening_accumulator);
+        let r0 = outer_params.r0;
 
         let lagrange_evals_r =
             LagrangePolynomial::<F>::evals::<F::Challenge, OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE>(&r0);
@@ -644,45 +809,11 @@ impl<F: JoltField> OuterSharedState<F> {
         skip_all,
         name = "OuterSharedState::extrapolate_from_binary_grid_to_tertiary_grid"
     )]
-    /// 从二进制网格扩展到三进制网格的辅助函数。
-    ///
-    /// 在 Sumcheck 协议中，为了构建下一轮的多项式，我们需要在 {0, 1} 构成的超立方体上进行插值。
-    /// 为了确定一个多线性多项式（或低度多项式），通常需要在足够的点上进行评估。
-    /// 这里提到的 "Tertiary Grid" 通常指 {0, 1, 2}^n 或者类似的扩展域，用于后续的 Karatsuba 乘法或者多项式插值。
-    ///
-    /// # 参数
-    ///
-    /// * `acc_az`: Az 多项式的累加器。
-    /// * `acc_bz_first`: Bz 多项式（第一组约束）的累加器。
-    /// * `acc_bz_second`: Bz 多项式（第二组约束）的累加器。
-    /// * `grid_az`: 输出的 Az 网格评估值。
-    /// * `grid_bz`: 输出的 Bz 网格评估值。
-    /// * `jlen`: 当前窗口大小对应的网格点数量 (1 << window_size)。
-    /// * `klen`: 扩展挑战点组合的数量 (1 << num_challenges)。
-    /// * `offset`: 全局索引的偏移量。
-    /// * `scaled_w`: 预计算的权重向量 (Lagrange basis * random challenge weights)。
-    ///
-    /// # 算法逻辑
-    ///
-    /// 1. **约束分组 (Constraint Grouping)**:
-    ///    - 代码中用来 `selector = (full_idx & 1) == 1` 来区分约束组。
-    ///    - `full_idx` 是当前的全局索引。如果 LSB 为 0，属于第一组；为 1，属于第二组。
-    ///    - 这种分组策略（Interleaved Grouping）允许将所有约束均匀分布在同一个处理流程中，
-    ///      而不需要显式地构建两个完全分离的矩阵。这有助于负载均衡和并行计算。
-    ///
-    /// 2. **按需生成 (On-the-fly Generation)**:
-    ///    - `R1CSCycleInputs::from_trace` 根据 `step_idx` (Trace 行号) 实时重构出电路输入。
-    ///    - 这避免了将庞大的 R1CS 矩阵完全物化在内存中（Memory Efficient）。
-    ///    - `eval.fmadd_...` 方法将具体的电路值代入到约束多项式中，并利用 `scaled_w` 进行加权累加。
-    ///
-    /// 3. **Barrett Reduction**:
-    ///    - 为了性能，累加过程使用了延迟归约 (Acc5U, Acc6S 等)。
-    ///    - 最后阶段 `grid_az`/`grid_bz` 的计算中才调用 `barrett_reduce` 将大整数结果归约回有限域元素。
     fn extrapolate_from_binary_grid_to_tertiary_grid(
         &self,
-        acc_az: &mut [Acc5U<F>],
-        acc_bz_first: &mut [Acc6S<F>],
-        acc_bz_second: &mut [Acc7S<F>],
+        acc_az: &mut [SmallAccumU<F>],
+        acc_bz_first: &mut [MedAccumS<F>],
+        acc_bz_second: &mut [WideAccumS<F>],
         grid_az: &mut [F],
         grid_bz: &mut [F],
         jlen: usize,
@@ -704,9 +835,9 @@ impl<F: JoltField> OuterSharedState<F> {
             .zip(acc_bz_first.par_iter_mut())
             .zip(acc_bz_second.par_iter_mut())
             .for_each(|((a, b), c)| {
-                *a = Acc5U::zero();
-                *b = Acc6S::zero();
-                *c = Acc7S::zero();
+                *a = SmallAccumU::zero();
+                *b = MedAccumS::zero();
+                *c = WideAccumS::zero();
             });
 
         acc_az
@@ -717,19 +848,14 @@ impl<F: JoltField> OuterSharedState<F> {
             .for_each(|(j, ((acc_az_j, acc_bz_first_j), acc_bz_second_j))| {
                 for k in 0..klen {
                     let full_idx = offset + j * klen + k;
-                    // 通过右移一位获取真实的 Trace 步骤索引 (Trace Step Index)
-                    // 因为最低位被用作分组选择器 (Group Selector)
                     let current_step_idx = full_idx >> 1;
-                    // 最低位决定是第一组约束还是第二组约束
                     let selector = (full_idx & 1) == 1;
 
-                    // 根据 Trace 和 Bytecode 实时计算当步的电路输入值
                     let row_inputs =
                         R1CSCycleInputs::from_trace::<F>(preprocess, trace, current_step_idx);
                     let eval = R1CSEval::<F>::from_cycle_inputs(&row_inputs);
                     let w_k = &scaled_w[k];
 
-                    // 根据选择器将评估值累加到对应的累加器中
                     if !selector {
                         eval.fmadd_first_group_at_r(w_k, acc_az_j, acc_bz_first_j);
                     } else {
@@ -761,19 +887,6 @@ impl<F: JoltField> OuterSharedState<F> {
         skip_all,
         name = "OuterSharedState::compute_evaluation_grid_from_trace"
     )]
-    /// 从 Trace 计算评估网格。
-    ///
-    /// 这是 Spartan 协议中 sum-check 的关键步骤。它将 Trace 多项式的评估值扩展到一个稍大的域上，
-    /// 以便计算每轮 sum-check 所需的多项式系数。
-    ///
-    /// # 流程
-    ///
-    /// 1. **准备 Lagrange 权重**: 计算 `scaled_w`，结合了 `lagrange_evals_r` (在 r 点的 lagrange 插值) 和 `r_grid` (当前 sum-check 轮次的随机点组合)。
-    /// 2. **并行处理**: 并行遍历输出变量 (E_out) 的每一项。
-    /// 3. **内部循环与网格扩展**:
-    ///    - 对每个 E_in，调用 `extrapolate_from_binary_grid_to_tertiary_grid` 计算 Az 和 Bz 在网格点上的值。
-    ///    - 使用 `expand_linear_grid_to_multiquadratic` 将线性网格扩展为多二次形式 (Multi-Quadratic)，这对于后续计算乘积和 (inner product sum) 是必要的。
-    /// 4. **组合结果**: 计算 `Az * Bz * E_in` 并在 E_out 上累加，得到最终的 `t_prime` 多项式评估值。
     pub fn compute_evaluation_grid_from_trace(&mut self, window_size: usize) {
         let split_eq = &self.split_eq_poly;
 
@@ -810,15 +923,15 @@ impl<F: JoltField> OuterSharedState<F> {
             .par_iter()
             .enumerate()
             .map(|(out_idx, out_val)| {
-                let mut local_res_unr = vec![F::Unreduced::<9>::zero(); three_pow_dim];
+                let mut local_res_unr = vec![F::UnreducedProductAccum::zero(); three_pow_dim];
                 let mut buff_a: Vec<F> = vec![F::zero(); three_pow_dim];
                 let mut buff_b = vec![F::zero(); three_pow_dim];
                 let mut tmp = vec![F::zero(); three_pow_dim];
                 let mut grid_a = vec![F::zero(); jlen];
                 let mut grid_b = vec![F::zero(); jlen];
-                let mut acc_az = vec![Acc5U::<F>::zero(); jlen];
-                let mut acc_bz_first = vec![Acc6S::<F>::zero(); jlen];
-                let mut acc_bz_second = vec![Acc7S::<F>::zero(); jlen];
+                let mut acc_az = vec![SmallAccumU::<F>::zero(); jlen];
+                let mut acc_bz_first = vec![MedAccumS::<F>::zero(); jlen];
+                let mut acc_bz_second = vec![WideAccumS::<F>::zero(); jlen];
 
                 for (in_idx, in_val) in e_in.iter().enumerate() {
                     let i = out_idx * e_in_len + in_idx;
@@ -852,25 +965,25 @@ impl<F: JoltField> OuterSharedState<F> {
 
                     let e_in_val = *in_val;
                     if window_size == 1 {
-                        local_res_unr[0] += e_in_val.mul_unreduced::<9>(buff_a[0] * buff_b[0]);
-                        local_res_unr[2] += e_in_val.mul_unreduced::<9>(buff_a[2] * buff_b[2]);
+                        local_res_unr[0] += e_in_val.mul_to_product_accum(buff_a[0] * buff_b[0]);
+                        local_res_unr[2] += e_in_val.mul_to_product_accum(buff_a[2] * buff_b[2]);
                     } else {
                         for idx in 0..three_pow_dim {
                             let val = buff_a[idx] * buff_b[idx];
-                            local_res_unr[idx] += e_in_val.mul_unreduced::<9>(val);
+                            local_res_unr[idx] += e_in_val.mul_to_product_accum(val);
                         }
                     }
                 }
 
                 let e_out_val = *out_val;
                 for idx in 0..three_pow_dim {
-                    let inner_red = F::from_montgomery_reduce::<9>(local_res_unr[idx]);
-                    local_res_unr[idx] = e_out_val.mul_unreduced::<9>(inner_red);
+                    let inner_red = F::reduce_product_accum(local_res_unr[idx]);
+                    local_res_unr[idx] = e_out_val.mul_to_product_accum(inner_red);
                 }
                 local_res_unr
             })
             .reduce(
-                || vec![F::Unreduced::<9>::zero(); three_pow_dim],
+                || vec![F::UnreducedProductAccum::zero(); three_pow_dim],
                 |mut acc, local| {
                     for idx in 0..three_pow_dim {
                         acc[idx] += local[idx];
@@ -881,7 +994,7 @@ impl<F: JoltField> OuterSharedState<F> {
 
         let res: Vec<F> = res_unr
             .into_iter()
-            .map(|unr| F::from_montgomery_reduce::<9>(unr))
+            .map(|unr| F::reduce_product_accum(unr))
             .collect();
         self.t_prime_poly = Some(MultiquadraticPolynomial::new(window_size, res));
     }
@@ -900,21 +1013,42 @@ impl<F: JoltField> OuterSharedState<F> {
     }
 }
 
-impl<F: JoltField> SharedStreamingSumcheckState<F> for OuterSharedState<F> {
+impl<F: JoltField> SumcheckInstanceParams<F> for OuterSharedState<F> {
     fn degree(&self) -> usize {
-        OUTER_REMAINING_DEGREE_BOUND
+        self.params.degree()
     }
 
     fn num_rounds(&self) -> usize {
         self.params.num_rounds()
     }
 
-    fn input_claim(&self, accumulator: &ProverOpeningAccumulator<F>) -> F {
-        let (_, uni_skip_claim) = accumulator.get_virtual_polynomial_opening(
-            VirtualPolynomial::UnivariateSkip,
-            SumcheckId::SpartanOuter,
-        );
-        uni_skip_claim
+    fn input_claim(&self, accumulator: &dyn OpeningAccumulator<F>) -> F {
+        self.params.input_claim(accumulator)
+    }
+
+    fn normalize_opening_point(&self, challenges: &[F::Challenge]) -> OpeningPoint<BIG_ENDIAN, F> {
+        self.params.normalize_opening_point(challenges)
+    }
+
+    #[cfg(feature = "zk")]
+    fn input_claim_constraint(&self) -> InputClaimConstraint {
+        self.params.input_claim_constraint()
+    }
+
+    #[cfg(feature = "zk")]
+    fn input_constraint_challenge_values(&self, accumulator: &dyn OpeningAccumulator<F>) -> Vec<F> {
+        self.params.input_constraint_challenge_values(accumulator)
+    }
+
+    #[cfg(feature = "zk")]
+    fn output_claim_constraint(&self) -> Option<OutputClaimConstraint> {
+        self.params.output_claim_constraint()
+    }
+
+    #[cfg(feature = "zk")]
+    fn output_constraint_challenge_values(&self, sumcheck_challenges: &[F::Challenge]) -> Vec<F> {
+        self.params
+            .output_constraint_challenge_values(sumcheck_challenges)
     }
 }
 
@@ -971,37 +1105,6 @@ impl<F: JoltField> OuterLinearStage<F> {
         skip_all,
         name = "OuterLinearStage::fused_materialise_polynomials_general_with_multiquadratic"
     )]
-    /// 融合多项式具体化与多二次项扩展（针对通用 Sumcheck 轮次）。
-    ///
-    /// 此函数是线性时间 Sumcheck 的核心优化。它的任务是：
-    /// 1. **具体化 (Materialise)**: 计算 Az 和 Bz 多项式在某一轮绑定后的剩余变量上的值。
-    ///    - 由于 R1CS 矩阵是稀疏的且具有高度结构化（Trace 重复性），我们不存储矩阵，
-    ///      而是通过 `R1CSCycleInputs` 和 `R1CSEval` 实时计算 Az/Bz。
-    ///    - 这些值被保存到 `az_bound` 和 `bz_bound` 中，作为下一轮 DensePolynomial 的输入。
-    ///
-    /// 2. **多二次项扩展 (Multiquadratic Expansion)**:
-    ///    - 为了计算 Sumcheck 的三次项系数，我们需要将线性网格插值扩展到多二次形式。
-    ///    - `expand_linear_grid_to_multiquadratic` 执行这个操作，使得我们能够利用 Karatsuba 乘法或其他快速多项式乘法。
-    ///
-    /// 3. **融合 (Fused)**:
-    ///    - 将上述两个步骤（以及乘积求和 `inner_sum`）融合在一个大循环中。
-    ///    - 这极大地减少了内存带宽需求，因为不需要多次遍历庞大的数据结构。
-    ///    - 数据在 cache 中生成并立即被消费。
-    ///
-    /// # 详细逻辑
-    ///
-    /// - **分块并行**: 使用 `par_chunks_mut` 将输出缓冲区 `az_bound`/`bz_bound` 分块，每个线程通过 `fold` 处理一块数据。
-    /// - **内部循环**:
-    ///   - 遍历 `pair_idx` (代表 x_out 和 x_in 的组合)。
-    ///   - 遍历 `grid_size` (当前窗口大小的所有点)。
-    ///   - 遍历 `num_r_vals` (上一轮挑战点的所有组合，即 `r_grid`)。
-    ///   - 实时调用 `R1CSEval` 计算 Az/Bz 分量，并累加到 `acc_az`/`acc_bz`。
-    /// - **归约与复制**: 使用 Barrett Reduction 将累加器不仅结果归约，并复制到输出缓冲区。
-    /// - **计算内积**: 计算 `buff_a * buff_b` 并累加到 `inner_sum`，用于构建 `t_prime_poly` (即 Sumcheck 消息多项式)。
-    ///
-    /// # 返回值
-    ///
-    /// 返回两个 `DensePolynomial`: `Az` 和 `Bz`，它们被绑定了上一轮的随机数，且准备好用于下一轮的折叠。
     fn fused_materialise_polynomials_general_with_multiquadratic(
         shared: &mut OuterSharedState<F>,
         window_size: usize,
@@ -1059,12 +1162,12 @@ impl<F: JoltField> OuterLinearStage<F> {
                     let mut az_grid = vec![F::zero(); grid_size];
                     let mut bz_grid = vec![F::zero(); grid_size];
 
-                    let mut acc_az: Vec<Acc5U<F>> = vec![Acc5U::zero(); grid_size];
-                    let mut acc_bz_first: Vec<Acc6S<F>> = vec![Acc6S::zero(); grid_size];
-                    let mut acc_bz_second: Vec<Acc7S<F>> = vec![Acc7S::zero(); grid_size];
+                    let mut acc_az: Vec<SmallAccumU<F>> = vec![SmallAccumU::zero(); grid_size];
+                    let mut acc_bz_first: Vec<MedAccumS<F>> = vec![MedAccumS::zero(); grid_size];
+                    let mut acc_bz_second: Vec<WideAccumS<F>> = vec![WideAccumS::zero(); grid_size];
 
-                    let mut inner_sum: Vec<F::Unreduced<9>> =
-                        vec![F::Unreduced::<9>::zero(); three_pow_dim];
+                    let mut inner_sum: Vec<F::UnreducedProductAccum> =
+                        vec![F::UnreducedProductAccum::zero(); three_pow_dim];
                     let mut current_x_out = start_pair / num_x_in_vals;
 
                     for pair_idx in start_pair..end_pair {
@@ -1074,17 +1177,16 @@ impl<F: JoltField> OuterLinearStage<F> {
                         if x_out_val != current_x_out {
                             let e_out = E_out[current_x_out];
                             for idx in 0..three_pow_dim {
-                                local_ans[idx] +=
-                                    F::from_montgomery_reduce::<9>(inner_sum[idx]) * e_out;
-                                inner_sum[idx] = F::Unreduced::<9>::zero();
+                                local_ans[idx] += F::reduce_product_accum(inner_sum[idx]) * e_out;
+                                inner_sum[idx] = F::UnreducedProductAccum::zero();
                             }
                             current_x_out = x_out_val;
                         }
 
                         for x_val in 0..grid_size {
-                            acc_az[x_val] = Acc5U::zero();
-                            acc_bz_first[x_val] = Acc6S::zero();
-                            acc_bz_second[x_val] = Acc7S::zero();
+                            acc_az[x_val] = SmallAccumU::zero();
+                            acc_bz_first[x_val] = MedAccumS::zero();
+                            acc_bz_second[x_val] = WideAccumS::zero();
                         }
 
                         let base_idx = (x_out_val << (num_x_in_bits + window_size + num_r_bits))
@@ -1097,7 +1199,6 @@ impl<F: JoltField> OuterLinearStage<F> {
                                 let full_idx = base_idx | x_val_shifted | r_idx;
 
                                 let step_idx = full_idx >> 1;
-                                // 同样，根据最低位判断分组
                                 let selector = (full_idx & 1) == 1;
 
                                 let row_inputs = R1CSCycleInputs::from_trace::<F>(
@@ -1123,7 +1224,6 @@ impl<F: JoltField> OuterLinearStage<F> {
                             }
                         }
 
-                        // 归约当前块的结果
                         for x_val in 0..grid_size {
                             az_grid[x_val] = acc_az[x_val].barrett_reduce();
                             bz_grid[x_val] = acc_bz_first[x_val].barrett_reduce()
@@ -1135,7 +1235,6 @@ impl<F: JoltField> OuterLinearStage<F> {
                         az_chunk[buffer_offset..end].copy_from_slice(&az_grid[..grid_size]);
                         bz_chunk[buffer_offset..end].copy_from_slice(&bz_grid[..grid_size]);
 
-                        // 扩展到多二次形式
                         MultiquadraticPolynomial::<F>::expand_linear_grid_to_multiquadratic(
                             &az_grid,
                             &mut buff_a,
@@ -1149,24 +1248,24 @@ impl<F: JoltField> OuterLinearStage<F> {
                             window_size,
                         );
 
-                        // 计算内积并累加
                         let e_in = E_in[x_in_val];
+
                         if window_size == 1 {
                             let prod0 = buff_a[0] * buff_b[0];
                             let prod2 = buff_a[2] * buff_b[2];
-                            inner_sum[0] += prod0.mul_unreduced::<9>(e_in);
-                            inner_sum[2] += prod2.mul_unreduced::<9>(e_in);
+                            inner_sum[0] += prod0.mul_to_product_accum(e_in);
+                            inner_sum[2] += prod2.mul_to_product_accum(e_in);
                         } else {
                             for idx in 0..three_pow_dim {
                                 let prod = buff_a[idx] * buff_b[idx];
-                                inner_sum[idx] += prod.mul_unreduced::<9>(e_in);
+                                inner_sum[idx] += prod.mul_to_product_accum(e_in);
                             }
                         }
                     }
 
                     let e_out = E_out[current_x_out];
                     for idx in 0..three_pow_dim {
-                        local_ans[idx] += F::from_montgomery_reduce::<9>(inner_sum[idx]) * e_out;
+                        local_ans[idx] += F::reduce_product_accum(inner_sum[idx]) * e_out;
                     }
 
                     local_ans
@@ -1191,18 +1290,8 @@ impl<F: JoltField> OuterLinearStage<F> {
 
     #[tracing::instrument(
         skip_all,
-        name = "OuterSharedState::fused_materialise_polynomials_round_zero"
+        name = "OuterLinearStage::fused_materialise_polynomials_round_zero"
     )]
-    /// 融合多项式具体化（针对 Sumcheck 第 0 轮）。
-    ///
-    /// 这是 `fused_materialise_polynomials_general_with_multiquadratic` 的特化版本，用于 Sumcheck 的第一步。
-    /// 此时 `num_r_vals` (之前绑定的变量数) 为 0 (或者说 1 个组合)，因为还没有进行任何 Sumcheck 绑定。
-    ///
-    /// # 差异
-    ///
-    /// - 不需要遍历 `r_grid`，因为还没有 `r`。
-    /// - 直接从 `lagrange_evals_r0` (Univariate Skip 阶段产生的 Lagrange 评估) 获取权重。
-    /// - 逻辑简化，但核心思想（分块、实时计算、融合）相同。
     fn fused_materialise_polynomials_round_zero(
         shared: &mut OuterSharedState<F>,
         num_vars: usize,
@@ -1616,14 +1705,13 @@ impl<F: JoltField> LinearSumcheckStage<F> for OuterLinearStage<F> {
     }
 
     #[tracing::instrument(skip_all, name = "OuterLinearStage::cache_openings")]
-    fn cache_openings<T: Transcript>(
+    fn cache_openings(
         &self,
         shared: &Self::Shared,
         accumulator: &mut ProverOpeningAccumulator<F>,
-        transcript: &mut T,
         sumcheck_challenges: &[F::Challenge],
     ) {
-        let r_cycle = OuterStreamingProverParams::get_inputs_opening_point(sumcheck_challenges);
+        let r_cycle = shared.params.normalize_opening_point(sumcheck_challenges);
 
         let claimed_witness_evals = R1CSEval::compute_claimed_inputs(
             &shared.bytecode_preprocessing,
@@ -1633,7 +1721,6 @@ impl<F: JoltField> LinearSumcheckStage<F> for OuterLinearStage<F> {
 
         for (i, input) in ALL_R1CS_INPUTS.iter().enumerate() {
             accumulator.append_virtual(
-                transcript,
                 VirtualPolynomial::from(input),
                 SumcheckId::SpartanOuter,
                 r_cycle.clone(),
@@ -1642,51 +1729,3 @@ impl<F: JoltField> LinearSumcheckStage<F> for OuterLinearStage<F> {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ark_bn254::Fr;
-    use crate::zkvm::bytecode::BytecodePreprocessing;
-    use tracer::instruction::{Cycle, Instruction};
-    use common::constants::RAM_START_ADDRESS;
-    use tracer::instruction::add::ADD;
-
-    #[test]
-    fn test_compute_univariate_skip_extended_evals() {
-        // 1. Setup Bytecode
-        // We use an ADD instruction with valid address to pass preprocessing validation
-        let add = ADD {
-            address: RAM_START_ADDRESS,
-            ..Default::default()
-        };
-        let bytecode = vec![Instruction::ADD(add)];
-        let bp = BytecodePreprocessing::preprocess(bytecode);
-
-        // 2. Setup Tau
-        // tau represents (group_bit || row_bits)
-        // If we want trace length 32 (2^5), we need 5 bits for rows + 1 bit for group = 6 bits.
-        let num_vars = 6;
-        let trace_len = 1 << (num_vars - 1); // 32
-        let tau = vec![<Fr as JoltField>::Challenge::from(1u128); num_vars];
-
-        // 3. Setup Trace
-        let trace = vec![Cycle::NoOp; trace_len];
-
-        // 4. Call function
-        let evals = OuterUniSkipProver::<Fr>::compute_univariate_skip_extended_evals(
-            &bp,
-            &trace,
-            &tau
-        );
-
-        // 5. Assertions
-        assert_eq!(evals.len(), OUTER_UNIVARIATE_SKIP_DEGREE);
-
-        // Since we used NoOp and dummy tau, the result might be zero or non-zero depending on constraints.
-        // But we mainly check it runs without panic.
-    }
-}
-
-
-

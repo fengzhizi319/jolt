@@ -9,8 +9,7 @@
 //!
 //! 1. **RamInc**: Claims are emitted from:
 //!    - `RamReadWriteChecking` (Stage 2): opened at `r_cycle_stage2`
-//!    - `RamValEvaluation` (Stage 4): opened at `r_cycle_stage4`
-//!    - `RamValFinalEvaluation` (Stage 4): opened at `r_cycle_stage4` (same as RamValEvaluation)
+//!    - `RamValCheck` (Stage 4): opened at `r_cycle_stage4`
 //!    
 //!    Note: ValEvaluation and ValFinal share the same opening point because they're
 //!    in the same batched sumcheck and both normalize using the same sumcheck challenges.
@@ -26,7 +25,7 @@
 //!
 //! Let:
 //!   - v_1 = RamInc(r_cycle_stage2)     from RamReadWriteChecking
-//!   - v_2 = RamInc(r_cycle_stage4)     from RamValEvaluation (and RamValFinal)
+//!   - v_2 = RamInc(r_cycle_stage4)     from RamValCheck
 //!   - w_1 = RdInc(s_cycle_stage4)      from RegistersReadWriteChecking  
 //!   - w_2 = RdInc(s_cycle_stage5)      from RegistersValEvaluation
 //!
@@ -57,24 +56,24 @@ use tracer::instruction::{Cycle, RAMAccess};
 use crate::field::{BarrettReduce, FMAdd, JoltField};
 use crate::poly::eq_poly::EqPolynomial;
 use crate::poly::multilinear_polynomial::{BindingOrder, MultilinearPolynomial, PolynomialBinding};
+#[cfg(feature = "zk")]
+use crate::poly::opening_proof::OpeningId;
 use crate::poly::opening_proof::{
     OpeningAccumulator, OpeningPoint, ProverOpeningAccumulator, SumcheckId,
     VerifierOpeningAccumulator, BIG_ENDIAN, LITTLE_ENDIAN,
 };
 use crate::poly::unipoly::UniPoly;
+#[cfg(feature = "zk")]
+use crate::subprotocols::blindfold::{InputClaimConstraint, OutputClaimConstraint};
 use crate::subprotocols::sumcheck_prover::SumcheckInstanceProver;
 use crate::subprotocols::sumcheck_verifier::{SumcheckInstanceParams, SumcheckInstanceVerifier};
 use crate::transcripts::Transcript;
-use crate::utils::accumulation::Acc6S;
+use crate::utils::accumulation::MedAccumS;
 use crate::utils::math::{s64_from_diff_u64s, Math};
 use crate::utils::thread::unsafe_allocate_zero_vec;
 use crate::zkvm::witness::CommittedPolynomial;
 
 const DEGREE_BOUND: usize = 2;
-
-// ============================================================================
-// PARAMS
-// ============================================================================
 
 #[derive(Allocative, Clone)]
 pub struct IncClaimReductionSumcheckParams<F: JoltField> {
@@ -82,87 +81,41 @@ pub struct IncClaimReductionSumcheckParams<F: JoltField> {
     pub gamma_powers: [F; 3],
     pub n_cycle_vars: usize,
     pub r_cycle_stage2: OpeningPoint<BIG_ENDIAN, F>, // RamInc from RamReadWriteChecking
-    pub r_cycle_stage4: OpeningPoint<BIG_ENDIAN, F>, // RamInc from RamValEvaluation/RamValFinal
+    pub r_cycle_stage4: OpeningPoint<BIG_ENDIAN, F>, // RamInc from RamValCheck
     pub s_cycle_stage4: OpeningPoint<BIG_ENDIAN, F>, // RdInc from RegistersReadWriteChecking
     pub s_cycle_stage5: OpeningPoint<BIG_ENDIAN, F>, // RdInc from RegistersValEvaluation
 }
 
 impl<F: JoltField> IncClaimReductionSumcheckParams<F> {
-    /// 初始化增量检查参数集合 (Increment Context)。
-    ///
-    /// 该函数从之前的证明步骤中收集必要的随机挑战点，用于证明 RAM 和寄存器的时间戳/增量的一致性。
-    ///
-    /// # 举例说明 (Example Context)
-    /// 假设我们要验证 RAM 的读写历史是否正确：
-    /// 1. 我们在 **Stage 2** 运行了一个 Sumcheck 协议，证明 RAM 读写的时间戳是递增的。Verifer 发送了随机点 `r_cycle_stage2`。
-    /// 2. 我们在 **Stage 4** 运行了另一个 Sumcheck，证明 RAM 在这些时刻的值是正确的。Verifer 发送了随机点 `r_cycle_stage4`。
-    ///
-    /// 现在的任务是将这些零散的证明步骤“缝合”在一起。这个函数就是“缝合针”的初始化，
-    /// 它从 `accumulator` 中把 `r_cycle_stage2` 和 `r_cycle_stage4` 取出来，并计算一个新的挑战标量 `gamma`
-    /// 用于将不同的约束线性组合起来。
     pub fn new(
         trace_len: usize,
         accumulator: &dyn OpeningAccumulator<F>,
         transcript: &mut impl Transcript,
     ) -> Self {
-        // 1. 生成全局挑战标量 gamma
-        // 这个标量用于随机线性组合 (Random Linear Combination)，将多个多项式等式压缩为一个等式进行检查。
-        // 例如：若要证明 A(x)=0 且 B(x)=0，只需证明 A(x) + gamma * B(x) = 0。
         let gamma: F = transcript.challenge_scalar();
         let gamma_sqr = gamma.square();
         let gamma_cub = gamma_sqr * gamma;
 
-        // 2. 获取 RAM 相关的随机挑战点 (Commitment: RamInc)
-        // -----------------------------------------------------------
-        // 提取 SumcheckId::RamReadWriteChecking 阶段使用的随机点。
-        // 这对应于验证 "RAM 读操作必须在最近一次写操作之后" 的逻辑。
+        // Fetch opening points from accumulator
         let (r_cycle_stage2, _) = accumulator.get_committed_polynomial_opening(
             CommittedPolynomial::RamInc,
             SumcheckId::RamReadWriteChecking,
         );
+        let (r_cycle_stage4, _) = accumulator
+            .get_committed_polynomial_opening(CommittedPolynomial::RamInc, SumcheckId::RamValCheck);
 
-        // 提取 SumcheckId::RamValEvaluation 阶段使用的随机点。
-        // 这对应于验证 "RAM 在该时刻的具体数值 (Value) 是多少"。
-        let (r_cycle_stage4, _) = accumulator.get_committed_polynomial_opening(
-            CommittedPolynomial::RamInc,
-            SumcheckId::RamValEvaluation,
-        );
-
-        // Debug Assert: 确保一致性
-        // 在 Debug 模式下，验证 ValEvaluation 和 ValFinalEvaluation 是否在同一个点上打开 RamInc 多项式。
-        // 理论上这两个阶段应该共享同一个随机点，如果不一致说明流程有 Bug。
-        #[cfg(debug_assertions)]
-        {
-            let (r_cycle_stage4_final, _) = accumulator.get_committed_polynomial_opening(
-                CommittedPolynomial::RamInc,
-                SumcheckId::RamValFinalEvaluation,
-            );
-            debug_assert_eq!(
-                r_cycle_stage4.r, r_cycle_stage4_final.r,
-                "ValEvaluation and ValFinal should have same RamInc opening point"
-            );
-        }
-
-        // 3. 获取寄存器 (Register) 相关的随机挑战点 (Commitment: RdInc)
-        // -----------------------------------------------------------
-        // 提取 SumcheckId::RegistersReadWriteChecking 阶段使用的随机点。
-        // 类似于 RAM，这里验证寄存器 (Rd) 的读写时序一致性。
         let (s_cycle_stage4, _) = accumulator.get_committed_polynomial_opening(
             CommittedPolynomial::RdInc,
             SumcheckId::RegistersReadWriteChecking,
         );
-
-        // 提取 SumcheckId::RegistersValEvaluation 阶段使用的随机点。
-        // 验证寄存器 (Rd) 的具体数值。
         let (s_cycle_stage5, _) = accumulator.get_committed_polynomial_opening(
             CommittedPolynomial::RdInc,
             SumcheckId::RegistersValEvaluation,
         );
 
-        // 构建并返回包含所有必要参数的结构体
         Self {
             gamma_powers: [gamma, gamma_sqr, gamma_cub],
-            n_cycle_vars: trace_len.log_2(), // 变量个数 = log2(Trace长度)
+            n_cycle_vars: trace_len.log_2(),
             r_cycle_stage2,
             r_cycle_stage4,
             s_cycle_stage4,
@@ -179,10 +132,8 @@ impl<F: JoltField> SumcheckInstanceParams<F> for IncClaimReductionSumcheckParams
             CommittedPolynomial::RamInc,
             SumcheckId::RamReadWriteChecking,
         );
-        let (_, v_2) = accumulator.get_committed_polynomial_opening(
-            CommittedPolynomial::RamInc,
-            SumcheckId::RamValEvaluation,
-        );
+        let (_, v_2) = accumulator
+            .get_committed_polynomial_opening(CommittedPolynomial::RamInc, SumcheckId::RamValCheck);
         // Note: v_2 already includes ValFinal claim (same point, combined)
 
         let (_, w_1) = accumulator.get_committed_polynomial_opening(
@@ -211,11 +162,57 @@ impl<F: JoltField> SumcheckInstanceParams<F> for IncClaimReductionSumcheckParams
     ) -> OpeningPoint<BIG_ENDIAN, F> {
         OpeningPoint::<LITTLE_ENDIAN, F>::new(challenges.to_vec()).match_endianness()
     }
-}
 
-// ============================================================================
-// PROVER
-// ============================================================================
+    #[cfg(feature = "zk")]
+    fn input_claim_constraint(&self) -> InputClaimConstraint {
+        InputClaimConstraint::weighted_openings(&[
+            OpeningId::committed(
+                CommittedPolynomial::RamInc,
+                SumcheckId::RamReadWriteChecking,
+            ),
+            OpeningId::committed(CommittedPolynomial::RamInc, SumcheckId::RamValCheck),
+            OpeningId::committed(
+                CommittedPolynomial::RdInc,
+                SumcheckId::RegistersReadWriteChecking,
+            ),
+            OpeningId::committed(
+                CommittedPolynomial::RdInc,
+                SumcheckId::RegistersValEvaluation,
+            ),
+        ])
+    }
+
+    #[cfg(feature = "zk")]
+    fn input_constraint_challenge_values(&self, _: &dyn OpeningAccumulator<F>) -> Vec<F> {
+        let [gamma, gamma_sqr, gamma_cub] = self.gamma_powers;
+        vec![gamma, gamma_sqr, gamma_cub]
+    }
+
+    #[cfg(feature = "zk")]
+    fn output_claim_constraint(&self) -> Option<OutputClaimConstraint> {
+        Some(OutputClaimConstraint::all_weighted_openings(&[
+            OpeningId::committed(CommittedPolynomial::RamInc, SumcheckId::IncClaimReduction),
+            OpeningId::committed(CommittedPolynomial::RdInc, SumcheckId::IncClaimReduction),
+        ]))
+    }
+
+    #[cfg(feature = "zk")]
+    fn output_constraint_challenge_values(&self, sumcheck_challenges: &[F::Challenge]) -> Vec<F> {
+        let [gamma, gamma_sqr, _] = self.gamma_powers;
+
+        let opening_point = self.normalize_opening_point(sumcheck_challenges);
+
+        let eq_r2: F = EqPolynomial::mle(&opening_point.r, &self.r_cycle_stage2.r);
+        let eq_r4: F = EqPolynomial::mle(&opening_point.r, &self.r_cycle_stage4.r);
+        let eq_s4: F = EqPolynomial::mle(&opening_point.r, &self.s_cycle_stage4.r);
+        let eq_s5: F = EqPolynomial::mle(&opening_point.r, &self.s_cycle_stage5.r);
+
+        let eq_ram_combined = eq_r2 + gamma * eq_r4;
+        let eq_rd_combined = eq_s4 + gamma * eq_s5;
+
+        vec![eq_ram_combined, gamma_sqr * eq_rd_combined]
+    }
+}
 
 #[derive(Allocative)]
 pub struct IncClaimReductionSumcheckProver<F: JoltField> {
@@ -241,7 +238,7 @@ impl<F: JoltField> IncClaimReductionSumcheckProver<F> {
 }
 
 impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
-for IncClaimReductionSumcheckProver<F>
+    for IncClaimReductionSumcheckProver<F>
 {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         &self.params
@@ -282,7 +279,6 @@ for IncClaimReductionSumcheckProver<F>
     fn cache_openings(
         &self,
         accumulator: &mut ProverOpeningAccumulator<F>,
-        transcript: &mut T,
         sumcheck_challenges: &[F::Challenge],
     ) {
         let IncClaimReductionPhase::Phase2(state) = &self.phase else {
@@ -296,14 +292,12 @@ for IncClaimReductionSumcheckProver<F>
         let rd_inc_claim = state.rd_inc.final_sumcheck_claim();
 
         accumulator.append_dense(
-            transcript,
             CommittedPolynomial::RamInc,
             SumcheckId::IncClaimReduction,
             opening_point.r.clone(),
             ram_inc_claim,
         );
         accumulator.append_dense(
-            transcript,
             CommittedPolynomial::RdInc,
             SumcheckId::IncClaimReduction,
             opening_point.r,
@@ -316,10 +310,6 @@ for IncClaimReductionSumcheckProver<F>
         flamegraph.visit_root(self);
     }
 }
-
-// ============================================================================
-// PHASE 1: Prefix-Suffix Sumcheck
-// ============================================================================
 
 #[derive(Allocative)]
 struct IncClaimReductionPhase1State<F: JoltField> {
@@ -345,63 +335,42 @@ struct IncClaimReductionPhase1State<F: JoltField> {
 impl<F: JoltField> IncClaimReductionPhase1State<F> {
     #[tracing::instrument(skip_all, name = "IncClaimReductionPhase1State::initialize")]
     fn initialize(trace: Arc<Vec<Cycle>>, params: &IncClaimReductionSumcheckParams<F>) -> Self {
-        // ---------------------------------------------------------
-        // 1. 维度计算与拆分
-        // ---------------------------------------------------------
         let n_vars = params.n_cycle_vars;
-        // 将变量数对半拆分，例如 20 bits -> 10 bits (prefix) + 10 bits (suffix)
-        let prefix_n_vars = n_vars / 2;       // 对应低位 (Lo) 索引
-        let suffix_n_vars = n_vars - prefix_n_vars; // 对应高位 (Hi) 索引
-        let prefix_len = 1 << prefix_n_vars;  // P 和 Q 数组的长度 (sqrt(N))
-        let suffix_len = 1 << suffix_n_vars;  // 内层循环折叠的长度
+        let prefix_n_vars = n_vars / 2;
+        let suffix_n_vars = n_vars - prefix_n_vars;
+        let prefix_len = 1 << prefix_n_vars;
+        let suffix_len = 1 << suffix_n_vars;
 
-        // ---------------------------------------------------------
-        // 2. 拆分随机挑战点 (Challenges)
-        // ---------------------------------------------------------
-        // Verifier 提供的随机点 r 也被拆分为高位部分 (hi) 和低位部分 (lo)。
-        // split_at: 将随机向量切开。
+        // Split each opening point into hi (suffix) and lo (prefix)
+        // Big-endian: hi is first half, lo is second half
         let (r2_hi, r2_lo) = params.r_cycle_stage2.split_at(suffix_n_vars);
         let (r4_hi, r4_lo) = params.r_cycle_stage4.split_at(suffix_n_vars);
         let (s4_hi, s4_lo) = params.s_cycle_stage4.split_at(suffix_n_vars);
         let (s5_hi, s5_lo) = params.s_cycle_stage5.split_at(suffix_n_vars);
 
-        // ---------------------------------------------------------
-        // 3. 预计算 P 多项式 (Prefix Eq)
-        // ---------------------------------------------------------
-        // P[i] = eq(r_lo, i)。
-        // 这些将在后续的 Sumcheck Phase 2 中作为系数使用。
+        // P buffers: prefix eq evaluations
         let P_ram_0 = EqPolynomial::evals(&r2_lo.r);
         let P_ram_1 = EqPolynomial::evals(&r4_lo.r);
         let P_rd_0 = EqPolynomial::evals(&s4_lo.r);
         let P_rd_1 = EqPolynomial::evals(&s5_lo.r);
 
-        // ---------------------------------------------------------
-        // 4. 预计算高位 Eq 表 (Suffix Eq)
-        // ---------------------------------------------------------
-        // 用于在本次函数中计算 Q。
-        // eq_hi[j] = eq(r_hi, j)。
+        // Suffix eq evaluations (for computing Q)
         let eq_r2_hi = EqPolynomial::evals(&r2_hi.r);
         let eq_r4_hi = EqPolynomial::evals(&r4_hi.r);
         let eq_s4_hi = EqPolynomial::evals(&s4_hi.r);
         let eq_s5_hi = EqPolynomial::evals(&s5_hi.r);
 
-        // ---------------------------------------------------------
-        // 5. 分配 Q 多项式内存
-        // ---------------------------------------------------------
-        // Q[i] 将存储第 i 个 prefix 对应的所有 suffix 的加权和。
-        // 使用 unsafe_allocate_zero_vec 进行快速且未初始化的内存分配（随后会被覆盖或累加）。
+        // Q buffers: sum over suffix indices
         let mut Q_ram_0 = unsafe_allocate_zero_vec(prefix_len);
         let mut Q_ram_1 = unsafe_allocate_zero_vec(prefix_len);
         let mut Q_rd_0 = unsafe_allocate_zero_vec(prefix_len);
         let mut Q_rd_1 = unsafe_allocate_zero_vec(prefix_len);
 
-        // ---------------------------------------------------------
-        // 6. 并行计算折叠多项式 Q (核心逻辑)
-        // ---------------------------------------------------------
+        // Right-size chunks based on number of threads
+        // Use ceiling division to ensure roughly equal work per thread
         let num_threads = rayon::current_num_threads();
         let chunk_size = prefix_len.div_ceil(num_threads).max(1);
 
-        // 并行遍历 Q 的每一个块 (对应 prefix/lo 索引)
         (
             Q_ram_0.par_chunks_mut(chunk_size),
             Q_ram_1.par_chunks_mut(chunk_size),
@@ -411,46 +380,34 @@ impl<F: JoltField> IncClaimReductionPhase1State<F> {
             .into_par_iter()
             .enumerate()
             .for_each(|(chunk_i, (q_ram_0, q_ram_1, q_rd_0, q_rd_1))| {
-                // 遍历当前块内的每一个 prefix 索引 (i)
                 for i in 0..q_ram_0.len() {
-                    // 计算全局 prefix 索引 x_lo
                     let x_lo = chunk_i * chunk_size + i;
 
-                    // 初始化累加器 (使用 SIMD 优化的 Acc6S 类型)
-                    let mut acc_ram_0: Acc6S<F> = Acc6S::zero();
-                    let mut acc_ram_1: Acc6S<F> = Acc6S::zero();
-                    let mut acc_rd_0: Acc6S<F> = Acc6S::zero();
-                    let mut acc_rd_1: Acc6S<F> = Acc6S::zero();
+                    let mut acc_ram_0: MedAccumS<F> = MedAccumS::zero();
+                    let mut acc_ram_1: MedAccumS<F> = MedAccumS::zero();
+                    let mut acc_rd_0: MedAccumS<F> = MedAccumS::zero();
+                    let mut acc_rd_1: MedAccumS<F> = MedAccumS::zero();
 
-                    // 内层循环: 遍历所有高位 suffix 索引 (x_hi)
-                    // 这里执行了折叠操作: Q[x_lo] += Inc[x_lo, x_hi] * eq_hi[x_hi]
                     for x_hi in 0..suffix_len {
-                        // 组合得到 Trace 的绝对索引 x
-                        // x = x_lo + (x_hi * 2^prefix_bits)
                         let x = x_lo + (x_hi << prefix_n_vars);
                         let cycle = &trace[x];
 
-                        // --- 计算 RAM 写入增量 ---
-                        // 如果是写操作，增量 = 新值 - 旧值；否则为 0。
+                        // RamInc = post_value - pre_value for RAM writes
                         let ram_inc: S64 = match cycle.ram_access() {
                             RAMAccess::Write(w) => s64_from_diff_u64s(w.post_value, w.pre_value),
                             _ => S64::from(0i64),
                         };
 
-                        // --- 计算 RD (寄存器) 写入增量 ---
-                        // 增量 = 新寄存器值 - 旧寄存器值
+                        // RdInc = post_value - pre_value for rd writes
                         let (_, pre_rd, post_rd) = cycle.rd_write().unwrap_or_default();
                         let rd_inc: S64 = s64_from_diff_u64s(post_rd, pre_rd);
 
-                        // --- 累加 (Fused Multiply-Add) ---
-                        // acc += eq_hi * inc
                         acc_ram_0.fmadd(&eq_r2_hi[x_hi], &ram_inc);
                         acc_ram_1.fmadd(&eq_r4_hi[x_hi], &ram_inc);
                         acc_rd_0.fmadd(&eq_s4_hi[x_hi], &rd_inc);
                         acc_rd_1.fmadd(&eq_s5_hi[x_hi], &rd_inc);
                     }
 
-                    // 将累加结果进行 Barrett Reduction (取模) 并存入 Q
                     q_ram_0[i] = acc_ram_0.barrett_reduce();
                     q_ram_1[i] = acc_ram_1.barrett_reduce();
                     q_rd_0[i] = acc_rd_0.barrett_reduce();
@@ -543,10 +500,6 @@ impl<F: JoltField> IncClaimReductionPhase1State<F> {
     }
 }
 
-// ============================================================================
-// PHASE 2: Standard Sumcheck
-// ============================================================================
-
 #[derive(Allocative)]
 struct IncClaimReductionPhase2State<F: JoltField> {
     ram_inc: MultilinearPolynomial<F>,
@@ -634,8 +587,8 @@ impl<F: JoltField> IncClaimReductionPhase2State<F> {
             .for_each(|(chunk_i, (ram_chunk, rd_chunk))| {
                 for i in 0..ram_chunk.len() {
                     let x_hi = chunk_i * chunk_size + i;
-                    let mut acc_ram: Acc6S<F> = Acc6S::zero();
-                    let mut acc_rd: Acc6S<F> = Acc6S::zero();
+                    let mut acc_ram: MedAccumS<F> = MedAccumS::zero();
+                    let mut acc_rd: MedAccumS<F> = MedAccumS::zero();
 
                     for (x_lo, eq_val) in eq_prefix_evals.iter().enumerate() {
                         let x = x_lo + (x_hi << prefix_len.log_2());
@@ -718,10 +671,6 @@ impl<F: JoltField> IncClaimReductionPhase2State<F> {
     }
 }
 
-// ============================================================================
-// VERIFIER
-// ============================================================================
-
 pub struct IncClaimReductionSumcheckVerifier<F: JoltField> {
     params: IncClaimReductionSumcheckParams<F>,
 }
@@ -738,7 +687,7 @@ impl<F: JoltField> IncClaimReductionSumcheckVerifier<F> {
 }
 
 impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
-for IncClaimReductionSumcheckVerifier<F>
+    for IncClaimReductionSumcheckVerifier<F>
 {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         &self.params
@@ -779,20 +728,17 @@ for IncClaimReductionSumcheckVerifier<F>
     fn cache_openings(
         &self,
         accumulator: &mut VerifierOpeningAccumulator<F>,
-        transcript: &mut T,
         sumcheck_challenges: &[F::Challenge],
     ) {
         let opening_point = SumcheckInstanceVerifier::<F, T>::get_params(self)
             .normalize_opening_point(sumcheck_challenges);
 
         accumulator.append_dense(
-            transcript,
             CommittedPolynomial::RamInc,
             SumcheckId::IncClaimReduction,
             opening_point.r.clone(),
         );
         accumulator.append_dense(
-            transcript,
             CommittedPolynomial::RdInc,
             SumcheckId::IncClaimReduction,
             opening_point.r,

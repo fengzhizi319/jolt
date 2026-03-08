@@ -8,7 +8,7 @@
 //! From RA reduction sumcheck (Stage 5), we receive a single claim:
 //!
 //! ```text
-//! ra(r_address_reduced, r_cycle_reduced) = ra_claim_reduced
+//! ra(r_address_stage2, r_cycle_stage5) = ra_claim_stage5
 //! ```
 //!
 //! ## Identity
@@ -16,11 +16,11 @@
 //! We prove the following sumcheck identity over `c ∈ {0,1}^{log_T}`:
 //!
 //! ```text
-//! Σ_c eq(r_cycle_reduced, c) · Π_{i=0}^{d-1} ra_i(r_address_reduced_i, c) = ra_claim_reduced
+//! Σ_c eq(r_cycle_stage5, c) · Π_{i=0}^{d-1} ra_i(r_address_stage2_i, c) = ra_claim_stage5
 //! ```
 //!
 //! where:
-//! - `r_address_reduced` is split into chunks `r_address_reduced_i` according to the
+//! - `r_address_stage2` is split into chunks `r_address_stage2_i` according to the
 //!   one-hot decomposition parameters (each chunk has `bits_per_chunk` bits)
 //! - `ra_i(k, c) = 1` if the i-th chunk of the address accessed at cycle c equals k
 //! - `d` is the number of decomposition chunks
@@ -49,6 +49,8 @@ use common::jolt_device::MemoryLayout;
 use std::sync::Arc;
 use tracer::instruction::Cycle;
 
+#[cfg(feature = "zk")]
+use crate::poly::opening_proof::OpeningId;
 use crate::poly::opening_proof::{
     OpeningAccumulator, OpeningPoint, ProverOpeningAccumulator, SumcheckId,
     VerifierOpeningAccumulator, BIG_ENDIAN, LITTLE_ENDIAN,
@@ -56,6 +58,10 @@ use crate::poly::opening_proof::{
 use crate::poly::ra_poly::RaPolynomial;
 use crate::poly::split_eq_poly::GruenSplitEqPolynomial;
 use crate::poly::unipoly::UniPoly;
+#[cfg(feature = "zk")]
+use crate::subprotocols::blindfold::{
+    InputClaimConstraint, OutputClaimConstraint, ProductTerm, ValueSource,
+};
 use crate::subprotocols::mles_product_sum::compute_mles_product_sum;
 use crate::subprotocols::sumcheck_prover::SumcheckInstanceProver;
 use crate::subprotocols::sumcheck_verifier::{SumcheckInstanceParams, SumcheckInstanceVerifier};
@@ -90,40 +96,30 @@ pub struct RamRaVirtualParams<F: JoltField> {
 }
 
 impl<F: JoltField> RamRaVirtualParams<F> {
-      /// 初始化 RA 虚拟多项式的参数。
-    ///
-    /// 此函数从 `opening_accumulator` 中获取先前 Sumcheck 阶段（`RamRaClaimReduction`）产生的声明（claim），
-    /// 并从其对应的随机打开点 `r` 中提取出“地址部分”和“周期/时间部分”。
-    /// 地址部分会被进一步拆分为多个块（chunk），以对应多线性扩展（MLE）中的 One-Hot 编码结构。
     pub fn new(
         trace_len: usize,
         one_hot_params: &OneHotParams,
         opening_accumulator: &dyn OpeningAccumulator<F>,
     ) -> Self {
-        // 计算 RAM 大小 K 的对数，即地址位数
         let log_K = one_hot_params.ram_k.log_2();
 
-        // 从累加器中获取 RAM RA 多项式在先前 Sumcheck 协议中的打开点 `r` 和对应的评估值 `_ra_claim_reduced`。
-        // `r` 是一个合并后的随机向量，包含地址随机数和周期随机数。
+        // Get the reduced RA claim from RA reduction sumcheck
         let (r, _ra_claim_reduced) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::RamRa,
             SumcheckId::RamRaClaimReduction,
         );
 
-        // 将总的随机打开点 `r` 切分为两部分：
-        // `r_address`: 前 log_K 个元素，对应于内存地址的变量绑定。
-        // `r_cycle`: 剩余的元素（log_T 个），对应于执行周期（时间步骤）的变量绑定。
+        // Split the opening point into address and cycle parts
         let (r_address, r_cycle) = r.split_at(log_K);
 
-        // 根据 One-Hot 参数的配置，将 `r_address` 进一步切分成多个小块（chunks）。
-        // 这一步是为了适应内存构造中的分段查找逻辑（例如将大地址拆分为高低位段）。
+        // Split r_address into chunks according to one-hot decomposition
         let r_address_chunks = one_hot_params.compute_r_address_chunks::<F>(&r_address.r);
 
         Self {
-            r_cycle,          // 用于绑定时间维度的随机点
-            r_address_chunks, // 处理后的地址维度随机点片段
-            d: one_hot_params.ram_d, // 多少个 One-Hot 段
-            log_T: trace_len.log_2(), // 执行痕迹长度的对数（时间步数）
+            r_cycle,
+            r_address_chunks,
+            d: one_hot_params.ram_d,
+            log_T: trace_len.log_2(),
         }
     }
 }
@@ -153,6 +149,41 @@ impl<F: JoltField> SumcheckInstanceParams<F> for RamRaVirtualParams<F> {
     ) -> OpeningPoint<BIG_ENDIAN, F> {
         OpeningPoint::<LITTLE_ENDIAN, F>::new(challenges.to_vec()).match_endianness()
     }
+
+    #[cfg(feature = "zk")]
+    fn input_claim_constraint(&self) -> InputClaimConstraint {
+        let opening = OpeningId::virt(VirtualPolynomial::RamRa, SumcheckId::RamRaClaimReduction);
+        InputClaimConstraint::direct(opening)
+    }
+
+    #[cfg(feature = "zk")]
+    fn input_constraint_challenge_values(&self, _: &dyn OpeningAccumulator<F>) -> Vec<F> {
+        Vec::new()
+    }
+
+    #[cfg(feature = "zk")]
+    fn output_claim_constraint(&self) -> Option<OutputClaimConstraint> {
+        let factors: Vec<ValueSource> = (0..self.d)
+            .map(|i| {
+                let opening = OpeningId::committed(
+                    CommittedPolynomial::RamRa(i),
+                    SumcheckId::RamRaVirtualization,
+                );
+                ValueSource::Opening(opening)
+            })
+            .collect();
+
+        let terms = vec![ProductTerm::scaled(ValueSource::Challenge(0), factors)];
+
+        Some(OutputClaimConstraint::sum_of_products(terms))
+    }
+
+    #[cfg(feature = "zk")]
+    fn output_constraint_challenge_values(&self, sumcheck_challenges: &[F::Challenge]) -> Vec<F> {
+        let r_cycle_final = self.normalize_opening_point(sumcheck_challenges);
+        let eq_eval: F = EqPolynomial::<F>::mle_endian(&self.r_cycle, &r_cycle_final);
+        vec![eq_eval]
+    }
 }
 
 /// RAM RA virtualization sumcheck prover.
@@ -169,70 +200,34 @@ pub struct RamRaVirtualSumcheckProver<F: JoltField> {
 
 impl<F: JoltField> RamRaVirtualSumcheckProver<F> {
     #[tracing::instrument(skip_all, name = "RamRaVirtualSumcheckProver::initialize")]
-    /// 初始化 RAM 地址虚拟化证明器
-    /// 核心任务：将 Trace 中的大地址切分，并计算每个切片相对于 Verifier 挑战 r 的 Eq 值。
     pub fn initialize(
-        params: RamRaVirtualParams<F>, // 包含 Verifier 的随机挑战 r_address (已切分) 和 r_cycle
-        trace: &[Cycle],               // 执行痕迹，包含每一步的 RAM 操作
-        memory_layout: &MemoryLayout,  // 内存布局 (用于地址重映射)
-        one_hot_params: &OneHotParams, // 切分参数 (例如 d=8, chunk_size=8 bits)
+        params: RamRaVirtualParams<F>,
+        trace: &[Cycle],
+        memory_layout: &MemoryLayout,
+        one_hot_params: &OneHotParams,
     ) -> Self {
-        // =========================================================
-        // 步骤 1: 预计算 Eq 表 (Precompute EQ Tables)
-        // ---------------------------------------------------------
-        // Verifier 发来的大随机数 r_address 已经被切分成了 params.r_address_chunks。
-        // 对于每一个切片 i (比如第 0 个字节)，我们计算它在所有可能值 (0..255) 上的 eq 值。
-        // eq_tables[i][val] = eq(r_chunk_i, val)
-        // 这是一个极小的表 (例如 size 256)，查表速度极快。
-        // =========================================================
+        // Precompute EQ tables for each address chunk
         let eq_tables: Vec<Vec<F>> = params
             .r_address_chunks
             .iter()
             .map(|chunk| EqPolynomial::evals(chunk))
             .collect();
 
-        // =========================================================
-        // 步骤 2: 初始化时间维度的 Eq 多项式,创建针对周期的 Eq 多项式
-        // ---------------------------------------------------------
-        // 用于 Sumcheck 中对 Trace 的时间轴 (Cycle) 进行折叠。
-        // 使用 Gruen 优化算法，可以在 O(1) 时间内更新 sumcheck 状态。
-        // GruenSplitEqPolynomial 是一种优化的 Eq 多项式实现，用于处理 log_T 维度的 r_cycle 随机点。
-        // 它对应公式中的 eq(r_cycle, c)。
-        // =========================================================
+        // Create eq polynomial with Gruen optimization for r_cycle_reduced
         let eq_poly = GruenSplitEqPolynomial::new(&params.r_cycle.r, BindingOrder::LowToHigh);
 
-        // =========================================================
-        // 步骤 3: 构建切片多项式 (Create RA Polynomials),并行创建 ra_i 多项式
-        // ---------------------------------------------------------
-        // 地址被切分为 d 段，每一段生成一个 polynomial。
-        // 这里是核心：把 Trace 里的地址切碎，并绑定到 Eq 表上。
-        // 我们需要生成 d 个多项式 (ra_i_polys)，每个对应地址的一个切片位置。
-        // =========================================================
+        // Create ra_i polynomials for each decomposition chunk
         let ra_i_polys: Vec<RaPolynomial<u8, F>> = (0..params.d)
-            .into_par_iter() // 并行处理每个切片维度 (0..7)
-            .zip(eq_tables.into_par_iter()) // 携带对应的 Eq 表
+            .into_par_iter()
+            .zip(eq_tables.into_par_iter())
             .map(|(i, eq_table)| {
-                // 3.1 提取 Trace 中所有周期的第 i 个切片值
-                // 此闭包并行处理每一列（每一个 chunk 维度）
                 let ra_i_indices: Vec<Option<u8>> = trace
                     .par_iter()
                     .map(|cycle| {
-                        // 从 trace 中获取当前周期的内存地址，并根据内存布局进行映射
-                        // remap_address: 将物理地址映射到规范的 Proof 地址空间
-                        // one_hot_params.ram_address_chunk: 提取地址的第 i 个 chunk (如第 i 个字节)
                         remap_address(cycle.ram_access().address() as u64, memory_layout)
                             .map(|address| one_hot_params.ram_address_chunk(address, i))
                     })
                     .collect();
-
-                // 3.2 构造 RaPolynomial,RaPolynomial 实际上是一个 lookup 的封装。
-                // 这个多项式并不存储具体的数值，而是存储了 "索引 (indices)" 和 "查表逻辑 (eq_table)"。
-                // 当 Sumcheck 需要求值时，它会查表：Value[t] = eq_table[ indices[t] ]
-                // 物理含义：在时刻 t，第 i 个切片的 Eq 值是多少？
-
-                // 它的评估逻辑是：对于 trace 中的第 c 个元素（即 chunk 值 val），
-                // 其多项式值为 eq_table[val]。
-                // 数学会意为：eq(r_address_i, actual_chunk_at_cycle_c)
                 RaPolynomial::new(Arc::new(ra_i_indices), eq_table)
             })
             .collect();
@@ -267,7 +262,6 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for RamRaVirtualS
     fn cache_openings(
         &self,
         accumulator: &mut ProverOpeningAccumulator<F>,
-        transcript: &mut T,
         sumcheck_challenges: &[F::Challenge],
     ) {
         let r_cycle_final = self.params.normalize_opening_point(sumcheck_challenges);
@@ -276,7 +270,6 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for RamRaVirtualS
         for i in 0..self.params.d {
             let claim = self.ra_i_polys[i].final_sumcheck_claim();
             accumulator.append_sparse(
-                transcript,
                 vec![CommittedPolynomial::RamRa(i)],
                 SumcheckId::RamRaVirtualization,
                 self.params.r_address_chunks[i].clone(),
@@ -310,7 +303,7 @@ impl<F: JoltField> RamRaVirtualSumcheckVerifier<F> {
 }
 
 impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
-for RamRaVirtualSumcheckVerifier<F>
+    for RamRaVirtualSumcheckVerifier<F>
 {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         &self.params
@@ -343,7 +336,6 @@ for RamRaVirtualSumcheckVerifier<F>
     fn cache_openings(
         &self,
         accumulator: &mut VerifierOpeningAccumulator<F>,
-        transcript: &mut T,
         sumcheck_challenges: &[F::Challenge],
     ) {
         let r_cycle_final = self.params.normalize_opening_point(sumcheck_challenges);
@@ -352,7 +344,6 @@ for RamRaVirtualSumcheckVerifier<F>
         for i in 0..self.params.d {
             let opening_point = [&*self.params.r_address_chunks[i], &*r_cycle_final.r].concat();
             accumulator.append_sparse(
-                transcript,
                 vec![CommittedPolynomial::RamRa(i)],
                 SumcheckId::RamRaVirtualization,
                 opening_point,

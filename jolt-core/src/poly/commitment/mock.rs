@@ -6,7 +6,7 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use crate::{
     field::JoltField,
     poly::multilinear_polynomial::MultilinearPolynomial,
-    transcripts::{AppendToTranscript, Transcript},
+    transcripts::Transcript,
     utils::{errors::ProofVerifyError, small_scalar::SmallScalar},
 };
 
@@ -20,12 +20,6 @@ pub struct MockCommitScheme<F: JoltField> {
 #[derive(Default, Debug, PartialEq, Clone, CanonicalDeserialize, CanonicalSerialize)]
 pub struct MockCommitment<F: JoltField> {
     _field: PhantomData<F>,
-}
-
-impl<F: JoltField> AppendToTranscript for MockCommitment<F> {
-    fn append_to_transcript<ProofTranscript: Transcript>(&self, transcript: &mut ProofTranscript) {
-        transcript.append_message(b"mocker");
-    }
 }
 
 #[derive(CanonicalSerialize, CanonicalDeserialize, Clone, Debug)]
@@ -88,10 +82,13 @@ where
         opening_point: &[<Self::Field as JoltField>::Challenge],
         _hint: Option<Self::OpeningProofHint>,
         _transcript: &mut ProofTranscript,
-    ) -> Self::Proof {
-        MockProof {
-            opening_point: opening_point.to_owned(),
-        }
+    ) -> (Self::Proof, Option<Self::Field>) {
+        (
+            MockProof {
+                opening_point: opening_point.to_owned(),
+            },
+            None,
+        )
     }
 
     fn verify<ProofTranscript: Transcript>(

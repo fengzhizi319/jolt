@@ -2,6 +2,12 @@ use std::{array, iter::once, sync::Arc};
 
 use num_traits::Zero;
 
+#[cfg(feature = "zk")]
+use crate::poly::opening_proof::OpeningId;
+#[cfg(feature = "zk")]
+use crate::subprotocols::blindfold::{
+    InputClaimConstraint, OutputClaimConstraint, ProductTerm, ValueSource,
+};
 use crate::{
     field::JoltField,
     poly::{
@@ -43,7 +49,6 @@ use common::constants::{REGISTER_COUNT, XLEN};
 use itertools::{zip_eq, Itertools};
 use rayon::prelude::*;
 use strum::{EnumCount, IntoEnumIterator};
-// use tracing::info;
 use tracer::instruction::{Cycle, Instruction};
 
 /// Number of batched read-checking sumchecks bespokely
@@ -53,25 +58,35 @@ const N_STAGES: usize = 5;
 ///
 /// Stages virtualize different claim families (Stage1: Spartan outer; Stage2: product-virtualized
 /// flags; Stage3: Shift; Stage4: Registers RW; Stage5: Registers val-eval + Instruction lookups).
+///
 /// The input claim is a γ-weighted RLC of stage rv_claims plus RAF contributions folded into
 /// stages 1 and 3 via the identity polynomial. Address vars are bound in `d` chunks; cycle vars
-/// are bound with per-stage `GruenSplitEqPolynomial` (low-to-high binding), producing degree-3
-/// univariates.
+/// are bound with per-stage `GruenSplitEqPolynomial` (low-to-high binding), producing univariates
+/// of degree `d + 1` (cubic only when `d = 2`).
+///
+/// Challenge notation:
+/// - γ: the stage-folding scalar with powers `params.gamma_powers = transcript.challenge_scalar_powers(7)`.
+/// - β_s: per-stage scalars used *within* Val_s encodings (`stage{s}_gammas = transcript.challenge_scalar_powers(...)`),
+///   sampled separately for each stage.
 ///
 /// Mathematical claim:
 /// - Let K = 2^{log_K} and T = 2^{log_T}.
 /// - For stage s ∈ {1,2,3,4,5}, let r_s ∈ F^{log_T} and define eq_s(j) = EqPolynomial(j; r_s).
-/// - Let r_addr ∈ F^{log_K}. Let ra(k, j) ∈ {0,1} be the indicator that cycle j has program
-///   counter/address k (implemented as ∏_{i=0}^{d-1} ra_i(k_i, j)).
+/// - Let r_addr ∈ F^{log_K}. Let ra(k, j) ∈ {0,1} be the indicator that cycle j maps to bytecode
+///   row index k (i.e. `k = get_pc(cycle_j)`; this is *not* the ELF/instruction address).
+///   Implemented as ∏_{i=0}^{d-1} ra_i(k_i, j) via one-hot chunking of the bytecode index k.
 /// - Int(k) = 1 for all k (evaluation of the IdentityPolynomial over address variables).
 /// - Define per-stage Val_s(k) (address-only) as implemented by `compute_val_*`:
-///   * Stage1: Val_1(k) = unexpanded_pc(k) + γ·imm(k) + Σ_t γ^{2+t}·circuit_flag_t(k).
-///   * Stage2: Val_2(k) = 1_{jump}(k) + γ·1_{branch}(k) + γ^2·rd_addr(k) + γ^3·1_{write_lookup_to_rd}(k).
-///   * Stage3: Val_3(k) = imm(k) + γ·unexpanded_pc(k) + γ^2·1_{L_is_rs1}(k) + γ^3·1_{L_is_pc}(k)
-///   + γ^4·1_{R_is_rs2}(k) + γ^5·1_{R_is_imm}(k) + γ^6·1_{IsNoop}(k)
-///   + γ^7·1_{VirtualInstruction}(k) + γ^8·1_{IsFirstInSequence}(k).
-///   * Stage4: Val_4(k) = 1_{rd=r}(k) + γ·1_{rs1=r}(k) + γ^2·1_{rs2=r}(k), where r is fixed by opening.
-///   * Stage5: Val_5(k) = 1_{rd=r}(k) + γ·1_{¬interleaved}(k) + Σ_i γ^{2+i}·1_{table=i}(k).
+///   * Stage1: Val_1(k) = unexpanded_pc(k) + β_1·imm(k) + Σ_t β_1^{2+t}·circuit_flag_t(k).
+///   * Stage2: Val_2(k) = 1_{jump}(k) + β_2·1_{branch}(k) + β_2^2·1_{write_lookup_to_rd}(k)
+///   + β_2^3·1_{VirtualInstruction}(k).
+///   * Stage3: Val_3(k) = imm(k) + β_3·unexpanded_pc(k) + β_3^2·1_{L_is_rs1}(k) + β_3^3·1_{L_is_pc}(k)
+///   + β_3^4·1_{R_is_rs2}(k) + β_3^5·1_{R_is_imm}(k) + β_3^6·1_{IsNoop}(k)
+///   + β_3^7·1_{VirtualInstruction}(k) + β_3^8·1_{IsFirstInSequence}(k).
+///   * Stage4: Val_4(k) = 1_{rd=r}(k) + β_4·1_{rs1=r}(k) + β_4^2·1_{rs2=r}(k), where r is fixed by opening.
+///   * Stage5: Val_5(k) = 1_{rd=r}(k) + β_5·1_{¬interleaved}(k) + Σ_i β_5^{2+i}·1_{table=i}(k).
+///
+///   Here, unexpanded_pc(k) is the instruction's ELF/address field (`instr.address`) stored in the bytecode row k.
 ///
 /// Accumulator-provided LHS (RLC of stage claims with RAF):
 ///   rv_1(r_1) + γ·rv_2(r_2) + γ^2·rv_3(r_3) + γ^3·rv_4(r_4) + γ^4·rv_5(r_5)
@@ -90,95 +105,50 @@ const N_STAGES: usize = 5;
 ///     = Σ_{j,k} ra(k, j) · [ Σ_{s=1}^{5} γ^{s-1}·eq_s(j)·Val_s(k) + γ^5·eq_1(j)·Int(k) + γ^6·eq_3(j)·Int(k) ].
 ///
 /// Binding/implementation notes:
-/// - Address variables are bound first (high→low) in `d` chunks, accumulating `F_i` and `v` tables;
+/// - Address variables are bound first (low→high in the sumcheck binding order) in `d` chunks,
+///   accumulating `F_i` and `v` tables;
 ///   this materializes the address-only Val_s(k) evaluations and sets up `ra_i` polynomials.
 /// - Cycle variables are then bound (low→high) per stage with `GruenSplitEqPolynomial`, using
-///   previous-round claims to recover the cubic univariate each round.
-///   Prover state for the bytecode Read+RAF multi-stage sumcheck.
-///
-/// First log(K) rounds bind address variables in chunks, aggregating per-stage address-only
-/// contributions; last log(T) rounds bind cycle variables via per-stage `GruenSplitEqPolynomial`s.
+///   previous-round claims to recover the degree-(d+1) univariate each round.
+/// - RAF injection uses `VirtualPolynomial::PC` (not `UnexpandedPC`): `raf_claim` comes from
+///   `SumcheckId::SpartanOuter` and `raf_shift_claim` from `SumcheckId::SpartanShift`.
+/// - The Stage3 RAF weight is “offset inside the stage”: the prover uses `γ^4 * raf_shift_claim`
+///   in the Stage3 per-stage claim, then the stage itself is folded with an outer factor `γ^2`,
+///   yielding the advertised `γ^6` overall.
 #[derive(Allocative)]
 pub struct BytecodeReadRafSumcheckProver<F: JoltField> {
     /// Per-stage address MLEs F_i(k) built from eq(r_cycle_stage_i, (chunk_index, j)),
-    /// bound high-to-low during the address-binding phase.
-    ///
-    /// 每个阶段的地址多线性扩张 (MLE) F_i(k)。
-    /// 这里的 F[stage][k] 代表了“加权频次表”。对于给定的 ROM 地址 k，
-    /// F[k] = sum_{t where PC(t)=k} eq(r_cycle, t)。
-    /// 也就是说，它统计了地址 k 在整个执行 trace 中被访问了多少次，并未每一次访问赋予了一个基于时间的随机权重 eq(r, t)。
-    /// 在地址绑定阶段（前 log_K 轮），这些多项式会被从高位到低位逐轮折叠（bound）。
+    /// bound low-to-high during the address-binding phase.
     F: [MultilinearPolynomial<F>; N_STAGES],
-
     /// Chunked RA polynomials over address variables (one per dimension `d`), used to form
     /// the product ∏_i ra_i during the cycle-binding phase.
-    ///
-    /// 分块的 RA (Read Access) 多项式，定义在地址变量上。
-    /// 这里的 `ra` 实际上存储的是 trace 中每一行对应的 PC 的二进制位的分块表示。
-    /// 在周期绑定阶段（后 log_T 轮）使用，我们需要证明 trace 中的 PC 与我们声称的地址相符。
-    /// 它用于构建指示函数：当且仅当 cycle t 的地址等于特定的 k 时，值为 1。
     ra: Vec<RaPolynomial<u8, F>>,
-
     /// Binding challenges for the first log_K variables of the sumcheck
-    ///
-    /// 存储 Sumcheck 前 log_K 轮（地址绑定阶段）收到的 Verifier 随机挑战数。
-    /// 这些随机数共同确定了最终的随机地址 r_address。
     r_address_prime: Vec<F::Challenge>,
-
     /// Per-stage Gruen-split eq polynomials over cycle vars (low-to-high binding order).
-    ///
-    /// 每个阶段针对周期变量（Cycle variables）的 Gruen-split Eq 多项式。
-    /// 在 Sumcheck 的后 log_T 轮（时间绑定阶段），我们需要计算 eq(r_cycle, t)。
-    /// Gruen-split 是一种高效维护 eq 多项式折叠状态的技术，这里的绑定顺序是从低位到高位。
     gruen_eq_polys: [GruenSplitEqPolynomial<F>; N_STAGES],
-
-    /// Previous-round claims s_i(0)+s_i(1) per stage, needed for degree-3 univariate recovery.
-    ///
-    /// 每个阶段上一轮的 claim 值（s_i(0) + s_i(1)）。
-    /// 在构建当前轮次的 3 次单变量多项式时，需要用到上一轮的 sum 信息来恢复系数。
+    /// Previous-round claims s_i(0)+s_i(1) per stage, needed for degree-(d+1) univariate recovery.
     prev_round_claims: [F; N_STAGES],
-
     /// Round polynomials per stage for advancing to the next claim at r_j.
-    ///
-    /// 每个阶段当前轮次生成的单变量多项式。
-    /// Prover 计算出这些多项式后发送给 Verifier，并在进入下一轮前用随机点 r_j 进行评估以更新 Claim。
     prev_round_polys: Option<[UniPoly<F>; N_STAGES]>,
-
     /// Final sumcheck claims of stage Val polynomials (with RAF Int folded where applicable).
-    ///
-    /// 阶段 Val 多项式的最终 Sumcheck Claim（在适用处折叠了 RAF Int 多项式）。
-    /// 在地址绑定阶段结束时（前 log_K 轮结束），静态的 Val(k) 多项式已经被完全折叠成一个标量值：Val(r_address)。
-    /// 这个值将在剩下的 log_T 轮中作为常数系数乘在 Eq 多项式上。
     bound_val_evals: Option<[F; N_STAGES]>,
-
     /// Trace for computing PCs on the fly in init_log_t_rounds.
-    ///
-    /// 原始执行痕迹，用于在 init_log_t_rounds 中通过 trace索引 实时计算 PC。
-    /// 由于内存限制，我们可能不会显式存储完整的 PC 列表，而是持有 trace 的引用按需计算。
     #[allocative(skip)]
     trace: Arc<Vec<Cycle>>,
-
     /// Bytecode preprocessing for computing PCs.
-    ///
-    /// 字节码预处理信息，用于将 Trace 中的 pc 索引映射回实际的指令地址。
     #[allocative(skip)]
     bytecode_preprocessing: Arc<BytecodePreprocessing>,
-
     pub params: BytecodeReadRafSumcheckParams<F>,
 }
+
 impl<F: JoltField> BytecodeReadRafSumcheckProver<F> {
-    ///
-    /// 它的核心任务是计算一个叫 $F(k)$ 的多项式（实际上是 5 个，对应 5 个 Stage），我们称之为 “加权频次多项式”。
-    /// 输入: 执行痕迹 (Trace)，其中记录了每个周期 $c$ 执行了哪个 PC。输出: 一个关于 ROM 地址 $k$ 的表格 $F[k]$。
-    /// 如：$$F[100] = eq(r, 1) + eq(r, 50) + eq(r, 99)$$。表示pc=100是在第 1、50、99 步执行的。
-    /// 后续计算$$\text{Total} = \sum \text{Val}(k) \cdot F(k)$$
     #[tracing::instrument(skip_all, name = "BytecodeReadRafSumcheckProver::initialize")]
     pub fn initialize(
         params: BytecodeReadRafSumcheckParams<F>,
         trace: Arc<Vec<Cycle>>,
         bytecode_preprocessing: Arc<BytecodePreprocessing>,
     ) -> Self {
-        // 准备上一轮的 Claim，作为验证基准
         let claim_per_stage = [
             params.rv_claims[0] + params.gamma_powers[5] * params.raf_claim,
             params.rv_claims[1],
@@ -187,34 +157,26 @@ impl<F: JoltField> BytecodeReadRafSumcheckProver<F> {
             params.rv_claims[4],
         ];
 
-        // =================================================================================
-        // 核心算法：Split-Eq / Gruen Split 优化
-        // 目标：计算 F[stage][k] = Σ_{c: PC(c)=k} eq(r_cycle, c)
+        // Two-table split-eq optimization for computing F[stage][k] = Σ_{c: PC(c)=k} eq(r_cycle, c).
         //
-        // 原理：利用 eq(r, c) = eq(r_hi, c_hi) * eq(r_lo, c_lo) 的张量积性质。
-        // 将总循环 T 拆分为 "c_hi (Outer)" 和 "c_lo (Inner)" 两层。
+        // Double summation pattern:
+        //   F[stage][k] = Σ_{c_hi} E_hi[c_hi] × ( Σ_{c_lo : PC(c)=k} E_lo[c_lo] )
         //
-        // 1. Inner Loop (遍历 c_lo):
-        //    只进行纯加法累加。对于 block 内所有的 c_lo，通过 lookup 找到对应的 PC，
-        //    然后 accumulator[PC] += eq_lo[c_lo]。
-        //    这里完全不涉及乘法。
+        // Inner sum (over c_lo): ADDITIONS ONLY - accumulate E_lo contributions by PC
+        // Outer sum (over c_hi): ONE multiplication per touched PC, not per cycle
         //
-        // 2. Outer Loop (遍历 c_hi):
-        //    对 Inner Loop 累加的结果进行一次性乘法。
-        //    F[PC] += eq_hi[c_hi] * accumulator[PC]。
-        //    通过这种方式，乘法次数从 T 降到了 (Touched_PCs * Sqrt(T)) 级别。
-        // =================================================================================
+        // This reduces multiplications from O(T × N_STAGES) to O(touched_PCs × out_len × N_STAGES)
         let T = trace.len();
         let K = params.K;
         let log_T = params.log_T;
 
-        // 最佳分割点：通常取 sqrt(T)，使内外层平衡
+        // Optimal split: sqrt(T) for balanced tables
         let lo_bits = log_T / 2;
         let hi_bits = log_T - lo_bits;
-        let in_len: usize = 1 << lo_bits; // E_lo 长度 (Inner loop 大小)
-        let out_len: usize = 1 << hi_bits; // E_hi 长度 (Outer loop 大小)
+        let in_len: usize = 1 << lo_bits; // E_lo size (inner loop)
+        let out_len: usize = 1 << hi_bits; // E_hi size (outer loop)
 
-        // 并行预计算 Eq table 的两部分：E_hi 和 E_lo
+        // Pre-compute E_hi[stage][c_hi] and E_lo[stage][c_lo] for all stages in parallel
         let (E_hi, E_lo): ([Vec<F>; N_STAGES], [Vec<F>; N_STAGES]) = rayon::join(
             || {
                 params
@@ -230,34 +192,31 @@ impl<F: JoltField> BytecodeReadRafSumcheckProver<F> {
             },
         );
 
-        // 并行 Map-Reduce 模式：将 c_hi 块分配给不同线程处理
+        // Process by c_hi blocks, distributing work evenly among threads
         let num_threads = rayon::current_num_threads();
         let chunk_size = out_len.div_ceil(num_threads);
 
+        // Double summation: outer sum over c_hi, inner sum over c_lo
         let F: [Vec<F>; N_STAGES] = E_hi[0]
             .par_chunks(chunk_size)
             .enumerate()
             .map(|(chunk_idx, chunk)| {
-                // par_chunks 将 E_hi 切片，每个线程处理一部分 c_hi
-
-                // partial: 线程本地的最终累加结果 F[stage][k]
+                // Per-thread accumulators for final F
                 let mut partial: [Vec<F>; N_STAGES] =
                     array::from_fn(|_| unsafe_allocate_zero_vec(K));
 
-                // inner: 用于 Inner Loop 的临时累加器。
-                // 存储 sum_{c_lo} E_lo[c_lo] for each PC within current c_hi block.
+                // Per-c_hi inner accumulators (reused across c_hi iterations)
                 let mut inner: [Vec<F>; N_STAGES] = array::from_fn(|_| unsafe_allocate_zero_vec(K));
 
-                // touched: 记录当前 inner 循环中哪些 PC 被访问过，用于快速清空 inner 数组 (Sparse clear)
+                // Track which PCs were touched in this c_hi block
                 let mut touched = Vec::with_capacity(in_len);
 
                 let chunk_start = chunk_idx * chunk_size;
-                // 遍历分配给当前线程的每一個 c_hi
                 for (local_idx, _) in chunk.iter().enumerate() {
                     let c_hi = chunk_start + local_idx;
                     let c_hi_base = c_hi * in_len;
 
-                    // 1. 重置 Inner Accumulator (仅清空非零项)
+                    // Clear inner accumulators for touched PCs only
                     for &k in &touched {
                         for stage in 0..N_STAGES {
                             inner[stage][k] = F::zero();
@@ -265,31 +224,27 @@ impl<F: JoltField> BytecodeReadRafSumcheckProver<F> {
                     }
                     touched.clear();
 
-                    // 2. INNER SUM: 遍历 c_lo
-                    // 关键点：这里只做加法！
+                    // INNER SUM: accumulate E_lo by PC (ADDITIONS ONLY, no multiplications)
                     for c_lo in 0..in_len {
                         let c = c_hi_base + c_lo;
                         if c >= T {
                             break;
                         }
 
-                        // 从 Trace 中获取当前 Cycle 的 Program Counter (PC)
                         let pc = bytecode_preprocessing.get_pc(&trace[c]);
 
-                        // 记录访问过的 PC (避免重复 push)
+                        // Track touched PCs (avoid duplicates with a simple check)
                         if inner[0][pc].is_zero() {
                             touched.push(pc);
                         }
 
-                        // 将 E_lo 的值累加到该 PC 对应的桶中
+                        // Accumulate E_lo contributions (addition only!)
                         for stage in 0..N_STAGES {
                             inner[stage][pc] += E_lo[stage][c_lo];
                         }
                     }
 
-                    // 3. OUTER SUM: 应用乘法权重
-                    // 也就是：Accumulator[PC] * E_hi[c_hi]
-                    // 仅遍历 touched (稀疏数组)，进一步减少计算量
+                    // OUTER SUM: multiply by E_hi and add to partial (sparse)
                     for &k in &touched {
                         for stage in 0..N_STAGES {
                             partial[stage][k] += E_hi[stage][c_hi] * inner[stage][k];
@@ -299,7 +254,6 @@ impl<F: JoltField> BytecodeReadRafSumcheckProver<F> {
 
                 partial
             })
-            // Reduce: 将所有线程计算出的 partial F 向量按位相加，得到全局最终结果
             .reduce(
                 || array::from_fn(|_| unsafe_allocate_zero_vec(K)),
                 |mut a, b| {
@@ -315,9 +269,7 @@ impl<F: JoltField> BytecodeReadRafSumcheckProver<F> {
 
         #[cfg(test)]
         {
-            // Debug 检查：
-            // 验证计算出的 F 向量是否满足 Sumcheck 定义：
-            // sum(Val(k) * F(k)) == Sum(Val(PC(t)) * Eq(r, t)) == Claim
+            // Verify that for each stage i: sum(val_i[k] * F_i[k] * eq_i[k]) = rv_claim_i
             for i in 0..N_STAGES {
                 let computed_claim: F = (0..params.K)
                     .into_par_iter()
@@ -340,7 +292,6 @@ impl<F: JoltField> BytecodeReadRafSumcheckProver<F> {
 
         let F = F.map(MultilinearPolynomial::from);
 
-        // 创建用于后续轮次绑定的 GruenSplitEqPolynomial
         let gruen_eq_polys = params
             .r_cycles
             .each_ref()
@@ -373,22 +324,24 @@ impl<F: JoltField> BytecodeReadRafSumcheckProver<F> {
         // Stage 5: gamma^4 * (Val_5)
         // Which matches with the input claim:
         // rv_1 + gamma * rv_2 + gamma^2 * rv_3 + gamma^3 * rv_4 + gamma^4 * rv_5 + gamma^5 * raf_1 + gamma^6 * raf_3
-        self.bound_val_evals = Some(
-            self.params
-                .val_polys
-                .iter()
-                .zip([
-                    int_poly * self.params.gamma_powers[5],
-                    F::zero(),
-                    int_poly * self.params.gamma_powers[4],
-                    F::zero(),
-                    F::zero(),
-                ])
-                .map(|(poly, int_poly)| poly.final_sumcheck_claim() + int_poly)
-                .collect::<Vec<F>>()
-                .try_into()
-                .unwrap(),
-        );
+        let bound_val_evals: [F; N_STAGES] = self
+            .params
+            .val_polys
+            .iter()
+            .zip([
+                int_poly * self.params.gamma_powers[5],
+                F::zero(),
+                int_poly * self.params.gamma_powers[4],
+                F::zero(),
+                F::zero(),
+            ])
+            .map(|(poly, int_poly)| poly.final_sumcheck_claim() + int_poly)
+            .collect::<Vec<F>>()
+            .try_into()
+            .unwrap();
+        self.bound_val_evals = Some(bound_val_evals);
+        self.params.bound_val_polys = Some(bound_val_evals);
+        self.params.bound_int_poly = Some(int_poly);
 
         // Reverse r_address_prime to get the correct order (it was built low-to-high)
         let mut r_address = std::mem::take(&mut self.r_address_prime);
@@ -430,7 +383,7 @@ impl<F: JoltField> BytecodeReadRafSumcheckProver<F> {
 }
 
 impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
-for BytecodeReadRafSumcheckProver<F>
+    for BytecodeReadRafSumcheckProver<F>
 {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         &self.params
@@ -475,8 +428,8 @@ for BytecodeReadRafSumcheckProver<F>
                             std::array::from_fn::<F, DEGREE, _>(|j| {
                                 val_evals[j]
                                     + int_evals.map_or(F::zero(), |int_evals| {
-                                    int_evals[j] * gamma.unwrap()
-                                })
+                                        int_evals[j] * gamma.unwrap()
+                                    })
                             })
                         });
 
@@ -519,7 +472,7 @@ for BytecodeReadRafSumcheckProver<F>
                     let mut ra_eval_pairs = vec![(F::zero(), F::zero()); self.ra.len()];
                     let mut ra_prod_evals = vec![F::zero(); degree - 1];
                     let mut evals_per_stage: [_; N_STAGES] =
-                        array::from_fn(|_| vec![F::Unreduced::zero(); degree - 1]);
+                        array::from_fn(|_| vec![F::UnreducedProductAccum::zero(); degree - 1]);
 
                     for j_lo in 0..in_len {
                         let j = j_lo + (j_hi << in_n_vars);
@@ -536,7 +489,7 @@ for BytecodeReadRafSumcheckProver<F>
                             let eq_in_eval = self.gruen_eq_polys[stage].E_in_current()[j_lo];
                             for i in 0..degree - 1 {
                                 evals_per_stage[stage][i] +=
-                                    eq_in_eval.mul_unreduced::<9>(ra_prod_evals[i]);
+                                    eq_in_eval.mul_to_product_accum(ra_prod_evals[i]);
                             }
                         }
                     }
@@ -545,7 +498,7 @@ for BytecodeReadRafSumcheckProver<F>
                         let eq_out_eval = self.gruen_eq_polys[stage].E_out_current()[j_hi];
                         evals_per_stage[stage]
                             .iter()
-                            .map(|v| eq_out_eval * F::from_montgomery_reduce(*v))
+                            .map(|v| eq_out_eval * F::reduce_product_accum(*v))
                             .collect()
                     })
                 })
@@ -610,7 +563,6 @@ for BytecodeReadRafSumcheckProver<F>
     fn cache_openings(
         &self,
         accumulator: &mut ProverOpeningAccumulator<F>,
-        transcript: &mut T,
         sumcheck_challenges: &[F::Challenge],
     ) {
         let opening_point = self.params.normalize_opening_point(sumcheck_challenges);
@@ -624,7 +576,6 @@ for BytecodeReadRafSumcheckProver<F>
 
         for i in 0..self.params.d {
             accumulator.append_sparse(
-                transcript,
                 vec![CommittedPolynomial::BytecodeRa(i)],
                 SumcheckId::BytecodeReadRaf,
                 r_address_chunks[i].clone(),
@@ -665,7 +616,7 @@ impl<F: JoltField> BytecodeReadRafSumcheckVerifier<F> {
 }
 
 impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
-for BytecodeReadRafSumcheckVerifier<F>
+    for BytecodeReadRafSumcheckVerifier<F>
 {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         &self.params
@@ -727,7 +678,6 @@ for BytecodeReadRafSumcheckVerifier<F>
     fn cache_openings(
         &self,
         accumulator: &mut VerifierOpeningAccumulator<F>,
-        transcript: &mut T,
         sumcheck_challenges: &[<F as JoltField>::Challenge],
     ) {
         let opening_point = self.params.normalize_opening_point(sumcheck_challenges);
@@ -742,7 +692,6 @@ for BytecodeReadRafSumcheckVerifier<F>
         (0..self.params.d).for_each(|i| {
             let opening_point = [&r_address_chunks[i][..], &r_cycle.r].concat();
             accumulator.append_sparse(
-                transcript,
                 vec![CommittedPolynomial::BytecodeRa(i)],
                 SumcheckId::BytecodeReadRaf,
                 opening_point,
@@ -755,6 +704,12 @@ for BytecodeReadRafSumcheckVerifier<F>
 pub struct BytecodeReadRafSumcheckParams<F: JoltField> {
     /// Index `i` stores `gamma^i`.
     pub gamma_powers: Vec<F>,
+    /// Stage-specific gamma powers for input_claim_constraint
+    pub stage1_gammas: Vec<F>,
+    pub stage2_gammas: Vec<F>,
+    pub stage3_gammas: Vec<F>,
+    pub stage4_gammas: Vec<F>,
+    pub stage5_gammas: Vec<F>,
     /// RLC of stage rv_claims and RAF claims (per Stage1/Stage3) used as the sumcheck LHS.
     pub input_claim: F,
     /// RaParams
@@ -775,60 +730,32 @@ pub struct BytecodeReadRafSumcheckParams<F: JoltField> {
     /// Identity polynomial over address vars used to inject RAF contributions.
     pub int_poly: IdentityPolynomial<F>,
     pub r_cycles: [Vec<F::Challenge>; N_STAGES],
+    /// Bound values after log_K rounds (set by prover for output_constraint_challenge_values)
+    pub bound_int_poly: Option<F>,
+    pub bound_val_polys: Option<[F; N_STAGES]>,
 }
 
 impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
     #[tracing::instrument(skip_all, name = "BytecodeReadRafSumcheckParams::gen")]
-    /// 生成 BytecodeReadRafSumcheckParams 实例。
-    ///具体来说，它负责：
-    /// 收集挑战数：从 Transcript 中获取随机挑战数 <span>\gamma</span>（Gamma）。
-    /// 计算目标值：从之前的证明步骤（Opening Accumulator）中提取多项式的评估值，并通过随机线性组合（RLC）计算出当前 Sumcheck 需要证明的总和（LHS）。
-    /// 计算 Val 多项式：为了验证效率，通过一次并行扫描（Fused Pass）计算所有 5 个阶段所需的 Val(k) 多项式，而不是扫描 5 次。
-    /// 此函数是协议设置阶段的核心，负责：
-    /// 1. 从 Transcript 获取随机挑战数 (Gamma)。
-    /// 2. 从 OpeningAccumulator 获取各个子协议生成的 Claims (声称值)。
-    /// 3. 计算最终的 input_claim (Verifier 期望 Prover 证明的总和)。
-    /// 4. 预计算所有阶段的 Val 多项式。
-    /// 生成 BytecodeReadRafSumcheck 实例的参数
-    /// 主要任务：收集前 5 个 Stage 关于“指令读取”的承诺，并结合静态字节码构建验证多项式。
     pub fn gen(
-        bytecode_preprocessing: &BytecodePreprocessing, // 预处理的静态字节码 (ROM)
-        n_cycle_vars: usize,                            // 对应 trace 长度的变量数 (log_2(Time))
-        one_hot_params: &OneHotParams,                  // One-hot 编码参数
-        opening_accumulator: &dyn OpeningAccumulator<F>, // 存储前序 Stage 计算结果的累加器
-        transcript: &mut impl Transcript,               // Fiat-Shamir 挑战生成器
+        bytecode_preprocessing: &BytecodePreprocessing,
+        n_cycle_vars: usize,
+        one_hot_params: &OneHotParams,
+        opening_accumulator: &dyn OpeningAccumulator<F>,
+        transcript: &mut impl Transcript,
     ) -> Self {
-        // =========================================================
-        // 1. 生成全局随机权重 Gamma
-        // 用于将 5 个不同的 Stage 的 Check + 2 个 RAF Check 合并为一个大的 Sumcheck
-        // =========================================================
-        // Compute powers of scalar q : (1, q, q^2, ..., q^(len-1))
         let gamma_powers = transcript.challenge_scalar_powers(7);
 
         let bytecode = &bytecode_preprocessing.bytecode;
 
-        // =========================================================
-        // 2. 为每个子 Stage 生成内部混合系数
-        // 前面的每个 Stage 可能包含多个子多项式（例如 Stage 1 有多个 Circuit Flags），
-        // 这里需要生成对应的权重将它们压缩。
-        // =========================================================
-
-        // Stage 1: Spartan Outer (验证操作码 Opcode 是否正确)
+        // Generate all stage-specific gamma powers upfront (order must match verifier)
         let stage1_gammas: Vec<F> = transcript.challenge_scalar_powers(2 + NUM_CIRCUIT_FLAGS);
-        // Stage 2: Product Virtualization (验证乘法相关逻辑)
         let stage2_gammas: Vec<F> = transcript.challenge_scalar_powers(4);
-        // Stage 3: Shift Sumcheck (验证位移操作)
         let stage3_gammas: Vec<F> = transcript.challenge_scalar_powers(9);
-        // Stage 4: Register R/W Checking (验证寄存器读写索引 rd, rs1, rs2)
         let stage4_gammas: Vec<F> = transcript.challenge_scalar_powers(3);
-        // Stage 5: Instruction Lookups (验证指令查找表的结果)
         let stage5_gammas: Vec<F> = transcript.challenge_scalar_powers(2 + NUM_LOOKUP_TABLES);
 
-        // =========================================================
-        // 3. 计算各个 Stage 的 "声明值" (RV Claims)
-        // 这些值代表了：“在前几个 Stage 中，Prover 声称从 Bytecode 中读到了什么值”。
-        // opening_accumulator 里存的是 MLE(r) 的求值结果。即p(r)
-        // =========================================================
+        // Compute rv_claims (these don't iterate bytecode, just query opening accumulator)
         let rv_claim_1 = Self::compute_rv_claim_1(opening_accumulator, &stage1_gammas);
         let rv_claim_2 = Self::compute_rv_claim_2(opening_accumulator, &stage2_gammas);
         let rv_claim_3 = Self::compute_rv_claim_3(opening_accumulator, &stage3_gammas);
@@ -836,25 +763,17 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
         let rv_claim_5 = Self::compute_rv_claim_5(opening_accumulator, &stage5_gammas);
         let rv_claims = [rv_claim_1, rv_claim_2, rv_claim_3, rv_claim_4, rv_claim_5];
 
-        // =========================================================
-        // 4. 预计算 Eq 多项式 (用于过滤寄存器)
-        // Stage 4 和 5 涉及到寄存器索引的检查。
-        // 我们需要构建 eq(r_register, index) 来验证 Trace 里的寄存器索引是否匹配。
-        // =========================================================
-
-        // 获取 Stage 4 中用于校验寄存器读写的随机点 r
+        // Pre-compute eq_r_register for stages 4 and 5 (they use different r_register points)
         let r_register_4 = opening_accumulator
             .get_virtual_polynomial_opening(
-                VirtualPolynomial::RdWa, // 目标是 Rd/Wa (Write Address)
+                VirtualPolynomial::RdWa,
                 SumcheckId::RegistersReadWriteChecking,
             )
             .0
-            .r; // 取出随机向量 r
-        // 计算 eq(r, x) 在所有可能的寄存器索引上的值 (0..31)
+            .r;
         let eq_r_register_4 =
             EqPolynomial::<F>::evals(&r_register_4[..(REGISTER_COUNT as usize).log_2()]);
 
-        // 同上，处理 Stage 5
         let r_register_5 = opening_accumulator
             .get_virtual_polynomial_opening(
                 VirtualPolynomial::RdWa,
@@ -865,13 +784,7 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
         let eq_r_register_5 =
             EqPolynomial::<F>::evals(&r_register_5[..(REGISTER_COUNT as usize).log_2()]);
 
-        // =========================================================
-        // 5. [核心优化] 融合计算 (Fused Computation)
-        // 这是为了性能。我们需要遍历静态的 Bytecode 来计算“理论上的多项式值”。
-        // 与其对 Bytecode 遍历 5 次（为每个 Stage 算一次），
-        // 不如遍历 1 次，同时计算出 5 个 Stage 所需的系数 (val_polys)。
-        // 这将生成这一轮 Sumcheck 所需的基础多项式。
-        // =========================================================
+        // Fused pass: compute all val polynomials in a single parallel iteration
         let val_polys = Self::compute_val_polys(
             bytecode,
             &eq_r_register_4,
@@ -883,47 +796,12 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
             &stage5_gammas,
         );
 
-        // =========================================================
-        // 身份多项式 (Identity Polynomial)
-        // ---------------------------------------------------------
-        // 目标：生成静态的 PC 地址序列，作为“位置指纹”绑定到每一行指令上。
-        // 它代表了向量 v = [0, 1, 2, ..., K-1] 的多线性扩张 (MLE)。
-        //
-        // 作用说明：
-        // 1. **PC 值绑定 (Location Binding)**：
-        //    它确保了指令的内容（如 Opcode, Imm）是与它在 ROM 中的地址（PC）强绑定的。
-        //    例如在 Stage 3 中，Val 公式包含 `γ * PC` 项。Verifier 使用此多项式计算
-        //    "当前行理论上应有的 PC 值"，防止 Prover 将位于 PC=100 的指令“剪切粘贴”到
-        //    PC=200 处去执行。
-        //
-        // 2. **注入 RAF (Read Access Frequency) 贡献**：
-        //    RAF 协议计算了运行过程中每个 PC 被访问的频次。
-        //    为了将 RAF 的结果（动态执行流统计）与 Bytecode Sumcheck（静态 ROM 内容检查）
-        //    连接起来，我们需要在 Sumcheck 的 Claim 中包含 PC 的贡献。
-        //    int_poly 提供了这个 "Base PC" 的值，使得 Val_1(k) = PC(k) + ... 成立。
-        //
-        // 举例：
-        // 假设 Bytecode 长度 K=4 (log_K=2)。
-        // int_poly 对应的就是向量 I = [0, 1, 2, 3]。
-        // 当 Sumcheck 进行到随机点 r=(r0, r1) 时，int_poly.evaluate(r) 会计算出
-        // 该点对应的“广义地址值”，用于验证上述逻辑。
-        // =========================================================
         let int_poly = IdentityPolynomial::new(one_hot_params.bytecode_k.log_2());
-        // =========================================================
-        // 6. 获取 RAF Claims (读访问频次声明)
-        // 这里从 accumulator 获取之前的 Sumcheck 结果，这些结果隐含了
-        // "PC 这一列在之前的检查中被访问了多少次"。
-        // =========================================================
+
         let (_, raf_claim) = opening_accumulator
             .get_virtual_polynomial_opening(VirtualPolynomial::PC, SumcheckId::SpartanOuter);
         let (_, raf_shift_claim) = opening_accumulator
             .get_virtual_polynomial_opening(VirtualPolynomial::PC, SumcheckId::SpartanShift);
-
-        // =========================================================
-        // 7. 组合最终的 Input Claim (总目标值)
-        // Sumcheck 的目标是证明：Sum(Poly(x)) = Input_Claim
-        // input_claim = (Claim1 * γ^0) + ... + (Claim5 * γ^4) + (RAF * γ^5) + (Shift * γ^6)
-        // =========================================================
         let input_claim = [
             rv_claim_1,
             rv_claim_2,
@@ -933,66 +811,31 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
             raf_claim,
             raf_shift_claim,
         ]
-            .iter()
-            .zip(&gamma_powers)
-            .map(|(claim, g)| *claim * g) // 线性组合
-            .sum();
+        .iter()
+        .zip(&gamma_powers)
+        .map(|(claim, g)| *claim * g)
+        .sum();
 
-        // =========================================================
-        // 8. 收集时间绑定随机点 (Time Binding / r_cycle)
-        // ---------------------------------------------------------
-        // 目标：从 OpeningAccumulator 中提取出用于“时间维度”加权的随机挑战向量 r。
-        //
-        // 意义：这个 Sumcheck 是要证明：
-        //      Sum_t( Eq(r_cycle, t) * Val(RAM[PC_t]) ) == Claim
-        // 既然 Claim 是之前的动态检查产生的，那么这里的 r_cycle 必须严格等于
-        // 之前动态检查时 Verifier 下发的那个随机挑战，否则等式无法成立。
-        // =========================================================
-
-        // --- 简单情况：纯时间维度的子协议 ---
-        // Stage 1 (Spartan Outer): 变量仅包含 log(T) 维度的 Cycle
         let (r_cycle_1, _) = opening_accumulator
             .get_virtual_polynomial_opening(VirtualPolynomial::Imm, SumcheckId::SpartanOuter);
-
-        // Stage 2: 变量仅包含 log(T) 维度的 Cycle
         let (r_cycle_2, _) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::OpFlags(CircuitFlags::Jump),
             SumcheckId::SpartanProductVirtualization,
         );
-
-        // Stage 3: 变量仅包含 log(T) 维度的 Cycle
         let (r_cycle_3, _) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::UnexpandedPC,
             SumcheckId::SpartanShift,
         );
-
-        // --- 复杂情况：复合维度 (寄存器 x 时间) 的子协议 ---
-        // ... (重复获取其他 Stage 的 r_cycle)
-
-        // Stage 4 (寄存器读写检查 Register RAM):
-        // 这里的多项式定义在 (寄存器索引 || 时间周期) 上。
-        // Challenge r 的结构通常是 [ r_register_bits ... | r_cycle_bits ... ]。
-        // 我们需要把前 log(RegisterCount) 个变量剥离（它们用于之前的寄存器指纹生成），
-        // 剩下的才是代表“时间”的随机数。
         let (r, _) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::Rs1Ra,
             SumcheckId::RegistersReadWriteChecking,
         );
-        // split_at 参数为 5 (32个寄存器 log2=5)。
-        // 结果：丢弃前5个，保留剩下的作为 r_cycle_4。
         let (_, r_cycle_4) = r.split_at((REGISTER_COUNT as usize).log_2());
-
-        // Stage 5 (指令查表检查):
-        // 原理同 Stage 4，也是复合维度。
         let (r, _) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::RdWa,
             SumcheckId::RegistersValEvaluation,
         );
         let (_, r_cycle_5) = r.split_at((REGISTER_COUNT as usize).log_2());
-
-        // 将 5 个 Stage 提取出的时间随机向量打包，
-        // 用于后续构造 GruenSplitEqPolynomial (分段 Eq 多项式)，
-        // 以便在 Sumcheck 过程中快速计算 Eq(r_cycle, t)。
         let r_cycles = [
             r_cycle_1.r,
             r_cycle_2.r,
@@ -1001,9 +844,13 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
             r_cycle_5.r,
         ];
 
-        // 返回构造好的参数结构体
         Self {
             gamma_powers,
+            stage1_gammas,
+            stage2_gammas,
+            stage3_gammas,
+            stage4_gammas,
+            stage5_gammas,
             input_claim,
             one_hot_params: one_hot_params.clone(),
             K: one_hot_params.bytecode_k,
@@ -1016,6 +863,8 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
             raf_shift_claim,
             int_poly,
             r_cycles,
+            bound_int_poly: None,
+            bound_val_polys: None,
         }
     }
 
@@ -1024,112 +873,60 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
     /// This computes all 5 stage-specific Val(k) polynomials simultaneously, avoiding
     /// 5 separate passes through the bytecode. Each stage has its own gamma powers
     /// and formula for Val(k).
-
-    /// 通过一次并行扫描（Fused Computation）计算所有 5 个 Stage 所需的 Val 多项式。
-    ///  该函数遍历静态字节码，利用随机挑战数 (Gammas) 将指令的各种属性（如操作码、寄存器索引、标志位）
-    /// 压缩为 5 个多线性多项式。这些多项式将作为 Sumcheck 中的 "Lookup Table" 真值。
-    ///
-    /// ### 算法原理：融合优化 (Fused Optimization)
-    ///
-    /// 在标准的 Sumcheck 协议中，通常需要针对每个验证目标（Stage）分别计算其所有的多项式评估值。
-    /// 由于 Jolt 包含 5 个不同的验证阶段（从指令解码到寄存器读写），朴素的做法是扫描静态字节码（Bytecode）5 次。
-    ///
-    /// 此函数利用了多项式计算的独立性，执行一次“融合扫描”：
-    /// 1. **并行处理**：使用 `rayon` 将字节码数组切分为多个块（Chunks）并行处理。
-    /// 2. **单次遍历**：对每条指令（指令地址 k），只需加载一次，就能同时提取出 5 个 Stage 所需的所有特征（标志位、操作数、寄存器索引等）。
-    /// 3. **实时计算**：直接在循环内部计算这一行指令在 5 个不同 RLC（随机线性组合）公式下的贡献值 `v0[k], v1[k], ..., v4[k]`。
-    ///
-    /// ### 对应关系
-    /// - `vals[0]` (Stage 1): 验证指令基础解码 (PC, Imm, Opcode Flags).
-    /// - `vals[1]` (Stage 2): 验证控制流逻辑 (Jump, Branch).
-    /// - `vals[2]` (Stage 3): 验证操作数选择逻辑 (Input Muxing).
-    /// - `vals[3]` (Stage 4): 验证寄存器读取索引 (Register R/W Indices).
-    /// - `vals[4]` (Stage 5): 验证寄存器写入索引与查找表选择 (Register Write & Lookup ID).
     #[allow(clippy::too_many_arguments)]
     fn compute_val_polys(
-        bytecode: &[Instruction],       // 静态字节码 (ROM)
-        eq_r_register_4: &[F],          // Stage 4 的寄存器指纹表 (预计算的 eq(r, index))
-        eq_r_register_5: &[F],          // Stage 5 的寄存器指纹表
-        stage1_gammas: &[F],            // Stage 1 的随机压缩因子
-        stage2_gammas: &[F],            // Stage 2 的随机压缩因子 (控制流)
-        stage3_gammas: &[F],            // Stage 3 的随机压缩因子 (操作数选择)
-        stage4_gammas: &[F],            // Stage 4 的随机压缩因子 (寄存器读写)
-        stage5_gammas: &[F],            // Stage 5 的随机压缩因子 (指令查找表)
+        bytecode: &[Instruction],
+        eq_r_register_4: &[F],
+        eq_r_register_5: &[F],
+        stage1_gammas: &[F],
+        stage2_gammas: &[F],
+        stage3_gammas: &[F],
+        stage4_gammas: &[F],
+        stage5_gammas: &[F],
     ) -> [MultilinearPolynomial<F>; N_STAGES] {
-        let K = bytecode.len();// ROM 大小
-        // 1. 预分配内存
-        // 预分配内存：创建 5 个长度为 K 的向量，用于存储每个 Stage 的计算结果。
-        // unsafe_allocate_zero_vec 避免了初始化开销，假设后续会完全覆盖写入。
+        let K = bytecode.len();
+
+        // Pre-allocate output vectors for each stage
         let mut vals: [Vec<F>; N_STAGES] = array::from_fn(|_| unsafe_allocate_zero_vec(K));
         let [v0, v1, v2, v3, v4] = &mut vals;
 
-        // Fused parallel iteration: 并行迭代字节码，一次性计算 5 个值
-
-        // 2. 并行融合迭代 (Fused Parallel Iteration)
-        // 使用 Rayon (par_iter) 并行遍历字节码。
-        // 同时操作 5 个输出向量 (v0...v4)，一次读取指令，计算所有属性。
+        // Fused parallel iteration: compute all 5 val entries for each instruction
         bytecode
             .par_iter()
-            // 使用 zip 将 5 个结果向量与指令流对齐，以便在闭包中同时写入
             .zip(v0.par_iter_mut())
             .zip(v1.par_iter_mut())
             .zip(v2.par_iter_mut())
             .zip(v3.par_iter_mut())
             .zip(v4.par_iter_mut())
             .for_each(|(((((instruction, o0), o1), o2), o3), o4)| {
-                // 标准化指令并提取各类标志位，避免重复解析
-                // 1. 预处理指令与提取特征标志位
-                // - normalize(): 对原始指令进行标准化处理（例如统一立即数格式），确保后续数值计算的一致性。
-                // - circuit_flags / instr_flags: 一次性提取指令的所有布尔属性（如是否是跳转指令、是否操作内存、操作数类型等）。
-                //   这些 Flags 将在下方作为指示函数（Indicator Functions，取值 0 或 1），参与到不同 Stage 的加权求和（RLC）中，
-                //   从而避免在后续计算中频繁重复解析指令。
                 let instr = instruction.normalize();
-                // info!("Instruction: {:#?}", instr);
                 let circuit_flags = instruction.circuit_flags();
                 let instr_flags = instruction.instruction_flags();
-                // info!("Circuit Flags: {:#?}", circuit_flags);
-                // info!("Instruction Flags: {:#?}", instr_flags);
 
-                // =========================================================
-                // Stage 1: Spartan Outer Sumcheck (基础指令属性)
-                // ---------------------------------------------------------
-                // 目标：验证 (Address, Immediate, Opcode Flags)
-                // 原理：RLC (随机线性组合)。将多个属性压扁成一个数。
-                // 公式：Val = Address + γ_1 * Imm + Σ (γ_i * Flag_i)
-                // 作用：防止 Prover 篡改指令类型（比如把 ADD 改成 MUL）或立即数。
-                // =========================================================
+                // Stage 1 (Spartan outer sumcheck)
+                // Val(k) = unexpanded_pc(k) + γ·imm(k)
+                //          + γ²·circuit_flags[0](k) + γ³·circuit_flags[1](k) + ...
+                // This virtualizes claims output by Spartan's "outer" sumcheck.
                 {
-                    // 1. 累加地址 (Address)
                     let mut lc = F::from_u64(instr.address as u64);
-                    // 2. 累加立即数 (Immediate)
                     lc += instr.operands.imm.field_mul(stage1_gammas[1]);
-                    // 一致性检查：压缩指令不能更新 UnexpandedPC
-                    // Sanity check: 确保压缩标志位逻辑正常
+                    // sanity check
                     debug_assert!(
                         !circuit_flags[CircuitFlags::IsCompressed]
                             || !circuit_flags[CircuitFlags::DoNotUpdateUnexpandedPC]
                     );
-                    // 遍历并累加所有电路标志位的贡献
-                    // 3. 累加电路标志位 (Circuit Flags)
-                    // 遍历每一个 Flag，如果该指令激活了这个 Flag (如 IsADD 为true)，则加上对应的 Gamma
                     for (flag, gamma_power) in circuit_flags.iter().zip(stage1_gammas[2..].iter()) {
                         if *flag {
                             lc += *gamma_power;
                         }
                     }
-                    *o0 = lc; // 写入 Stage 1 结果，写入 v0 向量
+                    *o0 = lc;
                 }
-                // =========================================================
-                // Stage 2: Product Virtualization (控制流属性)
-                // ---------------------------------------------------------
-                // 目标：验证跳转 (Jump) 和分支 (Branch) 逻辑
-                // 原理：只累加与控制流相关的 Flag。
-                // 作用：确保 Prover 正确识别了跳转指令。如果 Prover 把 JUMP 当作 ADD 执行，
-                //      这里的真值检查会导致 Sumcheck 失败。
-                // Val(k) = jump_flag + γ·branch_flag
-                //          + γ²·rd_not_zero + γ³·write_lookup_to_rd
-                // 含义：这些参数决定了 PC 跳转行为和是否写寄存器。
-                // =========================================================
+
+                // Stage 2 (product virtualization, de-duplicated factors)
+                // Val(k) = jump_flag(k) + γ·branch_flag(k)
+                //          + γ²·write_lookup_output_to_rd_flag(k) + γ³·virtual_instruction(k)
+                // This Val matches the fused product sumcheck.
                 {
                     let mut lc = F::zero();
                     if circuit_flags[CircuitFlags::Jump] {
@@ -1138,197 +935,108 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
                     if instr_flags[InstructionFlags::Branch] {
                         lc += stage2_gammas[1];
                     }
-                    if instr_flags[InstructionFlags::IsRdNotZero] {
+                    if circuit_flags[CircuitFlags::WriteLookupOutputToRD] {
                         lc += stage2_gammas[2];
                     }
-                    if circuit_flags[CircuitFlags::WriteLookupOutputToRD] {
+                    if circuit_flags[CircuitFlags::VirtualInstruction] {
                         lc += stage2_gammas[3];
                     }
-                    *o1 = lc; // 写入 Stage 2 结果，写入 v1 向量
+                    *o1 = lc;
                 }
 
-                // ===== Stage 3 (Shift sumcheck / Input Muxing) =====
-                // 目标：验证指令的“输入数据通路”配置。
-                // 即验证：ALU 的左输入和右输入分别取自哪里？是寄存器值、立即数、还是 PC？
-                // 同时也验证虚拟指令序列（Virtual Sequence）的元数据。
-                //
-                // 公式：Val(k) = imm
-                //          + γ^1 · PC
-                //          + γ^2 · Left_is_RS1 + γ^3 · Left_is_PC
-                //          + γ^4 · Right_is_RS2 + γ^5 · Right_is_Imm
-                //          + ... (Noop, Virtual, FirstInSeq)
+                // Stage 3 (Shift sumcheck)
+                // Val(k) = imm(k) + γ·unexpanded_pc(k)
+                //          + γ²·left_operand_is_rs1_value(k) + γ³·left_operand_is_pc(k)
+                //          + γ⁴·right_operand_is_rs2_value(k) + γ⁵·right_operand_is_imm(k)
+                //          + γ⁶·is_noop(k) + γ⁷·virtual_instruction(k) + γ⁸·is_first_in_sequence(k)
+                // This virtualizes claims output by the ShiftSumcheck.
                 {
-                    // 1. 基础负载：立即数 (Immediate)
-                    // 许多指令（如 ADDI, SHL）直接依赖立即数作为输入之一，因此将其作为常数项
                     let mut lc = F::from_i128(instr.operands.imm);
-
-                    // 2. 绑定当前指令的 PC 地址
-                    // 乘以 γ^1，防止指令位置被交换
                     lc += stage3_gammas[1].mul_u64(instr.address as u64);
-
-                    // 3. 左操作数来源选择 (Left Mux)
-                    // 如果该指令定义左操作数取自 rs1 寄存器 (例如 ADD, SUB)
                     if instr_flags[InstructionFlags::LeftOperandIsRs1Value] {
                         lc += stage3_gammas[2];
                     }
-                    // 如果该指令定义左操作数取自 PC (例如 AUIPC, JAL)
                     if instr_flags[InstructionFlags::LeftOperandIsPC] {
                         lc += stage3_gammas[3];
                     }
-
-                    // 4. 右操作数来源选择 (Right Mux)
-                    // 如果右操作数取自 rs2 寄存器 (例如 ADD, SLL)
                     if instr_flags[InstructionFlags::RightOperandIsRs2Value] {
                         lc += stage3_gammas[4];
                     }
-                    // 如果右操作数是立即数 (例如 ADDI, SLLI)
                     if instr_flags[InstructionFlags::RightOperandIsImm] {
                         lc += stage3_gammas[5];
                     }
-
-                    // 5. 特殊指令属性
-                    // IsNoop: 是否是填充指令（不改变状态）
                     if instr_flags[InstructionFlags::IsNoop] {
                         lc += stage3_gammas[6];
                     }
-                    // VirtualInstruction: 是否是 Jolt 拆解后的微指令的一部分
                     if circuit_flags[CircuitFlags::VirtualInstruction] {
                         lc += stage3_gammas[7];
                     }
-                    // IsFirstInSequence: 是否是微指令序列的第一条（用于重置序列计数器）
                     if circuit_flags[CircuitFlags::IsFirstInSequence] {
                         lc += stage3_gammas[8];
                     }
-
-                    // 将计算出的唯一指纹写入 Stage 3 的结果向量
                     *o2 = lc;
                 }
 
-                // =========================================================
-                // Stage 4: Register R/W Checking (寄存器索引检查)
-                // ---------------------------------------------------------
-                // 目标：验证本条指令实际操作的寄存器索引 (rd, rs1, rs2) 是否正确。
-                //
-                // 问题：直接相加寄存器号 (如 1+2=3) 容易产生碰撞 (0+3=3)。
-                // 解决方案：使用 Schwartz-Zippel 引理衍生出的 Fingerprinting 技术。
-                //          不直接使用 index，而是使用预先计算好的随机指纹表 `eq_r_register_4`。
-                //          该表是基于 Verifier 的随机挑战 r 生成的：Table[i] = Eq(i, r)。
-                //
-                // 公式：Val(k) = Fingerprint(rd) + γ^1·Fingerprint(rs1) + γ^2·Fingerprint(rs2)
-                // =========================================================
+                // Stage 4 (registers read/write checking sumcheck)
+                // Val(k) = eq(rd(k), r_register) + γ·eq(rs1(k), r_register) + γ²·eq(rs2(k), r_register)
+                // where rd(k, r) = 1 if the k'th instruction in the bytecode has rd = r,
+                // and analogously for rs1(k, r) and rs2(k, r).
+                // This virtualizes claims output by the registers read/write checking sumcheck.
                 {
-                    // 1. 获取目标寄存器 (Dest Register) 的指纹
-                    // 查表逻辑：如果指令有写回目标(rd)，则查表 Eq(rd, r)；如果是分支/存储指令无rd，则为0。
                     let rd_eq = instr
                         .operands
                         .rd
                         .map_or(F::zero(), |r| eq_r_register_4[r as usize]);
-
-                    // 2. 获取源寄存器 1 (Source Register 1) 的指纹
-                    // 例如 ADD x1, x2, x3 中的 x2。无 rs1 则为 0。
                     let rs1_eq = instr
                         .operands
                         .rs1
                         .map_or(F::zero(), |r| eq_r_register_4[r as usize]);
-
-                    // 3. 获取源寄存器 2 (Source Register 2) 的指纹
-                    // 例如 ADD x1, x2, x3 中的 x3。ADDI 指令没有 rs2，则为 0。
                     let rs2_eq = instr
                         .operands
                         .rs2
                         .map_or(F::zero(), |r| eq_r_register_4[r as usize]);
-
-                    // 4. 加权聚合 (Random Linear Combination)
-                    // 使用 Stage 4 专属的 Gamma 因子进行压缩，生成唯一的校验值。
-                    // o3 是当前指令在 Stage 4 多项式中的系数值。
-                    *o3 = rd_eq * stage4_gammas[0]       // weight: 1 (gamma^0)
-                        + rs1_eq * stage4_gammas[1]      // weight: gamma^1
-                        + rs2_eq * stage4_gammas[2];     // weight: gamma^2
+                    *o3 = rd_eq * stage4_gammas[0]
+                        + rs1_eq * stage4_gammas[1]
+                        + rs2_eq * stage4_gammas[2];
                 }
-                // =========================================================
-                // Stage 5: Instruction Lookups (查找表路由检查)
-                // ---------------------------------------------------------
-                // 目标：验证该指令应该去查哪个查找表 (Lookup Table)。验证寄存器写回索引和查找表 ID。
-                //
-                // 背景：在 Jolt 中，大多数运算不是通过电路计算的，而是通过查表 (Lookup) 完成的。
-                //      VM 需要知道当前行指令（如 ADD）对应哪个表（如 Add Table）。
-                //      同时也需要验证查表结果最终写回到哪个寄存器。
-                //
-                // 公式：Val(k) = Fingerprint(rd)
-                //            + γ^1 · IsNotInterleaved
-                //            + γ^(2 + table_id) · 1
-                //
-                // 含义：确认指令最终写入哪个寄存器，数据切分模式，以及使用了数十种查找表中的哪一种。
-                // =========================================================
+
+                // Stage 5 (registers val-evaluation + instruction lookups sumcheck)
+                // Val(k) = eq(rd(k), r_register) + γ·raf_flag(k)
+                //          + γ²·lookup_table_flag[0](k) + γ³·lookup_table_flag[1](k) + ...
+                // where rd(k, r) = 1 if the k'th instruction in the bytecode has rd = r,
+                // and raf_flag(k) = 1 if instruction k is NOT interleaved operands.
+                // This virtualizes the claim output by the registers val-evaluation sumcheck
+                // and the instruction lookups sumcheck.
                 {
-                    // 1. Rd 寄存器索引检查 (Register Write Fingerprint)
-                    // 再次验证 RD 的目的是为了将其与 Stage 4 中的读操作以及 Stage 5 中的查表结果绑定。
-                    // 只有当 Prover 在“写回”阶段操作的是同一个指纹对应的寄存器，验证才通过。
-                    // 使用 Stage 5 专属的 challenge r 生成的指纹表 eq_r_register_5。
                     let mut lc = instr
                         .operands
                         .rd
                         .map_or(F::zero(), |r| eq_r_register_5[r as usize]);
-
-                    // 2. 验证操作数编码模式 (Interleaved Flag)
-                    // Jolt 有两种查表模式：直接查表或交错(Interleaved)查表。
-                    // Interleaved 用于处理需要两个操作数按位混合的情况（如 ADD/SUB），
-                    // 此 Flag 决定了 Lookup Query 的构建方式。
                     if !circuit_flags.is_interleaved_operands() {
-                        lc += stage5_gammas[1]; // 如果是非交错模式，加上权重 γ^1
+                        lc += stage5_gammas[1];
                     }
-
-                    // 3. 查找表 ID 路由检查 (Lookup Table ID One-Hot)
-                    // 验证当前指令关联了哪个具体的 Lookup Table。
-                    // 使用 One-Hot 思想：虽然可能有 100 个表，但每条指令只会激活其中 1 个。
                     if let Some(table) = instruction.lookup_table() {
-                        // 获取枚举索引，例如 ADD=5, SUB=6, AND=7...
                         let table_index = LookupTables::enum_index(&table);
-
-                        // 加上对应的 Gamma 权重：γ^(2 + table_index)
-                        // 这相当于在多项式层面声明：“我选了第 table_index 号桌子”。
-                        // 只有正确的 Table Index 对应的项会被加上，其余表的项系数默认为 0。
                         lc += stage5_gammas[2 + table_index];
                     }
-
-                    // 将计算出的唯一指纹写入 Stage 5 的结果向量
                     *o4 = lc;
                 }
             });
 
-        //  3. 将计算好的向量封装为 MultilinearPolynomial
-        // 将原始数据向量转换为多线性多项式对象返回
         vals.map(MultilinearPolynomial::from)
     }
 
-    /// 计算 Stage 1 (Spartan Outer Sumcheck) 的聚合声明值 (RV Claim)。
-    ///
-    /// 该函数负责将 Spartan Outer 阶段产生的多个独立多项式评估值（Claims），
-    /// 使用随机挑战数 `gamma` 的幂次进行“批处理”压缩，合并为一个单一的标量值。
-    ///
-    /// 这里的 Claim 代表了 Prover 声称在某些随机点上，指令的各个组成部分（PC、立即数、标志位）的值。
-    ///
-    /// 数学公式：
-    /// Rv_1 = (Claim_{PC} * γ^0) + (Claim_{Imm} * γ^1) + Σ (Claim_{Flag_i} * γ^{2+i})
     fn compute_rv_claim_1(
-        opening_accumulator: &dyn OpeningAccumulator<F>, // 存储上一步 Sumcheck 结果的累加器
-        gamma_powers: &[F],                              // 随机挑战数 γ 的幂次序列 [1, γ, γ^2, ...]
+        opening_accumulator: &dyn OpeningAccumulator<F>,
+        gamma_powers: &[F],
     ) -> F {
-        // 1. 获取 UnexpandedPC (未扩展的程序计数器) 的 Claim
-        // 这代表了 SpartanOuter 阶段对指令 PC 值的承诺评估
         let (_, unexpanded_pc_claim) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::UnexpandedPC,
             SumcheckId::SpartanOuter,
         );
-
-        // 2. 获取 Immediate (立即数) 的 Claim
-        // 这代表了 SpartanOuter 阶段对指令立即数部分的承诺评估
         let (_, imm_claim) = opening_accumulator
             .get_virtual_polynomial_opening(VirtualPolynomial::Imm, SumcheckId::SpartanOuter);
 
-        // 3. 获取所有 Circuit Flags (电路控制标志) 的 Claims
-        // 遍历所有定义的电路标志（例如是否挑战 Jump、Branch 等），
-        // 提取它们在 SpartanOuter 阶段的评估值。
         let circuit_flag_claims: Vec<F> = CircuitFlags::iter()
             .map(|flag| {
                 opening_accumulator
@@ -1340,11 +1048,6 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
             })
             .collect();
 
-        // 4. 计算随机线性组合 (RLC - Random Linear Combination)
-        // 将所有提取出的 Claims 按照特定的顺序链接起来：
-        // [UnexpandedPC, Imm, Flag_0, Flag_1, ..., Flag_N]
-        // 然后与对应的 gamma_powers 进行点积运算 (claim * gamma)，最后求和。
-        // 这确保了如果 Prover 在任意一个分量上作弊，RLC 的结果都会以极大概率不匹配。
         std::iter::once(unexpanded_pc_claim)
             .chain(std::iter::once(imm_claim))
             .chain(circuit_flag_claims)
@@ -1353,91 +1056,48 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
             .sum()
     }
 
-    /// 计算 Stage 2 (Spartan Product Virtualization) 的聚合声明值 (RV Claim)。
-    ///
-    /// 此函数负责验证与“指令乘法化虚拟化”相关的逻辑，主要关注控制流（Jump/Branch）
-    /// 和寄存器写入条件。
-    ///
-    /// 它从 Opening Accumulator 中提取 Spartan Product Virtualization 阶段生成的 4 个多项式评估值，
-    /// 并使用随机挑战数 `gamma` 进行线性组合（RLC）。
-    ///
-    /// 聚合公式：
-    /// Rv_2 = (Claim_{Jump} * γ^0)
-    ///      + (Claim_{Branch} * γ^1)
-    ///      + (Claim_{IsRdNotZero} * γ^2)
-    ///      + (Claim_{WriteLookupToRD} * γ^3)
     fn compute_rv_claim_2(
         opening_accumulator: &dyn OpeningAccumulator<F>,
         gamma_powers: &[F],
     ) -> F {
-        // 1. 获取 Jump 标志的 Claim
-        // 验证当前指令是否为无条件跳转指令（JAL/JALR）。
         let (_, jump_claim) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::OpFlags(CircuitFlags::Jump),
             SumcheckId::SpartanProductVirtualization,
         );
-
-        // 2. 获取 Branch 标志的 Claim
-        // 验证当前指令是否为条件分支指令（BEQ, BNE, BLT 等）。
         let (_, branch_claim) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::InstructionFlags(InstructionFlags::Branch),
             SumcheckId::SpartanProductVirtualization,
         );
-
-        // 3. 获取 IsRdNotZero 标志的 Claim
-        // 验证目标寄存器索引 (rd) 是否非零（RISC-V 中 x0 恒为 0，写入无效）。
-        // 这通常用于判断是否需要执行寄存器写入操作。
-        let (_, rd_wa_claim) = opening_accumulator.get_virtual_polynomial_opening(
-            VirtualPolynomial::InstructionFlags(InstructionFlags::IsRdNotZero),
-            SumcheckId::SpartanProductVirtualization,
-        );
-
-        // 4. 获取 WriteLookupOutputToRD 标志的 Claim
-        // 验证当前指令是否需要将查找表（Lookup Table）的结果写入目标寄存器。
         let (_, write_lookup_output_to_rd_flag_claim) = opening_accumulator
             .get_virtual_polynomial_opening(
                 VirtualPolynomial::OpFlags(CircuitFlags::WriteLookupOutputToRD),
                 SumcheckId::SpartanProductVirtualization,
             );
+        let (_, virtual_instruction_claim) = opening_accumulator.get_virtual_polynomial_opening(
+            VirtualPolynomial::OpFlags(CircuitFlags::VirtualInstruction),
+            SumcheckId::SpartanProductVirtualization,
+        );
 
-        // 5. 计算加权和 (RLC)
-        // 将上述 4 个独立的 Claim 使用 Gamma 幂次进行压缩，生成单一的标量值以便于后续验证。
         [
             jump_claim,
             branch_claim,
-            rd_wa_claim,
             write_lookup_output_to_rd_flag_claim,
+            virtual_instruction_claim,
         ]
-            .into_iter()
-            .zip_eq(gamma_powers)
-            .map(|(claim, gamma)| claim * gamma)
-            .sum()
+        .into_iter()
+        .zip_eq(gamma_powers)
+        .map(|(claim, gamma)| claim * gamma)
+        .sum()
     }
 
-    /// 计算 Stage 3 (Instruction Input / Shift) 的聚合声明值 (RV Claim)。
-    ///
-    /// 此函数负责验证指令操作数来源的逻辑（操作数是来自寄存器、立即数还是 PC），
-    /// 以及与指令序列化（虚拟指令拆分）相关的标志。
-    ///
-    /// 聚合公式：
-    /// Rv_3 = (Claim_{Imm} * γ^0) + (Claim_{PC} * γ^1)
-    ///      + (Claim_{L_is_rs1} * γ^2) + (Claim_{L_is_pc} * γ^3)
-    ///      + (Claim_{R_is_rs2} * γ^4) + (Claim_{R_is_imm} * γ^5)
-    ///      + (Claim_{IsNoop} * γ^6) + (Claim_{Virtual} * γ^7) + (Claim_{FirstInSeq} * γ^8)
     fn compute_rv_claim_3(
         opening_accumulator: &dyn OpeningAccumulator<F>,
         gamma_powers: &[F],
     ) -> F {
-        // 1. 获取立即数 (Imm) 的 Claim
-        // 验证指令中立即数部分的正确性。
         let (_, imm_claim) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::Imm,
             SumcheckId::InstructionInputVirtualization,
         );
-
-        // 2. 获取并校验程序计数器 (PC) 的 Claim
-        // 这里有一个一致性检查：PC 值在 "SpartanShift" 阶段和 "InstructionInputVirtualization" 阶段
-        // 应该是相同的。这是连接不同子协议的关键约束。
         let (_, spartan_shift_unexpanded_pc_claim) = opening_accumulator
             .get_virtual_polynomial_opening(
                 VirtualPolynomial::UnexpandedPC,
@@ -1449,16 +1109,12 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
                 SumcheckId::InstructionInputVirtualization,
             );
 
-        // 确保跨子协议的一致性
         assert_eq!(
             spartan_shift_unexpanded_pc_claim,
             instruction_input_unexpanded_pc_claim
         );
-        let unexpanded_pc_claim = spartan_shift_unexpanded_pc_claim;
 
-        // 3. 验证左操作数 (Left Operand) 的来源
-        // left_is_rs1_claim: 标志位，为 1 表示左操作数来自 rs1 寄存器。
-        // left_is_pc_claim: 标志位，为 1 表示左操作数来自 PC（例如 AUIPC 指令）。
+        let unexpanded_pc_claim = spartan_shift_unexpanded_pc_claim;
         let (_, left_is_rs1_claim) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::InstructionFlags(InstructionFlags::LeftOperandIsRs1Value),
             SumcheckId::InstructionInputVirtualization,
@@ -1467,10 +1123,6 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
             VirtualPolynomial::InstructionFlags(InstructionFlags::LeftOperandIsPC),
             SumcheckId::InstructionInputVirtualization,
         );
-
-        // 4. 验证右操作数 (Right Operand) 的来源
-        // right_is_rs2_claim: 标志位，为 1 表示右操作数来自 rs2 寄存器。
-        // right_is_imm_claim: 标志位，为 1 表示右操作数来自立即数。
         let (_, right_is_rs2_claim) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::InstructionFlags(InstructionFlags::RightOperandIsRs2Value),
             SumcheckId::InstructionInputVirtualization,
@@ -1479,11 +1131,6 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
             VirtualPolynomial::InstructionFlags(InstructionFlags::RightOperandIsImm),
             SumcheckId::InstructionInputVirtualization,
         );
-
-        // 5. 验证指令状态标志
-        // is_noop_claim: 标志位，为 1 表示该指令是填充的空操作（padding）。
-        // is_virtual_claim: 标志位，为 1 表示该指令是 Jolt 内部的虚拟宏指令。
-        // is_first_in_sequence_claim: 标志位，为 1 表示这是多步指令序列的第一步。
         let (_, is_noop_claim) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::InstructionFlags(InstructionFlags::IsNoop),
             SumcheckId::SpartanShift,
@@ -1497,8 +1144,6 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
             SumcheckId::SpartanShift,
         );
 
-        // 6. 计算加权和 (RLC)
-        // 将所有相关的标志位和数值 claim 组合成一个标量。
         [
             imm_claim,
             unexpanded_pc_claim,
@@ -1510,33 +1155,21 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
             is_virtual_claim,
             is_first_in_sequence_claim,
         ]
-            .into_iter()
-            .zip_eq(gamma_powers)
-            .map(|(claim, gamma)| claim * gamma)
-            .sum()
+        .into_iter()
+        .zip_eq(gamma_powers)
+        .map(|(claim, gamma)| claim * gamma)
+        .sum()
     }
 
-    /// 计算 Stage 4 (Registers Read/Write Checking) 的聚合声明值 (RV Claim)。
-    ///
-    /// 此函数负责验证指令所访问的通用寄存器索引（Register Index）是否正确。
-    /// 它从 "寄存器读写检查" 子协议中提取对 Rd (写目标), Rs1 (读源1), Rs2 (读源2) 的评估。
-    ///
-    /// 聚合公式：
-    /// Rv_4 = (Claim_{Rd_Address} * γ^0)
-    ///      + (Claim_{Rs1_Address} * γ^1)
-    ///      + (Claim_{Rs2_Address} * γ^2)
     fn compute_rv_claim_4(
         opening_accumulator: &dyn OpeningAccumulator<F>,
         gamma_powers: &[F],
     ) -> F {
-        // 遍历三个寄存器操作数类型：Rd (Write Address), Rs1 (Read Address 1), Rs2 (Read Address 2)
         std::iter::empty()
             .chain(once(VirtualPolynomial::RdWa))
             .chain(once(VirtualPolynomial::Rs1Ra))
             .chain(once(VirtualPolynomial::Rs2Ra))
             .map(|vp| {
-                // 从 OpeningAccumulator 获取对应的评估值。
-                // 这些值实际上是 "Flag(指令是否有该操作数) * Index(寄存器号)" 的某种编码形式的承诺。
                 opening_accumulator
                     .get_virtual_polynomial_opening(vp, SumcheckId::RegistersReadWriteChecking)
                     .1
@@ -1546,50 +1179,29 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
             .sum::<F>()
     }
 
-    /// 计算 Stage 5 (Registers Val Evaluation & Instruction Lookups) 的聚合声明值 (RV Claim)。
-    ///
-    /// 此函数负责验证指令执行结果的写入逻辑（写哪个寄存器）以及指令所使用的查找表类型。
-    /// 它从两个不同的子协议（RegistersValEvaluation 和 InstructionReadRaf）中提取评估值，
-    /// 并将其合并。
-    ///
-    /// 聚合公式：
-    /// Rv_5 = (Claim_{Rd_Address} * γ^0)
-    ///      + (Claim_{Raf_Flag} * γ^1)
-    ///      + Σ (Claim_{LookupTableFlag_i} * γ^{2+i})
     fn compute_rv_claim_5(
         opening_accumulator: &dyn OpeningAccumulator<F>,
         gamma_powers: &[F],
     ) -> F {
-        // 1. 获取目标寄存器写地址 (Rd Write Address) 的 Claim
-        // 验证指令打算写入的寄存器索引是否正确。
-        // 这里的 SumcheckId 是 RegistersValEvaluation。
         let (_, rd_wa_claim) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::RdWa,
             SumcheckId::RegistersValEvaluation,
         );
 
-        // 2. 获取 RAF (Read Access Frequency) 标志的 Claim
-        // 根据 compute_val_polys 中的逻辑，这个标志位对应 `!is_interleaved_operands`。
-        // 它用于区分普通的指令操作数读取和其他类型的内存访问模式。
-        // 这里的 SumcheckId 是 InstructionReadRaf。
         let (_, raf_flag_claim) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::InstructionRafFlag,
             SumcheckId::InstructionReadRaf,
         );
 
-        // 初始化 RLC 和，包含 Rd 和 RAF 标志的贡献
         let mut sum = rd_wa_claim * gamma_powers[0];
         sum += raf_flag_claim * gamma_powers[1];
 
-        // 3. 获取所有查找表标志 (Lookup Table Flags) 的 Claims
-        // 遍历所有可能的查找表（例如 AND, ADD, XOR 等），验证当前指令使用了哪一个表。
-        // 只有当指令实际执行了某种查找操作时，对应的标志位才为 1。
+        // Add lookup table flag claims from InstructionReadRaf
         for i in 0..LookupTables::<XLEN>::COUNT {
             let (_, claim) = opening_accumulator.get_virtual_polynomial_opening(
                 VirtualPolynomial::LookupTableFlag(i),
                 SumcheckId::InstructionReadRaf,
             );
-            // 累加每个表的贡献：Flag_i * γ^{2+i}
             sum += claim * gamma_powers[2 + i];
         }
 
@@ -1618,5 +1230,369 @@ impl<F: JoltField> SumcheckInstanceParams<F> for BytecodeReadRafSumcheckParams<F
         r[0..self.log_K].reverse();
         r[self.log_K..].reverse();
         OpeningPoint::new(r)
+    }
+
+    #[cfg(feature = "zk")]
+    fn input_claim_constraint(&self) -> InputClaimConstraint {
+        // input_claim = Σᵢ gamma_powers[i] * rv_claim_i + gamma_powers[5]*raf_claim + gamma_powers[6]*raf_shift_claim
+        // Each rv_claim_i = Σⱼ stage_i_gamma[j] * opening_ij
+        //
+        // Challenge layout:
+        // - Stage 1 (SpartanOuter): 2 + NUM_CIRCUIT_FLAGS terms
+        // - Stage 2 (SpartanProductVirtualization): 5 terms
+        // - Stage 3 (InstructionInputVirtualization + SpartanShift): 10 terms (9 + 1 for split unexpanded_pc)
+        // - Stage 4 (RegistersReadWriteChecking): 3 terms
+        // - Stage 5 (RegistersValEvaluation + InstructionReadRaf): 2 + NUM_LOOKUP_TABLES terms
+        // - raf_claim (PC @ SpartanOuter): 1 term
+        // - raf_shift_claim (PC @ SpartanShift): 1 term
+
+        let mut terms = Vec::new();
+        let mut challenge_idx = 0;
+
+        // Stage 1: SpartanOuter openings
+        // Order: UnexpandedPC, Imm, then CircuitFlags in order
+        terms.push(ProductTerm::scaled(
+            ValueSource::Challenge(challenge_idx),
+            vec![ValueSource::Opening(OpeningId::virt(
+                VirtualPolynomial::UnexpandedPC,
+                SumcheckId::SpartanOuter,
+            ))],
+        ));
+        challenge_idx += 1;
+
+        terms.push(ProductTerm::scaled(
+            ValueSource::Challenge(challenge_idx),
+            vec![ValueSource::Opening(OpeningId::virt(
+                VirtualPolynomial::Imm,
+                SumcheckId::SpartanOuter,
+            ))],
+        ));
+        challenge_idx += 1;
+
+        for flag in CircuitFlags::iter() {
+            terms.push(ProductTerm::scaled(
+                ValueSource::Challenge(challenge_idx),
+                vec![ValueSource::Opening(OpeningId::virt(
+                    VirtualPolynomial::OpFlags(flag),
+                    SumcheckId::SpartanOuter,
+                ))],
+            ));
+            challenge_idx += 1;
+        }
+
+        // Stage 2: SpartanProductVirtualization openings
+        // Order: Jump, Branch, WriteLookupOutputToRD, VirtualInstruction
+        terms.push(ProductTerm::scaled(
+            ValueSource::Challenge(challenge_idx),
+            vec![ValueSource::Opening(OpeningId::virt(
+                VirtualPolynomial::OpFlags(CircuitFlags::Jump),
+                SumcheckId::SpartanProductVirtualization,
+            ))],
+        ));
+        challenge_idx += 1;
+
+        terms.push(ProductTerm::scaled(
+            ValueSource::Challenge(challenge_idx),
+            vec![ValueSource::Opening(OpeningId::virt(
+                VirtualPolynomial::InstructionFlags(InstructionFlags::Branch),
+                SumcheckId::SpartanProductVirtualization,
+            ))],
+        ));
+        challenge_idx += 1;
+
+        terms.push(ProductTerm::scaled(
+            ValueSource::Challenge(challenge_idx),
+            vec![ValueSource::Opening(OpeningId::virt(
+                VirtualPolynomial::OpFlags(CircuitFlags::WriteLookupOutputToRD),
+                SumcheckId::SpartanProductVirtualization,
+            ))],
+        ));
+        challenge_idx += 1;
+
+        terms.push(ProductTerm::scaled(
+            ValueSource::Challenge(challenge_idx),
+            vec![ValueSource::Opening(OpeningId::virt(
+                VirtualPolynomial::OpFlags(CircuitFlags::VirtualInstruction),
+                SumcheckId::SpartanProductVirtualization,
+            ))],
+        ));
+        challenge_idx += 1;
+
+        // Stage 3: InstructionInputVirtualization + SpartanShift openings
+        // Order: Imm, UnexpandedPC (split), LeftIsRs1, LeftIsPC, RightIsRs2, RightIsImm, IsNoop, IsVirtual, IsFirstInSequence
+        terms.push(ProductTerm::scaled(
+            ValueSource::Challenge(challenge_idx),
+            vec![ValueSource::Opening(OpeningId::virt(
+                VirtualPolynomial::Imm,
+                SumcheckId::InstructionInputVirtualization,
+            ))],
+        ));
+        challenge_idx += 1;
+
+        // UnexpandedPC: must be equal from SpartanShift and InstructionInputVirtualization
+        // Include both with half coefficient each
+        terms.push(ProductTerm::scaled(
+            ValueSource::Challenge(challenge_idx),
+            vec![ValueSource::Opening(OpeningId::virt(
+                VirtualPolynomial::UnexpandedPC,
+                SumcheckId::SpartanShift,
+            ))],
+        ));
+        terms.push(ProductTerm::scaled(
+            ValueSource::Challenge(challenge_idx),
+            vec![ValueSource::Opening(OpeningId::virt(
+                VirtualPolynomial::UnexpandedPC,
+                SumcheckId::InstructionInputVirtualization,
+            ))],
+        ));
+        challenge_idx += 1;
+
+        terms.push(ProductTerm::scaled(
+            ValueSource::Challenge(challenge_idx),
+            vec![ValueSource::Opening(OpeningId::virt(
+                VirtualPolynomial::InstructionFlags(InstructionFlags::LeftOperandIsRs1Value),
+                SumcheckId::InstructionInputVirtualization,
+            ))],
+        ));
+        challenge_idx += 1;
+
+        terms.push(ProductTerm::scaled(
+            ValueSource::Challenge(challenge_idx),
+            vec![ValueSource::Opening(OpeningId::virt(
+                VirtualPolynomial::InstructionFlags(InstructionFlags::LeftOperandIsPC),
+                SumcheckId::InstructionInputVirtualization,
+            ))],
+        ));
+        challenge_idx += 1;
+
+        terms.push(ProductTerm::scaled(
+            ValueSource::Challenge(challenge_idx),
+            vec![ValueSource::Opening(OpeningId::virt(
+                VirtualPolynomial::InstructionFlags(InstructionFlags::RightOperandIsRs2Value),
+                SumcheckId::InstructionInputVirtualization,
+            ))],
+        ));
+        challenge_idx += 1;
+
+        terms.push(ProductTerm::scaled(
+            ValueSource::Challenge(challenge_idx),
+            vec![ValueSource::Opening(OpeningId::virt(
+                VirtualPolynomial::InstructionFlags(InstructionFlags::RightOperandIsImm),
+                SumcheckId::InstructionInputVirtualization,
+            ))],
+        ));
+        challenge_idx += 1;
+
+        terms.push(ProductTerm::scaled(
+            ValueSource::Challenge(challenge_idx),
+            vec![ValueSource::Opening(OpeningId::virt(
+                VirtualPolynomial::InstructionFlags(InstructionFlags::IsNoop),
+                SumcheckId::SpartanShift,
+            ))],
+        ));
+        challenge_idx += 1;
+
+        terms.push(ProductTerm::scaled(
+            ValueSource::Challenge(challenge_idx),
+            vec![ValueSource::Opening(OpeningId::virt(
+                VirtualPolynomial::OpFlags(CircuitFlags::VirtualInstruction),
+                SumcheckId::SpartanShift,
+            ))],
+        ));
+        challenge_idx += 1;
+
+        terms.push(ProductTerm::scaled(
+            ValueSource::Challenge(challenge_idx),
+            vec![ValueSource::Opening(OpeningId::virt(
+                VirtualPolynomial::OpFlags(CircuitFlags::IsFirstInSequence),
+                SumcheckId::SpartanShift,
+            ))],
+        ));
+        challenge_idx += 1;
+
+        // Stage 4: RegistersReadWriteChecking openings
+        // Order: RdWa, Rs1Ra, Rs2Ra
+        terms.push(ProductTerm::scaled(
+            ValueSource::Challenge(challenge_idx),
+            vec![ValueSource::Opening(OpeningId::virt(
+                VirtualPolynomial::RdWa,
+                SumcheckId::RegistersReadWriteChecking,
+            ))],
+        ));
+        challenge_idx += 1;
+
+        terms.push(ProductTerm::scaled(
+            ValueSource::Challenge(challenge_idx),
+            vec![ValueSource::Opening(OpeningId::virt(
+                VirtualPolynomial::Rs1Ra,
+                SumcheckId::RegistersReadWriteChecking,
+            ))],
+        ));
+        challenge_idx += 1;
+
+        terms.push(ProductTerm::scaled(
+            ValueSource::Challenge(challenge_idx),
+            vec![ValueSource::Opening(OpeningId::virt(
+                VirtualPolynomial::Rs2Ra,
+                SumcheckId::RegistersReadWriteChecking,
+            ))],
+        ));
+        challenge_idx += 1;
+
+        // Stage 5: RegistersValEvaluation + InstructionReadRaf openings
+        // Order: RdWa@RegistersValEvaluation, InstructionRafFlag, LookupTableFlag(0..NUM_LOOKUP_TABLES)
+        terms.push(ProductTerm::scaled(
+            ValueSource::Challenge(challenge_idx),
+            vec![ValueSource::Opening(OpeningId::virt(
+                VirtualPolynomial::RdWa,
+                SumcheckId::RegistersValEvaluation,
+            ))],
+        ));
+        challenge_idx += 1;
+
+        terms.push(ProductTerm::scaled(
+            ValueSource::Challenge(challenge_idx),
+            vec![ValueSource::Opening(OpeningId::virt(
+                VirtualPolynomial::InstructionRafFlag,
+                SumcheckId::InstructionReadRaf,
+            ))],
+        ));
+        challenge_idx += 1;
+
+        for i in 0..NUM_LOOKUP_TABLES {
+            terms.push(ProductTerm::scaled(
+                ValueSource::Challenge(challenge_idx),
+                vec![ValueSource::Opening(OpeningId::virt(
+                    VirtualPolynomial::LookupTableFlag(i),
+                    SumcheckId::InstructionReadRaf,
+                ))],
+            ));
+            challenge_idx += 1;
+        }
+
+        // raf_claim: PC @ SpartanOuter
+        terms.push(ProductTerm::scaled(
+            ValueSource::Challenge(challenge_idx),
+            vec![ValueSource::Opening(OpeningId::virt(
+                VirtualPolynomial::PC,
+                SumcheckId::SpartanOuter,
+            ))],
+        ));
+        challenge_idx += 1;
+
+        // raf_shift_claim: PC @ SpartanShift
+        terms.push(ProductTerm::scaled(
+            ValueSource::Challenge(challenge_idx),
+            vec![ValueSource::Opening(OpeningId::virt(
+                VirtualPolynomial::PC,
+                SumcheckId::SpartanShift,
+            ))],
+        ));
+
+        InputClaimConstraint::sum_of_products(terms)
+    }
+
+    #[cfg(feature = "zk")]
+    fn input_constraint_challenge_values(&self, _: &dyn OpeningAccumulator<F>) -> Vec<F> {
+        // Compute coefficients: gamma_powers[stage] * stage_gammas[idx]
+        // The order must match input_claim_constraint terms.
+
+        let mut challenges = Vec::new();
+
+        // Stage 1: gamma_powers[0] * stage1_gammas[i]
+        for g in &self.stage1_gammas {
+            challenges.push(self.gamma_powers[0] * *g);
+        }
+
+        // Stage 2: gamma_powers[1] * stage2_gammas[i]
+        for g in &self.stage2_gammas {
+            challenges.push(self.gamma_powers[1] * *g);
+        }
+
+        // Stage 3: gamma_powers[2] * stage3_gammas[i]
+        // Special handling for index 1 (unexpanded_pc) which is split between two openings
+        challenges.push(self.gamma_powers[2] * self.stage3_gammas[0]); // imm
+                                                                       // unexpanded_pc: split between SpartanShift and InstructionInputVirtualization
+                                                                       // Each gets half the coefficient
+        let half = F::from_u64(2).inverse().unwrap();
+        challenges.push(self.gamma_powers[2] * self.stage3_gammas[1] * half);
+        // Continue with the rest of stage3 (indices 2..9)
+        for g in &self.stage3_gammas[2..] {
+            challenges.push(self.gamma_powers[2] * *g);
+        }
+
+        // Stage 4: gamma_powers[3] * stage4_gammas[i]
+        for g in &self.stage4_gammas {
+            challenges.push(self.gamma_powers[3] * *g);
+        }
+
+        // Stage 5: gamma_powers[4] * stage5_gammas[i]
+        for g in &self.stage5_gammas {
+            challenges.push(self.gamma_powers[4] * *g);
+        }
+
+        // raf_claim: gamma_powers[5]
+        challenges.push(self.gamma_powers[5]);
+
+        // raf_shift_claim: gamma_powers[6]
+        challenges.push(self.gamma_powers[6]);
+
+        challenges
+    }
+
+    #[cfg(feature = "zk")]
+    fn output_claim_constraint(&self) -> Option<OutputClaimConstraint> {
+        let factors: Vec<ValueSource> = (0..self.d)
+            .map(|i| {
+                let opening = OpeningId::committed(
+                    CommittedPolynomial::BytecodeRa(i),
+                    SumcheckId::BytecodeReadRaf,
+                );
+                ValueSource::Opening(opening)
+            })
+            .collect();
+
+        let terms = vec![ProductTerm::scaled(ValueSource::Challenge(0), factors)];
+
+        Some(OutputClaimConstraint::sum_of_products(terms))
+    }
+
+    #[cfg(feature = "zk")]
+    fn output_constraint_challenge_values(&self, sumcheck_challenges: &[F::Challenge]) -> Vec<F> {
+        let opening_point = self.normalize_opening_point(sumcheck_challenges);
+        let (r_address_prime, r_cycle_prime) = opening_point.split_at(self.log_K);
+
+        // Prover stores bound values before clearing polys; verifier evaluates directly
+        let val: F = if let Some(bound_val_polys) = &self.bound_val_polys {
+            bound_val_polys
+                .iter()
+                .zip(&self.r_cycles)
+                .zip(&self.gamma_powers)
+                .map(|((bound_val, r_cycle), gamma)| {
+                    *bound_val * EqPolynomial::<F>::mle(r_cycle, &r_cycle_prime.r) * gamma
+                })
+                .sum()
+        } else {
+            let int_poly = self.int_poly.evaluate(&r_address_prime.r);
+            self.val_polys
+                .iter()
+                .zip(&self.r_cycles)
+                .zip(&self.gamma_powers)
+                .zip([
+                    int_poly * self.gamma_powers[5],
+                    F::zero(),
+                    int_poly * self.gamma_powers[4],
+                    F::zero(),
+                    F::zero(),
+                ])
+                .map(|(((val, r_cycle), gamma), int_poly_contrib)| {
+                    (val.evaluate(&r_address_prime.r) + int_poly_contrib)
+                        * EqPolynomial::<F>::mle(r_cycle, &r_cycle_prime.r)
+                        * gamma
+                })
+                .sum()
+        };
+
+        vec![val]
     }
 }

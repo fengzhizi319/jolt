@@ -1,8 +1,7 @@
 use crate::field::{BarrettReduce, FMAdd, JoltField};
-use crate::msm::VariableBaseMSM;
-use crate::poly::commitment::dory::DoryGlobals;
+use crate::poly::commitment::dory::{DoryGlobals, DoryLayout};
 use crate::poly::multilinear_polynomial::MultilinearPolynomial;
-use crate::utils::accumulation::Acc6S;
+use crate::utils::accumulation::MedAccumS;
 use crate::utils::math::{s64_from_diff_u64s, Math};
 use crate::utils::thread::unsafe_allocate_zero_vec;
 use crate::zkvm::config::OneHotParams;
@@ -10,8 +9,6 @@ use crate::zkvm::instruction::LookupQuery;
 use crate::zkvm::ram::remap_address;
 use crate::zkvm::{bytecode::BytecodePreprocessing, witness::CommittedPolynomial};
 use allocative::Allocative;
-use ark_bn254::{Fr, G1Projective};
-use ark_ec::CurveGroup;
 use common::constants::XLEN;
 use common::jolt_device::MemoryLayout;
 use itertools::Itertools;
@@ -20,7 +17,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracer::ChunksIterator;
 use tracer::{instruction::Cycle, LazyTraceIterator};
-use tracing::trace_span;
 
 #[derive(Clone, Debug)]
 pub struct RLCStreamingData {
@@ -173,84 +169,30 @@ impl<F: JoltField> RLCPolynomial<F> {
     #[tracing::instrument(skip_all)]
     pub fn new_streaming(
         one_hot_params: OneHotParams,
-        preprocessing: Arc<RLCStreamingData>, // 包含 Bytecode 和内存布局，用于辅助计算地址
-        trace_source: TraceSource,            // Trace 数据源（可以是内存中的 Vec<Cycle> 或磁盘上的迭代器）
-        poly_ids: Vec<CommittedPolynomial>,   // 需要组合的多项式 ID 列表
-        coefficients: &[F],                   // 对应的随机系数 (Gamma Powers)
-        mut advice_poly_map: HashMap<CommittedPolynomial, MultilinearPolynomial<F>>, // 较小的、已存在内存中的辅助多项式
+        preprocessing: Arc<RLCStreamingData>,
+        trace_source: TraceSource,
+        poly_ids: Vec<CommittedPolynomial>,
+        coefficients: &[F],
+        mut advice_poly_map: HashMap<CommittedPolynomial, MultilinearPolynomial<F>>,
     ) -> Self {
-        // 确保每个多项式 ID 都有对应的系数
         debug_assert_eq!(poly_ids.len(), coefficients.len());
 
-        // 1. 初始化三个分类容器
-        /*
-           【核心原理：以计算换空间 (Time-Space Tradeoff)】
-
-           Q: 为什么我们在这里丢弃实际的多项式值，而只存储元数据？
-           A: 为了适应超大规模的 Trace（可能包含数十亿行），这在内存中完全存不下。
-
-           Q: 既然要丢掉，那为何开始的时候（在 Prover 阶段）要生成多线形多项式的点值？
-           A: 因为点值在两个不同阶段都有用，但每次用完就得丢，否则内存爆炸：
-              1.【Commitment Phase (第一次生成)】：
-                 - 目的：生成承诺（Fingerprint）。
-                 - 状态：Prover 需要完整的点值来计算 Commitment。算完一块，丢一块。
-
-              2.【Opening / Sumcheck Phase (第二次生成 - 当前阶段)】：
-                 - 目的：计算并证明 P(r)。
-                 - 场景：Verifier 给出了随机挑战点 r。
-                 - 任务：Prover 需要计算多项式在 r 点的值 P(r)，以及相关的证明辅助值（如 Dory 中的 vector-matrix product）。
-                 - 实现：RLCPolynomial 不存值，而是存“配方”。当需要算 P(r) 相关数据时，
-                   它会根据配方再次流式遍历 Trace，实时还原出数值并与 r 进行运算。
-
-           总结：主要是为了在计算 P(r) 的过程中，避免维持一个巨大的 O(N) 数组。
-        */
-
-        // A类容器：Trace 衍生的密集多项式 (Dense)
-        // 存储 (ID, 系数) 对。
-        // 它们的值通常是 Trace 中前后两个状态的差值 (post - pre)
-        // 例子：Read/Write 计数器的增量。
-        // 解释：不需要存这个数组，只需要遍历 Trace 时做减法即可得到。
         let mut dense_polys = Vec::new();
-
-        // B类容器：Trace 衍生的独热多项式 (One-Hot)
-        // 存储 (ID, 系数) 对。
-        // 它们的值用于内存一致性检查，指示某个 Chunk 的值是否等于索引 k。
-        // 重新计算公式：Value(t, k) = 1 if chunk(trace[t]) == k else 0
         let mut onehot_polys = Vec::new();
-
-        // C类容器：内存常驻辅助多项式 (Advice)
-        // 存储 (系数, 多项式实体) 对。
-        // 这些多项式通常很小（与 Trace 长度无关或只占很小比例），且不直接通过简单的 Trace 公式生成，
-        // 所以我们保留它们的实体在内存中。
         let mut advice_polys = Vec::new();
 
-        // 2. 遍历所有请求，进行分类分流
         for (poly_id, coeff) in poly_ids.iter().zip(coefficients.iter()) {
             match poly_id {
-                // A类：密集多项式 (Dense)
-                // 这些多项式的值是 Trace 中前后两个状态的差值 (post - pre)
-                // 例子：Read/Write 计数器的增量。
-                // 解释：不需要存这个数组，只需要遍历 Trace 时做减法即可得到。
                 CommittedPolynomial::RdInc | CommittedPolynomial::RamInc => {
                     dense_polys.push((*poly_id, *coeff));
                 }
-
-                // B类：独热多项式 (One-Hot)
-                // 这些多项式的值涉及将数值拆分为 chunk，用于离线内存检查
-                // 例子：指令查找、内存读写一致性。
-                // 解释：不需要存巨大的 0/1 矩阵。只需要遍历 Trace，拿到数值算出它属于哪个 Chunk (k)，
-                // 那么在 k 位置就是 1，其他位置是 0。
                 CommittedPolynomial::InstructionRa(_)
                 | CommittedPolynomial::BytecodeRa(_)
                 | CommittedPolynomial::RamRa(_) => {
                     onehot_polys.push((*poly_id, *coeff));
                 }
-
-                // C类：辅助多项式 (Advice)
-                // 这些不依赖 Trace 流，而是独立的较小多项式
                 CommittedPolynomial::TrustedAdvice | CommittedPolynomial::UntrustedAdvice => {
-                    // 如果 map 中存在该多项式，将其取出 (move) 并保存
-                    // 注意：这里保存的是实体数据 (MultilinearPolynomial)，因为它们体积小，不需要流式优化
+                    // Advice polynomials are passed in directly (not streamed from trace)
                     if advice_poly_map.contains_key(poly_id) {
                         advice_polys.push((*coeff, advice_poly_map.remove(poly_id).unwrap()));
                     }
@@ -258,17 +200,9 @@ impl<F: JoltField> RLCPolynomial<F> {
             }
         }
 
-        // 3. 构建 RLCPolynomial 对象
         Self {
-            // 关键点：对于流式 RLC，我们不在此处生成巨大的 dense_rlc/one_hot_rlc 向量。
-            // 设置为空 vec![] 以节省内存。
-            dense_rlc: vec![],
-            one_hot_rlc: vec![],
-
-            // 4. 填充流式上下文
-            // 将分类好的元数据和数据源封装到 StreamingRLCContext 中。
-            // 后续的 commit_rows 或 vector_matrix_product 会利用这个上下文
-            // 实时从 trace_source 读取数据并根据 coefficients 动态计算。
+            dense_rlc: vec![],   // Not materialized in streaming mode
+            one_hot_rlc: vec![], // Not materialized in streaming mode
             streaming_context: Some(Arc::new(StreamingRLCContext {
                 dense_polys,
                 onehot_polys,
@@ -329,78 +263,6 @@ impl<F: JoltField> RLCPolynomial<F> {
         result
     }
 
-    /// Commits to the rows of `RLCPolynomial`, viewing its coefficients
-    /// as a matrix (used in Dory).
-    /// We do so by computing the row commitments for the individual
-    /// polynomials comprising the linear combination, and taking the
-    /// linear combination of the resulting commitments.
-    // TODO(moodlezoup): we should be able to cache the row commitments
-    // for each underlying polynomial and take a linear combination of those
-    #[tracing::instrument(skip_all, name = "RLCPolynomial::commit_rows")]
-    pub fn commit_rows<G: CurveGroup<ScalarField = F> + VariableBaseMSM>(
-        &self,
-        bases: &[G::Affine],
-    ) -> Vec<G> {
-        let num_rows = DoryGlobals::get_max_num_rows();
-        tracing::debug!("Committing to RLC polynomial with {num_rows} rows");
-        let row_len = DoryGlobals::get_num_columns();
-
-        let mut row_commitments = vec![G::zero(); num_rows];
-
-        // Compute the row commitments for dense submatrix
-        self.dense_rlc
-            .par_chunks(row_len)
-            .zip(row_commitments.par_iter_mut())
-            .for_each(|(dense_row, commitment)| {
-                let msm_result: G =
-                    VariableBaseMSM::msm_field_elements(&bases[..dense_row.len()], dense_row)
-                        .unwrap();
-                *commitment += msm_result
-            });
-
-        // Compute the row commitments for one-hot polynomials
-        for (coeff, poly) in self.one_hot_rlc.iter() {
-            let mut new_row_commitments: Vec<G> = match poly.as_ref() {
-                MultilinearPolynomial::OneHot(one_hot) => one_hot.commit_rows(bases),
-                _ => panic!("Expected OneHot polynomial in one_hot_rlc"),
-            };
-
-            // TODO(moodlezoup): Avoid resize
-            new_row_commitments.resize(num_rows, G::zero());
-
-            let updated_row_commitments: &mut [G1Projective] = unsafe {
-                std::slice::from_raw_parts_mut(
-                    new_row_commitments.as_mut_ptr() as *mut G1Projective,
-                    new_row_commitments.len(),
-                )
-            };
-
-            let current_row_commitments: &[G1Projective] = unsafe {
-                std::slice::from_raw_parts(
-                    row_commitments.as_ptr() as *const G1Projective,
-                    row_commitments.len(),
-                )
-            };
-
-            let coeff_fr = unsafe { *(&raw const *coeff as *const Fr) };
-
-            let _span = trace_span!("vector_scalar_mul_add_gamma_g1_online");
-            let _enter = _span.enter();
-
-            // Scales the row commitments for the current polynomial by
-            // its coefficient
-            jolt_optimizations::vector_scalar_mul_add_gamma_g1_online(
-                updated_row_commitments,
-                coeff_fr,
-                current_row_commitments,
-            );
-
-            let _ = std::mem::replace(&mut row_commitments, new_row_commitments);
-        }
-
-        row_commitments
-    }
-
     /// Computes a vector-matrix product, viewing the coefficients of the
     /// polynomial as a matrix (used in Dory).
     /// We do so by computing the vector-matrix product for the individual
@@ -415,22 +277,45 @@ impl<F: JoltField> RLCPolynomial<F> {
             // Streaming mode: generate rows on-demand from trace
             self.streaming_vector_matrix_product(left_vec, num_columns, Arc::clone(ctx))
         } else {
-            // Linear space mode: use pre-computed dense_rlc
-            (0..num_columns)
-                .into_par_iter()
-                .map(|col_index| {
-                    self.dense_rlc
-                        .iter()
-                        .skip(col_index)
-                        .step_by(num_columns)
-                        .zip(left_vec.iter())
-                        .map(|(&a, &b)| -> F { a * b })
-                        .sum::<F>()
-                })
-                .collect()
+            let mut dense_result = vec![F::zero(); num_columns];
+            match DoryGlobals::get_layout() {
+                DoryLayout::CycleMajor => {
+                    dense_result
+                        .par_iter_mut()
+                        .enumerate()
+                        .for_each(|(col_idx, dest)| {
+                            *dest = self
+                                .dense_rlc
+                                .iter()
+                                .skip(col_idx)
+                                .step_by(num_columns)
+                                .zip(left_vec.iter())
+                                .map(|(&a, &b)| a * b)
+                                .sum();
+                        });
+                }
+                DoryLayout::AddressMajor => {
+                    let cycles_per_row = DoryGlobals::address_major_cycles_per_row();
+                    dense_result
+                        .par_iter_mut()
+                        .step_by(num_columns / cycles_per_row)
+                        .enumerate()
+                        .for_each(|(offset, dot_product_result)| {
+                            *dot_product_result = self
+                                .dense_rlc
+                                .par_iter()
+                                .skip(offset)
+                                .step_by(cycles_per_row)
+                                .zip(left_vec.par_iter())
+                                .map(|(&a, &b)| -> F { a * b })
+                                .sum::<F>();
+                        });
+                }
+            }
+            dense_result
         };
 
-        // Compute the vector-matrix product for one-hot polynomials (linear space)
+        // Compute the **linear space** vector-matrix product for one-hot polynomials
         for (coeff, poly) in self.one_hot_rlc.iter() {
             match poly.as_ref() {
                 MultilinearPolynomial::OneHot(one_hot) => {
@@ -458,9 +343,7 @@ impl<F: JoltField> RLCPolynomial<F> {
     ///
     /// # Complexity
     /// It uses O(m + a) space where m is the number of rows
-    /// and a is the advice size. However, this is small enough in practice (advice is typically
-    /// much smaller than the trace). This function is used in both streaming and
-    /// non-streaming contexts, and mutates `result` in place.
+    /// and a is the advice size, so even though it is linear it is negl space overall.
     fn vmp_advice_contribution(
         result: &mut [F],
         left_vec: &[F],
@@ -519,14 +402,20 @@ guardrail in gen_from_trace should ensure sigma_main >= sigma_a."
     /// Streaming VMP implementation that generates rows on-demand from trace.
     /// Achieves O(sqrt(n)) space complexity by lazily generating the witness.
     /// Single pass through trace for both dense and one-hot polynomials.
+    /// Note: Streaming optimization only works for CycleMajor layout.
+    /// For AddressMajor, we materialize the polynomial and use regular VMP.
     fn streaming_vector_matrix_product(
         &self,
         left_vec: &[F],
         num_columns: usize,
         ctx: Arc<StreamingRLCContext<F>>,
     ) -> Vec<F> {
-        let T = DoryGlobals::get_T();
+        // For AddressMajor layout, materialize and use regular VMP
+        if DoryGlobals::get_layout() == DoryLayout::AddressMajor {
+            return self.address_major_vector_matrix_product(left_vec, num_columns, &ctx);
+        }
 
+        let T = DoryGlobals::get_T();
         match &ctx.trace_source {
             TraceSource::Materialized(trace) => {
                 self.materialized_vector_matrix_product(left_vec, num_columns, trace, &ctx, T)
@@ -538,6 +427,79 @@ guardrail in gen_from_trace should ensure sigma_main >= sigma_a."
                 &ctx,
                 T,
             ),
+        }
+    }
+
+    /// AddressMajor VMP: materialize the RLC polynomial from trace and use regular VMP.
+    #[tracing::instrument(skip_all, name = "RLCPolynomial::address_major_vmp")]
+    fn address_major_vector_matrix_product(
+        &self,
+        left_vec: &[F],
+        num_columns: usize,
+        ctx: &StreamingRLCContext<F>,
+    ) -> Vec<F> {
+        let trace = match &ctx.trace_source {
+            TraceSource::Materialized(trace) => trace,
+            TraceSource::Lazy(_) => panic!("AddressMajor VMP requires materialized trace"),
+        };
+
+        // Materialize the RLC polynomial from the streaming context
+        let materialized = self.materialize_from_context(ctx, trace);
+
+        // Use the regular vector_matrix_product on the materialized polynomial
+        let mut result = materialized.vector_matrix_product(left_vec);
+
+        Self::vmp_advice_contribution(&mut result, left_vec, num_columns, ctx);
+
+        result
+    }
+
+    /// Materialize an RLC polynomial from a streaming context.
+    #[tracing::instrument(skip_all, name = "RLCPolynomial::materialize_from_context")]
+    fn materialize_from_context(
+        &self,
+        ctx: &StreamingRLCContext<F>,
+        trace: &[Cycle],
+    ) -> RLCPolynomial<F> {
+        let T = DoryGlobals::get_T();
+        let mut dense_rlc: Vec<F> = unsafe_allocate_zero_vec(T);
+
+        // Materialize dense polynomials (RdInc, RamInc) into dense_rlc
+        for (poly_id, coeff) in ctx.dense_polys.iter() {
+            let poly: MultilinearPolynomial<F> = poly_id.generate_witness(
+                &ctx.preprocessing.bytecode,
+                &ctx.preprocessing.memory_layout,
+                trace,
+                Some(&ctx.one_hot_params),
+            );
+
+            // Add coeff * poly to dense_rlc
+            let len = poly.original_len().min(dense_rlc.len());
+            dense_rlc[..len]
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(i, acc)| {
+                    let val = poly.get_coeff(i);
+                    *acc += *coeff * val;
+                });
+        }
+
+        // Materialize one-hot polynomials (Ra polynomials)
+        let mut one_hot_rlc = Vec::new();
+        for (poly_id, coeff) in ctx.onehot_polys.iter() {
+            let poly = poly_id.generate_witness(
+                &ctx.preprocessing.bytecode,
+                &ctx.preprocessing.memory_layout,
+                trace,
+                Some(&ctx.one_hot_params),
+            );
+            one_hot_rlc.push((*coeff, Arc::new(poly)));
+        }
+
+        RLCPolynomial {
+            dense_rlc,
+            one_hot_rlc,
+            streaming_context: None,
         }
     }
 
@@ -574,7 +536,6 @@ guardrail in gen_from_trace should ensure sigma_main >= sigma_a."
                     let row_idx = row_start + local_idx;
                     let chunk_start = row_idx * num_columns;
 
-                    // Row-scaled dense coefficients.
                     let scaled_rd_inc = row_weight * setup.rd_inc_coeff;
                     let scaled_ram_inc = row_weight * setup.ram_inc_coeff;
                     let row_factor = setup.row_factors[row_idx];
@@ -824,8 +785,8 @@ impl<'a, F: JoltField> VmvSetup<'a, F> {
         scaled_rd_inc: F,
         scaled_ram_inc: F,
         row_factor: F,
-        dense_acc: &mut Acc6S<F>,
-        onehot_acc: &mut F::Unreduced<9>,
+        dense_acc: &mut MedAccumS<F>,
+        onehot_acc: &mut F::UnreducedProductAccum,
     ) {
         // Dense polynomials: accumulate scaled_coeff * (post - pre)
         let (_, pre_value, post_value) = cycle.rd_write().unwrap_or_default();
@@ -838,20 +799,20 @@ impl<'a, F: JoltField> VmvSetup<'a, F> {
         }
 
         // One-hot polynomials: accumulate using pre-folded K tables (unreduced)
-        let mut inner_sum = F::Unreduced::<5>::default();
+        let mut inner_sum = F::UnreducedMulU64::default();
 
         // Instruction RA chunks
         let lookup_index = LookupQuery::<XLEN>::to_lookup_index(cycle);
         for (i, table) in self.folded_tables.instruction.iter().enumerate() {
             let k = self.one_hot_params.lookup_index_chunk(lookup_index, i) as usize;
-            inner_sum += *table[k].as_unreduced_ref();
+            inner_sum += table[k].to_unreduced();
         }
 
         // Bytecode RA chunks
         let pc = self.bytecode.get_pc(cycle);
         for (i, table) in self.folded_tables.bytecode.iter().enumerate() {
             let k = self.one_hot_params.bytecode_pc_chunk(pc, i) as usize;
-            inner_sum += *table[k].as_unreduced_ref();
+            inner_sum += table[k].to_unreduced();
         }
 
         // RAM RA chunks
@@ -859,17 +820,19 @@ impl<'a, F: JoltField> VmvSetup<'a, F> {
         if let Some(remapped) = remap_address(address, self.memory_layout) {
             for (i, table) in self.folded_tables.ram.iter().enumerate() {
                 let k = self.one_hot_params.ram_address_chunk(remapped, i) as usize;
-                inner_sum += *table[k].as_unreduced_ref();
+                inner_sum += table[k].to_unreduced();
             }
         }
 
         // Reduce inner_sum before multiplying with row_factor
-        let inner_sum_reduced = F::from_barrett_reduce::<5>(inner_sum);
-        *onehot_acc += row_factor.mul_unreduced::<9>(inner_sum_reduced);
+        let inner_sum_reduced = F::reduce_mul_u64(inner_sum);
+        *onehot_acc += row_factor.mul_to_product_accum(inner_sum_reduced);
     }
 
     #[inline]
-    fn create_accumulators(num_columns: usize) -> (Vec<Acc6S<F>>, Vec<F::Unreduced<9>>) {
+    fn create_accumulators(
+        num_columns: usize,
+    ) -> (Vec<MedAccumS<F>>, Vec<F::UnreducedProductAccum>) {
         (
             unsafe_allocate_zero_vec(num_columns),
             unsafe_allocate_zero_vec(num_columns),
@@ -878,9 +841,9 @@ impl<'a, F: JoltField> VmvSetup<'a, F> {
 
     #[inline]
     fn merge_accumulators(
-        (mut dense_a, mut onehot_a): (Vec<Acc6S<F>>, Vec<F::Unreduced<9>>),
-        (dense_b, onehot_b): (Vec<Acc6S<F>>, Vec<F::Unreduced<9>>),
-    ) -> (Vec<Acc6S<F>>, Vec<F::Unreduced<9>>) {
+        (mut dense_a, mut onehot_a): (Vec<MedAccumS<F>>, Vec<F::UnreducedProductAccum>),
+        (dense_b, onehot_b): (Vec<MedAccumS<F>>, Vec<F::UnreducedProductAccum>),
+    ) -> (Vec<MedAccumS<F>>, Vec<F::UnreducedProductAccum>) {
         for (a, b) in dense_a.iter_mut().zip(dense_b.iter()) {
             *a = *a + *b;
         }
@@ -891,15 +854,14 @@ impl<'a, F: JoltField> VmvSetup<'a, F> {
     }
 
     fn finalize(
-        dense_accs: Vec<Acc6S<F>>,
-        onehot_accs: Vec<F::Unreduced<9>>,
+        dense_accs: Vec<MedAccumS<F>>,
+        onehot_accs: Vec<F::UnreducedProductAccum>,
         num_columns: usize,
     ) -> Vec<F> {
         (0..num_columns)
             .into_par_iter()
             .map(|col_idx| {
-                dense_accs[col_idx].barrett_reduce()
-                    + F::from_montgomery_reduce::<9>(onehot_accs[col_idx])
+                dense_accs[col_idx].barrett_reduce() + F::reduce_product_accum(onehot_accs[col_idx])
             })
             .collect()
     }

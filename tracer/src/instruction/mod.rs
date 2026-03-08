@@ -1,9 +1,27 @@
 #![allow(clippy::upper_case_acronyms)]
 
+// Opcode constants
+pub const CUSTOM_OPCODE: u8 = 0x5B; // Custom instructions (virtual sequences, advice, etc.)
+pub const INLINE_OPCODE: u8 = 0x2B; // Inline instructions
+
+// funct3 values for CUSTOM_OPCODE (0x5B)
+pub const FUNCT3_VIRTUAL_REV8W: u8 = 0b000;
+pub const FUNCT3_VIRTUAL_ASSERT_EQ: u8 = 0b001;
+pub const FUNCT3_VIRTUAL_HOST_IO: u8 = 0b010;
+pub const FUNCT3_ADVICE_LB: u8 = 0b011; // Load byte from advice tape
+pub const FUNCT3_ADVICE_LH: u8 = 0b100; // Load halfword from advice tape
+pub const FUNCT3_ADVICE_LW: u8 = 0b101; // Load word from advice tape
+pub const FUNCT3_ADVICE_LD: u8 = 0b110; // Load doubleword from advice tape
+pub const FUNCT3_ADVICE_LEN: u8 = 0b111; // Get remaining bytes in advice tape
+
 use add::ADD;
 use addi::ADDI;
 use addiw::ADDIW;
 use addw::ADDW;
+use advice_lb::AdviceLB;
+use advice_ld::AdviceLD;
+use advice_lh::AdviceLH;
+use advice_lw::AdviceLW;
 use amoaddd::AMOADDD;
 use amoaddw::AMOADDW;
 use amoandd::AMOANDD;
@@ -35,10 +53,13 @@ use bgeu::BGEU;
 use blt::BLT;
 use bltu::BLTU;
 use bne::BNE;
+use csrrs::CSRRS;
+use csrrw::CSRRW;
 use div::DIV;
 use divu::DIVU;
 use divuw::DIVUW;
 use divw::DIVW;
+use ebreak::EBREAK;
 use ecall::ECALL;
 use fence::FENCE;
 use jal::JAL;
@@ -53,6 +74,7 @@ use lrw::LRW;
 use lui::LUI;
 use lw::LW;
 use lwu::LWU;
+use mret::MRET;
 use mul::MUL;
 use mulh::MULH;
 use mulhsu::MULHSU;
@@ -90,10 +112,13 @@ use strum_macros::{EnumCount as EnumCountMacro, EnumIter, IntoStaticStr};
 use sub::SUB;
 use subw::SUBW;
 use sw::SW;
+use virtual_host_io::VirtualHostIO;
 use xor::XOR;
 use xori::XORI;
 
 use virtual_advice::VirtualAdvice;
+use virtual_advice_len::VirtualAdviceLen;
+use virtual_advice_load::VirtualAdviceLoad;
 use virtual_assert_eq::VirtualAssertEQ;
 use virtual_assert_halfword_alignment::VirtualAssertHalfwordAlignment;
 use virtual_assert_lte::VirtualAssertLTE;
@@ -142,6 +167,10 @@ pub mod add;
 pub mod addi;
 pub mod addiw;
 pub mod addw;
+pub mod advice_lb;
+pub mod advice_ld;
+pub mod advice_lh;
+pub mod advice_lw;
 pub mod amoaddd;
 pub mod amoaddw;
 pub mod amoandd;
@@ -170,10 +199,13 @@ pub mod bgeu;
 pub mod blt;
 pub mod bltu;
 pub mod bne;
+pub mod csrrs;
+pub mod csrrw;
 pub mod div;
 pub mod divu;
 pub mod divuw;
 pub mod divw;
+pub mod ebreak;
 pub mod ecall;
 pub mod fence;
 pub mod inline;
@@ -189,6 +221,7 @@ pub mod lrw;
 pub mod lui;
 pub mod lw;
 pub mod lwu;
+pub mod mret;
 pub mod mul;
 pub mod mulh;
 pub mod mulhsu;
@@ -225,6 +258,8 @@ pub mod sub;
 pub mod subw;
 pub mod sw;
 pub mod virtual_advice;
+pub mod virtual_advice_len;
+pub mod virtual_advice_load;
 pub mod virtual_assert_eq;
 pub mod virtual_assert_halfword_alignment;
 pub mod virtual_assert_lte;
@@ -234,6 +269,7 @@ pub mod virtual_assert_valid_unsigned_remainder;
 pub mod virtual_assert_word_alignment;
 pub mod virtual_change_divisor;
 pub mod virtual_change_divisor_w;
+pub mod virtual_host_io;
 pub mod virtual_lw;
 pub mod virtual_movsign;
 pub mod virtual_muli;
@@ -308,18 +344,12 @@ impl From<()> for RAMAccess {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default)]
 pub struct NormalizedInstruction {
-    /// 指令所在的内存地址（程序计数器 PC 的值）。
     pub address: usize,
-    /// 标准化后的操作数，包含 rd, rs1, rs2, imm 等，统一格式以便处理。
     pub operands: NormalizedOperands,
-    /// 如果该指令属于一个虚拟指令序列（宏指令展开），此字段表示后续还剩多少条指令待执行。
-    /// `None` 表示这是一个普通的单条指令，不是序列的一部分。
     pub virtual_sequence_remaining: Option<u16>,
-    /// 标记该指令是否为一个虚拟指令序列（宏指令展开）的第一条指令。
     pub is_first_in_sequence: bool,
-    /// 标记该指令原始形式是否为压缩指令（16位，RVC扩展）。
     pub is_compressed: bool,
 }
 
@@ -346,6 +376,10 @@ pub trait RISCVInstruction:
     }
 
     fn execute(&self, cpu: &mut Cpu, ram_access: &mut Self::RAMAccess);
+
+    fn has_side_effects(&self) -> bool {
+        false
+    }
 }
 
 pub trait RISCVTrace: RISCVInstruction
@@ -515,6 +549,28 @@ macro_rules! define_rv32im_enums {
 
         impl Instruction {
             pub fn trace(&self, cpu: &mut Cpu, trace: Option<&mut Vec<Cycle>>) {
+                let normalized = self.normalize();
+                // Rewrite instructions with rd=x0 via inline_sequence so the
+                // constraint system never sees rd=x0.
+                if normalized.operands.rd == Some(0) {
+                    let inline_sequence = self.inline_sequence(&cpu.vr_allocator, cpu.xlen);
+                    let mut trace = trace;
+                    for instr in inline_sequence {
+                        instr.trace_raw(cpu, trace.as_deref_mut());
+                    }
+                    return;
+                }
+                match self {
+                    Instruction::NoOp => panic!("Unsupported instruction: {:?}", self),
+                    Instruction::UNIMPL => panic!("Unsupported instruction: {:?}", self),
+                    $(
+                        Instruction::$instr(instr) => instr.trace(cpu, trace),
+                    )*
+                    Instruction::INLINE(instr) => instr.trace(cpu, trace),
+                }
+            }
+
+            fn trace_raw(&self, cpu: &mut Cpu, trace: Option<&mut Vec<Cycle>>) {
                 match self {
                     Instruction::NoOp => panic!("Unsupported instruction: {:?}", self),
                     Instruction::UNIMPL => panic!("Unsupported instruction: {:?}", self),
@@ -554,7 +610,76 @@ macro_rules! define_rv32im_enums {
                 self.into()
             }
 
+            /// Copy this instruction with rd overwritten.  Uses
+            /// `InstructionFormat::set_rd` so the correct field is updated
+            /// for each format (e.g. FormatInline writes rs3).
+            fn with_rd(&self, new_rd: u8) -> Instruction {
+                match self {
+                    Instruction::NoOp => Instruction::NoOp,
+                    Instruction::UNIMPL => Instruction::UNIMPL,
+                    $(Instruction::$instr(instr) => {
+                        let mut copy = *instr;
+                        copy.operands.set_rd(new_rd);
+                        copy.into()
+                    },)*
+                    Instruction::INLINE(instr) => {
+                        let mut copy = *instr;
+                        copy.operands.set_rd(new_rd);
+                        copy.into()
+                    }
+                }
+            }
+
+            pub fn has_side_effects(&self) -> bool {
+                match self {
+                    Instruction::NoOp => false,
+                    Instruction::UNIMPL => false,
+                    $(
+                        Instruction::$instr(instr) => instr.has_side_effects(),
+                    )*
+                    Instruction::INLINE(instr) => instr.has_side_effects(),
+                }
+            }
+
             pub fn inline_sequence(&self, allocator: &VirtualRegisterAllocator, xlen: Xlen) -> Vec<Instruction> {
+                let normalized = self.normalize();
+                if normalized.operands.rd == Some(0) {
+                    // Delegate: these handle rd=0 internally
+                    if matches!(
+                        self,
+                        Instruction::ECALL(_)
+                            | Instruction::MRET(_)
+                            | Instruction::EBREAK(_)
+                            | Instruction::CSRRW(_)
+                            | Instruction::CSRRS(_)
+                    ) {
+                        return self.dispatch_inline_sequence(allocator, xlen);
+                    }
+
+                    // Remap rd to a virtual register for instructions with side effects
+                    if self.has_side_effects() {
+                        let vr = allocator.allocate();
+                        return self.with_rd(*vr).inline_sequence(allocator, xlen);
+                    }
+                    // No side effects beyond writing rd: replace with NOP
+                    let addi = ADDI::from(NormalizedInstruction {
+                        address: normalized.address,
+                        operands: NormalizedOperands {
+                            rd: Some(0),
+                            rs1: Some(0),
+                            rs2: None,
+                            imm: 0,
+                        },
+                        virtual_sequence_remaining: None,
+                        is_first_in_sequence: false,
+                        is_compressed: normalized.is_compressed,
+                    });
+                    return vec![addi.into()];
+                }
+                self.dispatch_inline_sequence(allocator, xlen)
+            }
+
+            fn dispatch_inline_sequence(&self, allocator: &VirtualRegisterAllocator, xlen: Xlen) -> Vec<Instruction> {
                 match self {
                     Instruction::NoOp => vec![],
                     Instruction::UNIMPL => vec![],
@@ -628,8 +753,9 @@ macro_rules! define_rv32im_enums {
 
 define_rv32im_enums! {
     instructions: [
-        ADD, ADDI, AND, ANDI, ANDN, AUIPC, BEQ, BGE, BGEU, BLT, BLTU, BNE, DIV, DIVU,
-        ECALL, FENCE, JAL, JALR, LB, LBU, LD, LH, LHU, LUI, LW, MUL, MULH, MULHSU,
+        ADD, ADDI, AND, ANDI, ANDN, AUIPC, BEQ, BGE, BGEU, BLT, BLTU, BNE,
+        CSRRS, CSRRW, DIV, DIVU,
+        EBREAK, ECALL, FENCE, JAL, JALR, LB, LBU, LD, LH, LHU, LUI, LW, MRET, MUL, MULH, MULHSU,
         MULHU, OR, ORI, REM, REMU, SB, SD, SH, SLL, SLLI, SLT, SLTI, SLTIU, SLTU,
         SRA, SRAI, SRL, SRLI, SUB, SW, XOR, XORI,
         // RV64I
@@ -641,7 +767,10 @@ define_rv32im_enums! {
         // RV64A (Atomic Memory Operations)
         LRD, SCD, AMOSWAPD, AMOADDD, AMOANDD, AMOORD, AMOXORD, AMOMIND, AMOMAXD, AMOMINUD, AMOMAXUD,
         // Virtual
-        VirtualAdvice, VirtualAssertEQ, VirtualAssertHalfwordAlignment, VirtualAssertWordAlignment, VirtualAssertLTE,
+        AdviceLB, AdviceLD, AdviceLH, AdviceLW,
+        VirtualAdvice, VirtualAdviceLen, VirtualAdviceLoad,
+        VirtualAssertEQ, VirtualAssertHalfwordAlignment, VirtualAssertWordAlignment, VirtualAssertLTE,
+        VirtualHostIO,
         VirtualAssertValidDiv0, VirtualAssertValidUnsignedRemainder, VirtualAssertMulUNoOverflow,
         VirtualChangeDivisor, VirtualChangeDivisorW, VirtualLW,VirtualSW, VirtualZeroExtendWord,
         VirtualSignExtendWord,VirtualPow2W, VirtualPow2IW,
@@ -925,11 +1054,29 @@ impl Instruction {
                 }
             }
             0b1110011 => {
-                // For now this only (potentially) maps to ECALL.
-                if instr == ECALL::MATCH {
-                    Ok(ECALL::new(instr, address, true, compressed).into())
-                } else {
-                    Err("Unsupported SYSTEM instruction")
+                // SYSTEM instructions: ECALL, EBREAK, MRET, CSRs
+                let funct3 = (instr >> 12) & 0x7;
+                let funct7 = (instr >> 25) & 0x7f;
+                let rs2 = (instr >> 20) & 0x1f;
+
+                match (funct3, funct7, rs2) {
+                    // ECALL: funct3=0, funct7=0, rs2=0 (instr = 0x00000073)
+                    (0, 0, 0) if instr == 0x00000073 => {
+                        Ok(ECALL::new(instr, address, true, compressed).into())
+                    }
+                    // EBREAK: funct3=0, rs2=1 (instr = 0x00100073)
+                    (0, 0, 1) if instr == 0x00100073 => {
+                        Ok(EBREAK::new(instr, address, true, compressed).into())
+                    }
+                    // MRET: funct3=0, funct7=0x18, rs2=2 (instr = 0x30200073)
+                    (0, 0x18, 2) if instr == 0x30200073 => {
+                        Ok(MRET::new(instr, address, true, compressed).into())
+                    }
+                    // CSRRW: funct3=1
+                    (1, _, _) => Ok(CSRRW::new(instr, address, true, compressed).into()),
+                    // CSRRS: funct3=2
+                    (2, _, _) => Ok(CSRRS::new(instr, address, true, compressed).into()),
+                    _ => Err("Unsupported SYSTEM instruction"),
                 }
             }
             // 0x0B is reserved for inlines supported by Jolt in jolt-inlines crate.
@@ -942,13 +1089,27 @@ impl Instruction {
             0b0001011 => Ok(INLINE::new(instr, address, false, compressed).into()),
             // 0x2B is reserved for external inlines
             0b0101011 => Ok(INLINE::new(instr, address, false, compressed).into()),
-            // 0x5B is reserved for virtual instructions.
+            // 0x5B is reserved for custom/virtual instructions.
             0b1011011 => {
                 let funct3 = (instr >> 12) & 0x7;
-                match funct3 {
-                    0b000 => Ok(VirtualRev8W::new(instr, address, true, compressed).into()),
-                    0b001 => Ok(VirtualAssertEQ::new(instr, address, true, compressed).into()),
-                    _ => Err("Invalid virtual instruction"),
+                match funct3 as u8 {
+                    FUNCT3_VIRTUAL_REV8W => {
+                        Ok(VirtualRev8W::new(instr, address, true, compressed).into())
+                    }
+                    FUNCT3_VIRTUAL_ASSERT_EQ => {
+                        Ok(VirtualAssertEQ::new(instr, address, true, compressed).into())
+                    }
+                    FUNCT3_VIRTUAL_HOST_IO => {
+                        Ok(VirtualHostIO::new(instr, address, true, compressed).into())
+                    }
+                    FUNCT3_ADVICE_LB => Ok(AdviceLB::new(instr, address, true, compressed).into()),
+                    FUNCT3_ADVICE_LH => Ok(AdviceLH::new(instr, address, true, compressed).into()),
+                    FUNCT3_ADVICE_LW => Ok(AdviceLW::new(instr, address, true, compressed).into()),
+                    FUNCT3_ADVICE_LD => Ok(AdviceLD::new(instr, address, true, compressed).into()),
+                    FUNCT3_ADVICE_LEN => {
+                        Ok(VirtualAdviceLen::new(instr, address, true, compressed).into())
+                    }
+                    _ => Err("Invalid custom/virtual instruction"),
                 }
             }
             _ => Err("Unknown opcode"),

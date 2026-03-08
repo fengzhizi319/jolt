@@ -30,7 +30,7 @@ declare_riscv_instr!(
 
 impl LW {
     fn exec(&self, cpu: &mut Cpu, ram_access: &mut <LW as RISCVInstruction>::RAMAccess) {
-        cpu.x[self.operands.rd as usize] = match cpu
+        let value = match cpu
             .mmu
             .load_word(cpu.x[self.operands.rs1 as usize].wrapping_add(self.operands.imm) as u64)
         {
@@ -40,6 +40,7 @@ impl LW {
             }
             Err(_) => panic!("MMU load error"),
         };
+        cpu.write_register(self.operands.rd as usize, value);
     }
 }
 
@@ -52,7 +53,7 @@ impl RISCVTrace for LW {
         }
     }
 
-    /// Load word (32-bit) from aligned memory.    
+    /// Load word (32-bit) from aligned memory.
     fn inline_sequence(
         &self,
         allocator: &VirtualRegisterAllocator,
@@ -77,20 +78,19 @@ impl LW {
     }
 
     fn inline_sequence_64(&self, allocator: &VirtualRegisterAllocator) -> Vec<Instruction> {
-        // Virtual registers used in sequence
-        let v_address = allocator.allocate();
-        let v_dword_address = allocator.allocate();
-        let v_dword = allocator.allocate();
-        let v_shift = allocator.allocate();
+        let v0 = allocator.allocate();
+        let v1 = allocator.allocate();
 
         let mut asm = InstrAssembler::new(self.address, self.is_compressed, Xlen::Bit64, allocator);
-        asm.emit_halign::<VirtualAssertWordAlignment>(self.operands.rs1, self.operands.imm);
-        asm.emit_i::<ADDI>(*v_address, self.operands.rs1, self.operands.imm as u64);
-        asm.emit_i::<ANDI>(*v_dword_address, *v_address, -8i64 as u64);
-        asm.emit_ld::<LD>(*v_dword, *v_dword_address, 0);
-        asm.emit_i::<SLLI>(*v_shift, *v_address, 3);
-        asm.emit_r::<SRL>(self.operands.rd, *v_dword, *v_shift);
-        asm.emit_i::<VirtualSignExtendWord>(self.operands.rd, self.operands.rd, 0);
+
+        asm.emit_align::<VirtualAssertWordAlignment>(self.operands.rs1, self.operands.imm);
+        asm.emit_i::<ADDI>(*v0, self.operands.rs1, self.operands.imm as u64);
+        asm.emit_i::<ANDI>(*v1, *v0, -8i64 as u64);
+        asm.emit_ld::<LD>(*v1, *v1, 0);
+        asm.emit_i::<SLLI>(*v0, *v0, 3);
+        asm.emit_r::<SRL>(*v1, *v1, *v0);
+        asm.emit_i::<VirtualSignExtendWord>(self.operands.rd, *v1, 0);
+
         asm.finalize()
     }
 }

@@ -12,22 +12,15 @@ use super::constraints::{
 use crate::utils::math::Math;
 use crate::zkvm::r1cs::inputs::JoltR1CSInputs;
 
-///UniformSpartanKey 是 Jolt 中用于 Uniform Spartan 证明系统的核心结构体，
-/// 充当了证明者（Prover）和验证者（Verifier）共享的“索引”或“键（Key）”。
-///它的主要作用是描述和唯一标识整个计算电路的结构（即 VM 执行了多少步，每步有哪些约束），
-/// 而不需要显式地存储巨大的约束矩阵。
 #[derive(Clone, Copy, CanonicalSerialize, CanonicalDeserialize)]
 pub struct UniformSpartanKey<F: JoltField> {
     /// Number of constraints across all steps padded to nearest power of 2
-    ///  填充到最近2的幂次的所有步骤的总约束数
     pub num_cons_total: usize,
 
     /// Number of steps padded to the nearest power of 2
-    /// 填充到最近2的幂次的执行步骤数 (Number of steps)
     pub num_steps: usize,
 
     /// Digest of verifier key
-    /// 验证密钥的摘要 (Digest)
     pub(crate) vk_digest: F,
 }
 
@@ -171,37 +164,5 @@ impl<F: JoltField> UniformSpartanKey<F> {
             digest
         };
         map_to_field(&hasher.finalize())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ark_bn254::Fr;
-
-    #[test]
-    fn test_digest_consistency() {
-        let num_steps = 1024;
-        let digest1 = UniformSpartanKey::<Fr>::digest(num_steps);
-        let digest2 = UniformSpartanKey::<Fr>::digest(num_steps);
-        assert_eq!(digest1, digest2, "Digest should be deterministic");
-    }
-
-    #[test]
-    fn test_digest_different_steps() {
-        let digest1 = UniformSpartanKey::<Fr>::digest(1024);
-        let digest2 = UniformSpartanKey::<Fr>::digest(2048);
-        assert_ne!(
-            digest1, digest2,
-            "Digest should differ for different num_steps"
-        );
-    }
-
-    #[test]
-    fn test_key_creation_sets_digest() {
-        let num_steps = 1024;
-        let key = UniformSpartanKey::<Fr>::new(num_steps);
-        let expected_digest = UniformSpartanKey::<Fr>::digest(num_steps);
-        assert_eq!(key.vk_digest, expected_digest);
     }
 }

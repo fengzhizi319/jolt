@@ -2,6 +2,7 @@ use crate::emulator::cpu::{Cpu, Xlen};
 use serde::{de::DeserializeOwned, Serialize};
 use std::fmt::Debug;
 
+pub mod format_advice_load_i;
 pub mod format_amo;
 pub mod format_assert_align;
 pub mod format_b;
@@ -34,6 +35,10 @@ pub trait InstructionFormat:
     fn capture_post_execution_state(&self, state: &mut Self::RegisterState, cpu: &mut Cpu);
     #[cfg(any(feature = "test-utils", test))]
     fn random(rng: &mut rand::rngs::StdRng) -> Self;
+
+    /// Overwrite the destination register. Default is a no-op for formats
+    /// without a destination register (branches, stores).
+    fn set_rd(&mut self, _rd: u8) {}
 }
 
 pub trait InstructionRegisterState:
@@ -52,7 +57,15 @@ pub trait InstructionRegisterState:
     }
 }
 
-pub fn normalize_register_value(value: i64, xlen: &Xlen) -> u64 {
+pub fn normalize_register_value(cpu: &Cpu, reg: usize) -> u64 {
+    let value = match reg {
+        0 => {
+            debug_assert_eq!(cpu.x[reg], 0);
+            0
+        }
+        _ => cpu.x[reg],
+    };
+    let xlen = cpu.xlen;
     match xlen {
         Xlen::Bit32 => value as u32 as u64,
         Xlen::Bit64 => value as u64,

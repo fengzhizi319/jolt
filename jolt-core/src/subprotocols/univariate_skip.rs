@@ -1,14 +1,21 @@
 use std::marker::PhantomData;
 
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use tracing::info;
+#[cfg(feature = "zk")]
+use rand_core::CryptoRngCore;
+
+use crate::curve::JoltCurve;
 use crate::field::JoltField;
+#[cfg(feature = "zk")]
+use crate::poly::commitment::pedersen::PedersenGenerators;
 use crate::poly::lagrange_poly::LagrangePolynomial;
+#[cfg(feature = "zk")]
+use crate::poly::opening_proof::OpeningId;
 use crate::poly::opening_proof::{ProverOpeningAccumulator, VerifierOpeningAccumulator};
 use crate::poly::unipoly::UniPoly;
 use crate::subprotocols::sumcheck_prover::SumcheckInstanceProver;
 use crate::subprotocols::sumcheck_verifier::SumcheckInstanceVerifier;
-use crate::transcripts::{AppendToTranscript, Transcript};
+use crate::transcripts::Transcript;
 use crate::utils::errors::ProofVerifyError;
 
 /// Returns the interleaved symmetric univariate-skip target indices outside the base window.
@@ -73,22 +80,6 @@ pub const fn uniskip_targets<const DOMAIN_SIZE: usize, const DEGREE: usize>() ->
 /// - tau_high: the challenge used in the Lagrange kernel L(τ_high, ·) over the base window.
 ///
 /// Returns: UniPoly s1 with exactly NUM_COEFFS coefficients.
-/// 构建 Uniskip 协议第一轮的单变量多项式。
-///
-/// 该函数主要执行以下步骤：
-/// 1.  **重构 T1 多项式的值域**：将基础评估值 (`base_evals`) 和扩展评估值 (`extended_evals`)
-///     合并到一个对称的扩展窗口中。这个窗口覆盖了 $[-DEGREE, DEGREE]$ 的整数点。
-/// 2.  **插值 T1**：将上述点值表示转换为系数表示，得到 $T_1(X)$ 的系数。
-/// 3.  **构建拉格朗日多项式**：计算在挑战点 `tau_high` 处的拉格朗日基函数值，并插值得到其系数表示。
-/// 4.  **多项式乘法（卷积）**：计算 $S_1(X) = \text{Lagrange}(X) \cdot T_1(X)$。
-///     在系数表示下，这通过系数的卷积来实现。
-///
-/// # 泛型参数
-/// * `F`: 域元素的类型 (Field Type)。
-/// * `DOMAIN_SIZE`: 基础求值域的大小。
-/// * `DEGREE`: 扩展窗口的一半大小，即窗口范围大约是 $[-DEGREE, DEGREE]$。
-/// * `EXTENDED_SIZE`: 扩展后用于插值 T1 的总点数，通常为 `2 * DEGREE + 1`。
-/// * `NUM_COEFFS`: 最终多项式的系数个数，等于两个多项式度数之和加 1。
 #[inline]
 pub fn build_uniskip_first_round_poly<
     F: JoltField,
@@ -97,139 +88,128 @@ pub fn build_uniskip_first_round_poly<
     const EXTENDED_SIZE: usize,
     const NUM_COEFFS: usize,
 >(
-    // 基础窗口内的评估值（可选）。如果为 None，则视为全 0。
-    // 这些值对应于以 0 为中心的对称小区间内的点。
     base_evals: Option<&[F; DOMAIN_SIZE]>,
-    // 扩展窗口的评估值。
-    // 这些是基础窗口之外的点，用于支持更高次数的插值。
     extended_evals: &[F; DEGREE],
-    // 来自验证者的随机挑战点 (High bits challenge)。
     tau_high: F::Challenge,
 ) -> UniPoly<F> {
-    // 编译时断言，确保泛型参数满足几何关系
-    // EXTENDED_SIZE 是 T1 多项式的点数，覆盖 [-DEGREE, DEGREE] 共 2*DEGREE + 1 个点
     debug_assert_eq!(EXTENDED_SIZE, 2 * DEGREE + 1);
-    // NUM_COEFFS 是最终多项式 S1 的系数个数。
-    // 它是 (DOMAIN_SIZE - 1) + (EXTENDED_SIZE - 1) + 1 的某种组合，这里简化为 3*DEGREE + 1
     debug_assert_eq!(NUM_COEFFS, 3 * DEGREE + 1);
 
-    // 1. 准备 T1 多项式的点值数据
-    // uniskip_targets 返回需要填充的扩展点的坐标索引
+    // Rebuild t1 on the full extended symmetric window
     let targets: [i64; DEGREE] = uniskip_targets::<DOMAIN_SIZE, DEGREE>();
-    // 初始化 T1 的值数组，大小为 EXTENDED_SIZE
     let mut t1_vals: [F; EXTENDED_SIZE] = [F::zero(); EXTENDED_SIZE];
 
-    // 填充基础窗口的评估值 (Base evaluations)
-    // 基础窗口通常是以 0 为中心对于称的，例如 [-1, 0, 1] 对应 DOMAIN_SIZE=3
+    // Fill in base window evaluations when provided (otherwise treated as zeros)
     if let Some(base) = base_evals {
-        // 计算基础窗口最左侧的坐标值
         let base_left: i64 = -((DOMAIN_SIZE as i64 - 1) / 2);
         for (i, &val) in base.iter().enumerate() {
-            // z 是实际的整数坐标
             let z = base_left + (i as i64);
-            // pos 是将坐标映射到数组索引 [0, EXTENDED_SIZE)。
-            // 映射方式是：index = coordinate + DEGREE。
-            // 因为 coordinate 最小是 -DEGREE，所以最小 index 为 0。
             let pos = (z + (DEGREE as i64)) as usize;
             t1_vals[pos] = val;
         }
     }
 
-    // 填充扩展评估值 (Extended evaluations)
-    // 这些点位于基础窗口之外
+    // Fill in extended evaluations (outside base window)
     for (idx, &val) in extended_evals.iter().enumerate() {
         let z = targets[idx];
         let pos = (z + (DEGREE as i64)) as usize;
         t1_vals[pos] = val;
     }
 
-    // 2. T1 插值：从点值形式转换到系数形式
-    // 这里将填充好的 t1_vals 视为在点 [-DEGREE, ..., DEGREE] 上的值进行插值
     let t1_coeffs = LagrangePolynomial::<F>::interpolate_coeffs::<EXTENDED_SIZE>(&t1_vals);
-
-    // 3. 构建与挑战点相关的拉格朗日多项式
-    // 计算拉格朗日基函数在 tau_high 处的值
     let lagrange_values = LagrangePolynomial::<F>::evals::<F::Challenge, DOMAIN_SIZE>(&tau_high);
-    // 将这些值插值为系数形式
     let lagrange_coeffs =
         LagrangePolynomial::<F>::interpolate_coeffs::<DOMAIN_SIZE>(&lagrange_values);
 
-    // 4. 计算多项式乘积 (卷积)
-    // S1(X) = Lagrange(X) * T1(X)
-    // 多项式乘法对应其系数向量的卷积
     let mut s1_coeffs: [F; NUM_COEFFS] = [F::zero(); NUM_COEFFS];
     for (i, &a) in lagrange_coeffs.iter().enumerate() {
         for (j, &b) in t1_coeffs.iter().enumerate() {
-            // 卷积公式：c[k] = sum(a[i] * b[j]) where i + j = k
             s1_coeffs[i + j] += a * b;
         }
     }
 
-    // 返回构建好的单变量多项式
     UniPoly::from_coeff(s1_coeffs.to_vec())
 }
 
-/// Univariate Skip 协议第一轮的 Prover 辅助函数。
-///
-/// 该函数执行 Sumcheck 协议第一轮（针对 Uni-skip 场景）的核心逻辑：
-/// 1. 获取输入声明（Input Claim）。
-/// 2. 计算第一轮的单变量多项式。
-/// 3. 将多项式提交到 Transcript 以进行 Fiat-Shamir 变换。
-/// 4. 获取验证者的随机挑战点 $r_0$。
-/// 5. 更新实例状态，为后续轮次做准备。
+/// Prove-only helper for a uni-skip first round instance (non-ZK mode).
+/// Produces the proof object, the uni-skip challenge r0, and the next claim s1(r0).
 pub fn prove_uniskip_round<F: JoltField, T: Transcript, I: SumcheckInstanceProver<F, T>>(
     instance: &mut I,
     opening_accumulator: &mut ProverOpeningAccumulator<F>,
     transcript: &mut T,
 ) -> UniSkipFirstRoundProof<F, T> {
-    // 1. 获取当前轮次的输入声明 (Input Claim)。
-    // 在 Sumcheck 协议开始时，这就是 Prover 声称的整个计算的总和 (Total Sum)。
-    // 如果这是递归步骤的一部分，它可能是上一层协议产生的 claim。
-    // opening_accumulator 负责管理这些声明的累加和验证状态。
     let input_claim = instance.input_claim(opening_accumulator);
-    info!("input_claim: {:?}", input_claim);
-
-    // 2. 计算当前轮次（UniSkip 轮）的单变量多项式 g(x)。
-    // 核心逻辑：
-    // Sumcheck 协议要求 Prover 将多变量多项式 P(x_1, ..., x_n) 在除 x_1 外的所有变量上求和，
-    // 得到一个单变量多项式 g(x_1) = \sum_{x_2...x_n} P(x_1, ..., x_n)。
-    //
-    // 在 Jolt 的 UniSkip 上下文中：
-    // 这个 g(x) 通常是一个高次多项式（Degree > 1）。
-    // 这里的 `compute_message` 会执行昂贵的“全量扫描”操作：
-    // 它会在特定的点（通常是域外的点，即 Extrapolated Points，如 -1, -2...）上评估 g(x)，
-    // 而不仅仅是计算系数。这利用了 Jolt 的高性能评估算法。
-    // 参数 `0` 通常指示这是 Sumcheck 的第一阶段或特定的 Skip 轮次索引。
     let uni_poly = instance.compute_message(0, input_claim);
-
-    // 3. 将计算出的单变量多项式 g(x) 提交到 Transcript。
-    // 这一步对应 Sumcheck 协议中 Prover 将 g(x) 发送给 Verifier。
-    // 实际上发送的是多项式在特定点上的评估值（Evaluations），或者是压缩后的系数。
-    // 这一步是 Fiat-Shamir 变换的一部分，用于让 Verifier (或 Transcript) 稍后生成随机挑战。
-    uni_poly.append_to_transcript(transcript);
-
-    // 4. 从 Transcript 中生成随机挑战点 r。
-    // 这是 Fiat-Shamir 启发式：模拟 Verifier 发送一个随机数 r (F::Challenge)。
-    // 这个 r 将被选为多项式第一个变量（或 UniSkip 这一批变量）的固定值。
+    // Append full polynomial and derive r0
+    transcript.append_scalars(b"uniskip_poly", &uni_poly.coeffs);
     let r0: F::Challenge = transcript.challenge_scalar_optimized::<F>();
-    info!("r0: {:?}", r0);
-
-    // 5. 更新实例状态：绑定变量并计算新的 Claim。
-    // 这一步非常关键，它完成了 Sumcheck 的状态转移：
-    // 1. Binding (绑定): 将多变量多项式中的对应变量固定为 r0。
-    //    (注意：在 UniSkip 中，这可能意味着一次性绑定了多个原始布尔变量，或者在一个扩展域上进行绑定)。
-    // 2. Evaluate (求值): 计算 g(r0)。
-    //    根据 Sumcheck 协议，g(r0) 将成为下一轮 Sumcheck 的目标声明 (Next Claim)。
-    // 3. Update (更新): 将 accumulator 更新为这个新值，准备进入下一阶段（例如常规的 Sumcheck 轮次或结束）。
-    //
-    // 或者处理高维度的折叠。本质是将问题规模缩小，并将验证责任转移到 g(r0) 上。
-    instance.cache_openings(opening_accumulator, transcript, &[r0]);
-
-    // 6. 构造并返回证明结构体。
-    // 这个 Proof 包含了一开始计算出的多项式 g(x)（通常是压缩形式或评估值形式）。
-    // Verifier 随后会利用这个 Proof 来执行自己的检查：
-    // 验证 g(0) + g(1) == input_claim，并计算 g(r0) 以推进验证。
+    instance.cache_openings(opening_accumulator, &[r0]);
+    opening_accumulator.flush_to_transcript(transcript);
     UniSkipFirstRoundProof::new(uni_poly)
+}
+
+/// ZK variant: commits to coefficients instead of revealing them.
+/// The polynomial coefficients are stored in the accumulator for BlindFold verification.
+#[cfg(feature = "zk")]
+pub fn prove_uniskip_round_zk<
+    F: JoltField,
+    C: JoltCurve,
+    T: Transcript,
+    I: SumcheckInstanceProver<F, T>,
+    R: CryptoRngCore,
+>(
+    instance: &mut I,
+    opening_accumulator: &mut ProverOpeningAccumulator<F>,
+    blindfold_accumulator: &mut crate::subprotocols::blindfold::BlindFoldAccumulator<F, C>,
+    transcript: &mut T,
+    pedersen_gens: &PedersenGenerators<C>,
+    rng: &mut R,
+) -> ZkUniSkipFirstRoundProof<F, C, T> {
+    use crate::subprotocols::blindfold::UniSkipStageData;
+
+    let input_claim = instance.input_claim(opening_accumulator);
+    let uni_poly = instance.compute_message(0, input_claim);
+    let poly_degree = uni_poly.degree();
+
+    let blinding = F::random(rng);
+    let commitment = pedersen_gens.commit(&uni_poly.coeffs, &blinding);
+
+    transcript.append_commitment(b"sumcheck_commitment", &commitment);
+
+    let r0: F::Challenge = transcript.challenge_scalar_optimized::<F>();
+    instance.cache_openings(opening_accumulator, &[r0]);
+
+    let output_claim_values = opening_accumulator.take_pending_claims();
+    let output_claim_ids = opening_accumulator.take_pending_claim_ids();
+    let oc_committed: Vec<_> = pedersen_gens.commit_chunked(&output_claim_values, rng);
+    let output_claims: Vec<(OpeningId, F)> = output_claim_ids
+        .into_iter()
+        .zip(output_claim_values)
+        .collect();
+    let output_claims_commitments: Vec<_> = oc_committed.iter().map(|(c, _)| *c).collect();
+    let output_claims_blindings: Vec<_> = oc_committed.iter().map(|(_, b)| *b).collect();
+    transcript.append_commitments(b"output_claims_coms", &output_claims_commitments);
+
+    let input_constraint = instance.get_params().input_claim_constraint();
+    let input_constraint_challenge_values = instance
+        .get_params()
+        .input_constraint_challenge_values(opening_accumulator);
+
+    blindfold_accumulator.push_uniskip_data(UniSkipStageData {
+        input_claim,
+        poly_coeffs: uni_poly.coeffs.clone(),
+        blinding_factor: blinding,
+        challenge: r0,
+        poly_degree,
+        commitment,
+        input_constraint,
+        input_constraint_challenge_values,
+        output_claims,
+        output_claims_blindings,
+        output_claims_commitments: output_claims_commitments.clone(),
+    });
+
+    ZkUniSkipFirstRoundProof::new(commitment, poly_degree, output_claims_commitments)
 }
 
 /// The sumcheck proof for a univariate skip round
@@ -249,18 +229,13 @@ impl<F: JoltField, T: Transcript> UniSkipFirstRoundProof<F, T> {
     }
 
     /// Verify only the univariate-skip first round.
-    ///
-    /// Params
-    /// - `const N`: the first degree plus one (e.g. the size of the first evaluation domain)
-    /// - `const FIRST_ROUND_POLY_NUM_COEFFS`: number of coefficients in the first-round polynomial
-    /// - `degree_bound_first`: Maximum allowed degree of the first univariate polynomial
-    /// - `transcript`: Fiat-Shamir transcript
+    /// Returns the challenge derived during verification.
     pub fn verify<const N: usize, const FIRST_ROUND_POLY_NUM_COEFFS: usize>(
         proof: &Self,
         sumcheck_instance: &dyn SumcheckInstanceVerifier<F, T>,
         opening_accumulator: &mut VerifierOpeningAccumulator<F>,
         transcript: &mut T,
-    ) -> Result<(), ProofVerifyError> {
+    ) -> Result<F::Challenge, ProofVerifyError> {
         let degree_bound = sumcheck_instance.degree();
         // Degree check for the high-degree first polynomial
         if proof.uni_poly.degree() > degree_bound {
@@ -271,7 +246,7 @@ impl<F: JoltField, T: Transcript> UniSkipFirstRoundProof<F, T> {
         }
 
         // Append full polynomial and derive r0
-        proof.uni_poly.append_to_transcript(transcript);
+        transcript.append_scalars(b"uniskip_poly", &proof.uni_poly.coeffs);
         let r0 = transcript.challenge_scalar_optimized::<F>();
 
         // Check symmetric-domain sum equals zero (initial claim), and compute next claim s1(r0)
@@ -279,12 +254,199 @@ impl<F: JoltField, T: Transcript> UniSkipFirstRoundProof<F, T> {
         let ok = proof
             .uni_poly
             .check_sum_evals::<N, FIRST_ROUND_POLY_NUM_COEFFS>(input_claim);
-        sumcheck_instance.cache_openings(opening_accumulator, transcript, &[r0]);
+        sumcheck_instance.cache_openings(opening_accumulator, &[r0]);
+        opening_accumulator.flush_to_transcript(transcript);
 
         if !ok {
             Err(ProofVerifyError::UniSkipVerificationError)
         } else {
-            Ok(())
+            Ok(r0)
+        }
+    }
+}
+
+/// ZK variant of uni-skip first round proof.
+/// Contains only the Pedersen commitment to polynomial coefficients.
+/// Actual verification is deferred to BlindFold R1CS.
+#[derive(Debug, Clone)]
+pub struct ZkUniSkipFirstRoundProof<F: JoltField, C: JoltCurve, T: Transcript> {
+    pub commitment: C::G1,
+    pub poly_degree: usize,
+    /// Pedersen commitments to output claims, chunked to fit generator count
+    pub output_claims_commitments: Vec<C::G1>,
+    _marker: PhantomData<(F, T)>,
+}
+
+impl<F: JoltField, C: JoltCurve, T: Transcript> ZkUniSkipFirstRoundProof<F, C, T> {
+    pub fn new(
+        commitment: C::G1,
+        poly_degree: usize,
+        output_claims_commitments: Vec<C::G1>,
+    ) -> Self {
+        Self {
+            commitment,
+            poly_degree,
+            output_claims_commitments,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Verify transcript consistency only.
+    /// The actual polynomial verification (sum check + evaluation) is done by BlindFold.
+    pub fn verify_transcript<I: SumcheckInstanceVerifier<F, T>>(
+        &self,
+        sumcheck_instance: &I,
+        opening_accumulator: &mut VerifierOpeningAccumulator<F>,
+        transcript: &mut T,
+    ) -> Result<F::Challenge, ProofVerifyError> {
+        let degree_bound = sumcheck_instance.degree();
+        if self.poly_degree > degree_bound {
+            return Err(ProofVerifyError::InvalidInputLength(
+                degree_bound,
+                self.poly_degree,
+            ));
+        }
+
+        transcript.append_commitment(b"sumcheck_commitment", &self.commitment);
+
+        let r0: F::Challenge = transcript.challenge_scalar_optimized::<F>();
+        sumcheck_instance.cache_openings(opening_accumulator, &[r0]);
+
+        transcript.append_commitments(b"output_claims_coms", &self.output_claims_commitments);
+        opening_accumulator.take_pending_claims();
+
+        Ok(r0)
+    }
+}
+
+impl<F: JoltField, C: JoltCurve, T: Transcript> CanonicalSerialize
+    for ZkUniSkipFirstRoundProof<F, C, T>
+{
+    fn serialize_with_mode<W: std::io::Write>(
+        &self,
+        mut writer: W,
+        compress: ark_serialize::Compress,
+    ) -> Result<(), ark_serialize::SerializationError> {
+        self.commitment.serialize_with_mode(&mut writer, compress)?;
+        self.poly_degree
+            .serialize_with_mode(&mut writer, compress)?;
+        self.output_claims_commitments
+            .serialize_with_mode(writer, compress)
+    }
+
+    fn serialized_size(&self, compress: ark_serialize::Compress) -> usize {
+        self.commitment.serialized_size(compress)
+            + self.poly_degree.serialized_size(compress)
+            + self.output_claims_commitments.serialized_size(compress)
+    }
+}
+
+impl<F: JoltField, C: JoltCurve, T: Transcript> CanonicalDeserialize
+    for ZkUniSkipFirstRoundProof<F, C, T>
+{
+    fn deserialize_with_mode<R: std::io::Read>(
+        mut reader: R,
+        compress: ark_serialize::Compress,
+        validate: ark_serialize::Validate,
+    ) -> Result<Self, ark_serialize::SerializationError> {
+        let commitment = C::G1::deserialize_with_mode(&mut reader, compress, validate)?;
+        let poly_degree = usize::deserialize_with_mode(&mut reader, compress, validate)?;
+        let output_claims_commitments =
+            Vec::<C::G1>::deserialize_with_mode(reader, compress, validate)?;
+        Ok(Self::new(
+            commitment,
+            poly_degree,
+            output_claims_commitments,
+        ))
+    }
+}
+
+impl<F: JoltField, C: JoltCurve, T: Transcript> ark_serialize::Valid
+    for ZkUniSkipFirstRoundProof<F, C, T>
+{
+    fn check(&self) -> Result<(), ark_serialize::SerializationError> {
+        self.commitment.check()?;
+        self.output_claims_commitments.check()
+    }
+}
+
+/// Unified proof enum for uni-skip first round (similar to SumcheckInstanceProof).
+#[derive(Debug, Clone)]
+pub enum UniSkipFirstRoundProofVariant<F: JoltField, C: JoltCurve, T: Transcript> {
+    Standard(UniSkipFirstRoundProof<F, T>),
+    Zk(ZkUniSkipFirstRoundProof<F, C, T>),
+}
+
+impl<F: JoltField, C: JoltCurve, T: Transcript> UniSkipFirstRoundProofVariant<F, C, T> {
+    /// Returns the polynomial degree for BlindFold R1CS configuration.
+    pub fn poly_degree(&self) -> usize {
+        match self {
+            Self::Standard(p) => p.uni_poly.degree(),
+            Self::Zk(p) => p.poly_degree,
+        }
+    }
+}
+
+impl<F: JoltField, C: JoltCurve, T: Transcript> CanonicalSerialize
+    for UniSkipFirstRoundProofVariant<F, C, T>
+{
+    fn serialize_with_mode<W: std::io::Write>(
+        &self,
+        mut writer: W,
+        compress: ark_serialize::Compress,
+    ) -> Result<(), ark_serialize::SerializationError> {
+        match self {
+            Self::Standard(proof) => {
+                0u8.serialize_with_mode(&mut writer, compress)?;
+                proof.serialize_with_mode(writer, compress)
+            }
+            Self::Zk(proof) => {
+                1u8.serialize_with_mode(&mut writer, compress)?;
+                proof.serialize_with_mode(writer, compress)
+            }
+        }
+    }
+
+    fn serialized_size(&self, compress: ark_serialize::Compress) -> usize {
+        1 + match self {
+            Self::Standard(proof) => proof.serialized_size(compress),
+            Self::Zk(proof) => proof.serialized_size(compress),
+        }
+    }
+}
+
+impl<F: JoltField, C: JoltCurve, T: Transcript> CanonicalDeserialize
+    for UniSkipFirstRoundProofVariant<F, C, T>
+{
+    fn deserialize_with_mode<R: std::io::Read>(
+        mut reader: R,
+        compress: ark_serialize::Compress,
+        validate: ark_serialize::Validate,
+    ) -> Result<Self, ark_serialize::SerializationError> {
+        let variant = u8::deserialize_with_mode(&mut reader, compress, validate)?;
+        match variant {
+            0 => {
+                let proof =
+                    UniSkipFirstRoundProof::deserialize_with_mode(reader, compress, validate)?;
+                Ok(Self::Standard(proof))
+            }
+            1 => {
+                let proof =
+                    ZkUniSkipFirstRoundProof::deserialize_with_mode(reader, compress, validate)?;
+                Ok(Self::Zk(proof))
+            }
+            _ => Err(ark_serialize::SerializationError::InvalidData),
+        }
+    }
+}
+
+impl<F: JoltField, C: JoltCurve, T: Transcript> ark_serialize::Valid
+    for UniSkipFirstRoundProofVariant<F, C, T>
+{
+    fn check(&self) -> Result<(), ark_serialize::SerializationError> {
+        match self {
+            Self::Standard(p) => p.check(),
+            Self::Zk(p) => p.check(),
         }
     }
 }

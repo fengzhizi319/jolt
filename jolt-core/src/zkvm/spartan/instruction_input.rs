@@ -4,19 +4,29 @@ use allocative::Allocative;
 use rayon::prelude::*;
 use tracer::instruction::Cycle;
 
+#[cfg(feature = "zk")]
+use crate::poly::opening_proof::OpeningId;
+#[cfg(feature = "zk")]
+use crate::subprotocols::blindfold::{
+    InputClaimConstraint, OutputClaimConstraint, ProductTerm, ValueSource,
+};
 use crate::{
     field::JoltField,
     poly::{
         eq_poly::EqPolynomial,
         multilinear_polynomial::{BindingOrder, MultilinearPolynomial, PolynomialBinding},
         opening_proof::{
-            OpeningAccumulator, OpeningPoint, ProverOpeningAccumulator, SumcheckId,
+            OpeningAccumulator, OpeningPoint, PolynomialId, ProverOpeningAccumulator, SumcheckId,
             VerifierOpeningAccumulator, BIG_ENDIAN, LITTLE_ENDIAN,
         },
         split_eq_poly::GruenSplitEqPolynomial,
         unipoly::UniPoly,
     },
     subprotocols::{
+        sumcheck_claim::{
+            CachedPointRef, ChallengePart, Claim, ClaimExpr, InputOutputClaims, SumcheckFrontend,
+            VerifierEvaluablePolynomial,
+        },
         sumcheck_prover::SumcheckInstanceProver,
         sumcheck_verifier::{SumcheckInstanceParams, SumcheckInstanceVerifier},
     },
@@ -32,7 +42,6 @@ const DEGREE_BOUND: usize = 3;
 
 #[derive(Allocative, Clone)]
 pub struct InstructionInputParams<F: JoltField> {
-    pub r_cycle_stage_1: OpeningPoint<BIG_ENDIAN, F>,
     pub r_cycle_stage_2: OpeningPoint<BIG_ENDIAN, F>,
     pub gamma: F,
 }
@@ -42,17 +51,12 @@ impl<F: JoltField> InstructionInputParams<F> {
         opening_accumulator: &dyn OpeningAccumulator<F>,
         transcript: &mut impl Transcript,
     ) -> Self {
-        let (r_cycle_stage_1, _) = opening_accumulator.get_virtual_polynomial_opening(
-            VirtualPolynomial::LeftInstructionInput,
-            SumcheckId::SpartanOuter,
-        );
         let (r_cycle_stage_2, _) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::LeftInstructionInput,
             SumcheckId::SpartanProductVirtualization,
         );
         let gamma = transcript.challenge_scalar();
         Self {
-            r_cycle_stage_1,
             r_cycle_stage_2,
             gamma,
         }
@@ -65,31 +69,40 @@ impl<F: JoltField> SumcheckInstanceParams<F> for InstructionInputParams<F> {
     }
 
     fn num_rounds(&self) -> usize {
-        self.r_cycle_stage_1.len()
+        self.r_cycle_stage_2.len()
     }
 
     fn input_claim(&self, accumulator: &dyn OpeningAccumulator<F>) -> F {
-        let (_, left_claim_stage_1) = accumulator.get_virtual_polynomial_opening(
-            VirtualPolynomial::LeftInstructionInput,
-            SumcheckId::SpartanOuter,
-        );
-        let (_, right_claim_stage_1) = accumulator.get_virtual_polynomial_opening(
-            VirtualPolynomial::RightInstructionInput,
-            SumcheckId::SpartanOuter,
-        );
-        let (_, left_claim_stage_2) = accumulator.get_virtual_polynomial_opening(
-            VirtualPolynomial::LeftInstructionInput,
-            SumcheckId::SpartanProductVirtualization,
-        );
-        let (_, right_claim_stage_2) = accumulator.get_virtual_polynomial_opening(
-            VirtualPolynomial::RightInstructionInput,
-            SumcheckId::SpartanProductVirtualization,
-        );
+        let (r_left_claim_instruction, left_claim_instruction) = accumulator
+            .get_virtual_polynomial_opening(
+                VirtualPolynomial::LeftInstructionInput,
+                SumcheckId::InstructionClaimReduction,
+            );
+        let (r_right_claim_instruction, right_claim_instruction) = accumulator
+            .get_virtual_polynomial_opening(
+                VirtualPolynomial::RightInstructionInput,
+                SumcheckId::InstructionClaimReduction,
+            );
 
-        let claim_stage_1 = right_claim_stage_1 + self.gamma * left_claim_stage_1;
-        let claim_stage_2 = right_claim_stage_2 + self.gamma * left_claim_stage_2;
+        let (r_left_claim_stage_2, left_claim_stage_2) = accumulator
+            .get_virtual_polynomial_opening(
+                VirtualPolynomial::LeftInstructionInput,
+                SumcheckId::SpartanProductVirtualization,
+            );
+        let (r_right_claim_stage_2, right_claim_stage_2) = accumulator
+            .get_virtual_polynomial_opening(
+                VirtualPolynomial::RightInstructionInput,
+                SumcheckId::SpartanProductVirtualization,
+            );
 
-        claim_stage_1 + self.gamma.square() * claim_stage_2
+        // Soundness: InstructionClaimReduction and SpartanProductVirtualization must produce
+        // the same claims at the same opening points.
+        assert_eq!(r_left_claim_instruction, r_left_claim_stage_2);
+        assert_eq!(left_claim_instruction, left_claim_stage_2);
+        assert_eq!(r_right_claim_instruction, r_right_claim_stage_2);
+        assert_eq!(right_claim_instruction, right_claim_stage_2);
+
+        right_claim_stage_2 + self.gamma * left_claim_stage_2
     }
 
     fn normalize_opening_point(
@@ -98,9 +111,111 @@ impl<F: JoltField> SumcheckInstanceParams<F> for InstructionInputParams<F> {
     ) -> OpeningPoint<BIG_ENDIAN, F> {
         OpeningPoint::<LITTLE_ENDIAN, F>::new(sumcheck_challenges.to_vec()).match_endianness()
     }
+
+    #[cfg(feature = "zk")]
+    fn input_claim_constraint(&self) -> InputClaimConstraint {
+        InputClaimConstraint::weighted_openings(&[
+            OpeningId::virt(
+                VirtualPolynomial::RightInstructionInput,
+                SumcheckId::SpartanProductVirtualization,
+            ),
+            OpeningId::virt(
+                VirtualPolynomial::LeftInstructionInput,
+                SumcheckId::SpartanProductVirtualization,
+            ),
+        ])
+    }
+
+    #[cfg(feature = "zk")]
+    fn input_constraint_challenge_values(&self, _: &dyn OpeningAccumulator<F>) -> Vec<F> {
+        vec![self.gamma]
+    }
+
+    #[cfg(feature = "zk")]
+    fn output_claim_constraint(&self) -> Option<OutputClaimConstraint> {
+        // expected_output_claim = E2 * (right_input + γ * left_input)
+        // where:
+        //   left_input = left_is_rs1 * rs1_value + left_is_pc * unexpanded_pc
+        //   right_input = right_is_rs2 * rs2_value + right_is_imm * imm
+        //
+        // Challenges:
+        // - Challenge(0) = E2
+        // - Challenge(1) = γ * E2
+
+        let left_is_rs1 = OpeningId::virt(
+            VirtualPolynomial::InstructionFlags(InstructionFlags::LeftOperandIsRs1Value),
+            SumcheckId::InstructionInputVirtualization,
+        );
+        let rs1_value = OpeningId::virt(
+            VirtualPolynomial::Rs1Value,
+            SumcheckId::InstructionInputVirtualization,
+        );
+        let left_is_pc = OpeningId::virt(
+            VirtualPolynomial::InstructionFlags(InstructionFlags::LeftOperandIsPC),
+            SumcheckId::InstructionInputVirtualization,
+        );
+        let unexpanded_pc = OpeningId::virt(
+            VirtualPolynomial::UnexpandedPC,
+            SumcheckId::InstructionInputVirtualization,
+        );
+        let right_is_rs2 = OpeningId::virt(
+            VirtualPolynomial::InstructionFlags(InstructionFlags::RightOperandIsRs2Value),
+            SumcheckId::InstructionInputVirtualization,
+        );
+        let rs2_value = OpeningId::virt(
+            VirtualPolynomial::Rs2Value,
+            SumcheckId::InstructionInputVirtualization,
+        );
+        let right_is_imm = OpeningId::virt(
+            VirtualPolynomial::InstructionFlags(InstructionFlags::RightOperandIsImm),
+            SumcheckId::InstructionInputVirtualization,
+        );
+        let imm = OpeningId::virt(
+            VirtualPolynomial::Imm,
+            SumcheckId::InstructionInputVirtualization,
+        );
+
+        let e2 = ValueSource::Challenge(0);
+        let gamma_e2 = ValueSource::Challenge(1);
+
+        let terms = vec![
+            // E2 * right_is_rs2 * rs2_value
+            ProductTerm::product(vec![
+                e2.clone(),
+                ValueSource::Opening(right_is_rs2),
+                ValueSource::Opening(rs2_value),
+            ]),
+            // E2 * right_is_imm * imm
+            ProductTerm::product(vec![
+                e2,
+                ValueSource::Opening(right_is_imm),
+                ValueSource::Opening(imm),
+            ]),
+            // γ*E2 * left_is_rs1 * rs1_value
+            ProductTerm::product(vec![
+                gamma_e2.clone(),
+                ValueSource::Opening(left_is_rs1),
+                ValueSource::Opening(rs1_value),
+            ]),
+            // γ*E2 * left_is_pc * unexpanded_pc
+            ProductTerm::product(vec![
+                gamma_e2,
+                ValueSource::Opening(left_is_pc),
+                ValueSource::Opening(unexpanded_pc),
+            ]),
+        ];
+
+        Some(OutputClaimConstraint::sum_of_products(terms))
+    }
+
+    #[cfg(feature = "zk")]
+    fn output_constraint_challenge_values(&self, sumcheck_challenges: &[F::Challenge]) -> Vec<F> {
+        let r = self.normalize_opening_point(sumcheck_challenges);
+        let e2 = EqPolynomial::mle_endian(&r, &self.r_cycle_stage_2);
+        vec![e2, self.gamma * e2]
+    }
 }
 
-/// Sumcheck prover for [`InstructionInputSumcheckVerifier`].
 // TODO: do 3 round compression SVO on each of the 8 multilinears, then bind directly
 #[derive(Allocative)]
 pub struct InstructionInputSumcheckProver<F: JoltField> {
@@ -112,12 +227,7 @@ pub struct InstructionInputSumcheckProver<F: JoltField> {
     rs2_value_poly: MultilinearPolynomial<F>,
     imm_poly: MultilinearPolynomial<F>,
     unexpanded_pc_poly: MultilinearPolynomial<F>,
-    eq_r_cycle_stage_1: GruenSplitEqPolynomial<F>,
     eq_r_cycle_stage_2: GruenSplitEqPolynomial<F>,
-    prev_claim_stage_1: F,
-    prev_claim_stage_2: F,
-    prev_round_poly_stage_1: Option<UniPoly<F>>,
-    prev_round_poly_stage_2: Option<UniPoly<F>>,
     pub params: InstructionInputParams<F>,
 }
 
@@ -126,28 +236,9 @@ impl<F: JoltField> InstructionInputSumcheckProver<F> {
     pub fn initialize(
         params: InstructionInputParams<F>,
         trace: &[Cycle],
-        opening_accumulator: &ProverOpeningAccumulator<F>,
+        _opening_accumulator: &ProverOpeningAccumulator<F>,
     ) -> Self {
-        // ========================================================================
-        // 1. 计算多线性扩展 (Compute MLEs) - 数据准备阶段
-        // ========================================================================
-        // [算法原理: Multilinear Extension (MLE) Construction]
-        // 我们将 Trace 表中的每一列视为一个多线性多项式的评估值向量。
-        // 这里初始化了 8 个列向量，它们构成了 "多路复用器 (MUX)" 电路的输入信号。
-        //
-        // 左操作数 (Left Input) 的候选项：
-        // - left_is_rs1_poly: 标志位，为真表示左输入应来自 RS1 寄存器。
-        // - left_is_pc_poly:  标志位，为真表示左输入应来自 PC (如 JAL 指令)。
-        //
-        // 右操作数 (Right Input) 的候选项：
-        // - right_is_rs2_poly: 标志位，为真表示右输入应来自 RS2 寄存器。
-        // - right_is_imm_poly: 标志位，为真表示右输入应来自立即数 (Immediate)。
-        //
-        // 实际数值数据：
-        // - rs1_value_poly: Trace 中每一行 RS1 寄存器里的实际值。
-        // - rs2_value_poly: Trace 中每一行 RS2 寄存器里的实际值。
-        // - imm_poly:       Trace 中每一行指令解码出的立即数值。
-        // - unexpanded_pc_poly: Trace 中每一行的 PC 值。
+        // Compute MLEs.
         let mut left_is_rs1_poly = vec![false; trace.len()];
         let mut left_is_pc_poly = vec![false; trace.len()];
         let mut right_is_rs2_poly = vec![false; trace.len()];
@@ -156,9 +247,6 @@ impl<F: JoltField> InstructionInputSumcheckProver<F> {
         let mut rs2_value_poly = vec![0; trace.len()];
         let mut imm_poly = vec![0; trace.len()];
         let mut unexpanded_pc_poly = vec![0; trace.len()];
-
-        // [算法原理: Parallel Data Processing]
-        // 使用 Rayon 并行迭代 Trace，填充上述向量。这是构建证明系统中最耗时的步骤之一(O(N))。
         (
             &mut left_is_rs1_poly,
             &mut left_is_pc_poly,
@@ -173,32 +261,23 @@ impl<F: JoltField> InstructionInputSumcheckProver<F> {
             .into_par_iter()
             .for_each(
                 |(
-                     left_is_rs1_eval,
-                     left_is_pc_eval,
-                     right_is_rs2_eval,
-                     right_is_imm_eval,
-                     rs1_value_eval,
-                     rs2_value_eval,
-                     imm_eval,
-                     unexpanded_pc_eval,
-                     cycle,
-                 )| {
-                    // 解码当前行的指令
+                    left_is_rs1_eval,
+                    left_is_pc_eval,
+                    right_is_rs2_eval,
+                    right_is_imm_eval,
+                    rs1_value_eval,
+                    rs2_value_eval,
+                    imm_eval,
+                    unexpanded_pc_eval,
+                    cycle,
+                )| {
                     let instruction = cycle.instruction();
                     let instruction_norm = instruction.normalize();
-
-                    // [约束逻辑来源] 获取指令的标志位 (Flags)。
-                    // 比如 ADD 指令会设置 Left=Rs1, Right=Rs2。
-                    // 而 ADDI 指令会设置 Left=Rs1, Right=Imm。
                     let flags = instruction.instruction_flags();
-
-                    // 填充选择器 (Selectors)
                     *left_is_rs1_eval = flags[InstructionFlags::LeftOperandIsRs1Value];
                     *left_is_pc_eval = flags[InstructionFlags::LeftOperandIsPC];
                     *right_is_rs2_eval = flags[InstructionFlags::RightOperandIsRs2Value];
                     *right_is_imm_eval = flags[InstructionFlags::RightOperandIsImm];
-
-                    // 填充源数据 (Source Data)
                     *rs1_value_eval = cycle.rs1_read().unwrap_or_default().1;
                     *rs2_value_eval = cycle.rs2_read().unwrap_or_default().1;
                     *imm_eval = instruction_norm.operands.imm;
@@ -206,56 +285,10 @@ impl<F: JoltField> InstructionInputSumcheckProver<F> {
                 },
             );
 
-        // ========================================================================
-        // 2. 初始化 Eq 多项式 (Eq Polynomials)
-        // ========================================================================
-        // [算法原理: Split Sumcheck / Tensor Product]
-        // 这里的 GruenSplitEqPolynomial 是一种优化的 Eq 多项式实现。
-        // Stage 1 和 Stage 2 可能会有不同的随机挑战点 r_cycle。
-        // 这些 Eq 多项式用于后续 Sumcheck 中绑定特定的随机行。
-        let eq_r_cycle_stage_1 =
-            GruenSplitEqPolynomial::new(&params.r_cycle_stage_1.r, BindingOrder::LowToHigh);
         let eq_r_cycle_stage_2 =
             GruenSplitEqPolynomial::new(&params.r_cycle_stage_2.r, BindingOrder::LowToHigh);
 
-        // ========================================================================
-        // 3. 提取 Claim 并进行线性组合 (Claims & RLC)
-        // ========================================================================
-        // [算法原理: Fiat-Shamir / Random Linear Combination]
-        //
-        // 这里的逻辑是：
-        // Stage 1 (Outer) 和 Stage 2 (Product) 已经运行完毕。
-        // 它们宣称："我在处理第 r 行时，使用的 LeftInput 是 L，RightInput 是 R"。
-        //
-        // Stage 3 必须证明："你用的这个 L 和 R，确实符合指令 MUX 的逻辑"。
-        //
-        // 为了节省证明成本，我们将 Left 和 Right 的 Claim 用 gamma 混合：
-        // CombinedClaim = RightClaim + gamma * LeftClaim
-        //
-        // 这样我们只需要证明一个组合后的等式，而不是两个。
-        let (_, left_claim_stage_1) = opening_accumulator.get_virtual_polynomial_opening(
-            VirtualPolynomial::LeftInstructionInput,
-            SumcheckId::SpartanOuter,
-        );
-        let (_, right_claim_stage_1) = opening_accumulator.get_virtual_polynomial_opening(
-            VirtualPolynomial::RightInstructionInput,
-            SumcheckId::SpartanOuter,
-        );
-        let (_, left_claim_stage_2) = opening_accumulator.get_virtual_polynomial_opening(
-            VirtualPolynomial::LeftInstructionInput,
-            SumcheckId::SpartanProductVirtualization,
-        );
-        let (_, right_claim_stage_2) = opening_accumulator.get_virtual_polynomial_opening(
-            VirtualPolynomial::RightInstructionInput,
-            SumcheckId::SpartanProductVirtualization,
-        );
-
-        // 构造组合后的 Claim
-        let claim_stage_1 = right_claim_stage_1 + params.gamma * left_claim_stage_1;
-        let claim_stage_2 = right_claim_stage_2 + params.gamma * left_claim_stage_2;
-
         Self {
-            // 将 Rust 的 Vec 转换为域元素的向量，准备用于证明
             left_is_rs1_poly: left_is_rs1_poly.into(),
             left_is_pc_poly: left_is_pc_poly.into(),
             right_is_rs2_poly: right_is_rs2_poly.into(),
@@ -264,12 +297,7 @@ impl<F: JoltField> InstructionInputSumcheckProver<F> {
             rs2_value_poly: rs2_value_poly.into(),
             imm_poly: imm_poly.into(),
             unexpanded_pc_poly: unexpanded_pc_poly.into(),
-            eq_r_cycle_stage_1,
             eq_r_cycle_stage_2,
-            prev_claim_stage_1: claim_stage_1,
-            prev_claim_stage_2: claim_stage_2,
-            prev_round_poly_stage_1: None,
-            prev_round_poly_stage_2: None,
             params,
         }
     }
@@ -283,130 +311,82 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
     }
 
     #[tracing::instrument(skip_all, name = "InstructionInputSumcheckProver::compute_message")]
-    fn compute_message(&mut self, _round: usize, _previous_claim: F) -> UniPoly<F> {
-        // Lockstep requirement: the two split-eq polynomials must have identical split sizes
-        debug_assert_eq!(
-            self.eq_r_cycle_stage_1.E_out_current_len(),
-            self.eq_r_cycle_stage_2.E_out_current_len(),
-            "eq_r_cycle_stage_1 and eq_r_cycle_stage_2 must have same E_out length"
-        );
-        debug_assert_eq!(
-            self.eq_r_cycle_stage_1.E_in_current_len(),
-            self.eq_r_cycle_stage_2.E_in_current_len(),
-            "eq_r_cycle_stage_1 and eq_r_cycle_stage_2 must have same E_in length"
-        );
+    fn compute_message(&mut self, _round: usize, previous_claim: F) -> UniPoly<F> {
+        let [eval_at_0, eval_at_inf] = self
+            .eq_r_cycle_stage_2
+            .par_fold_out_in(
+                || [F::UnreducedProductAccum::zero(); 2],
+                |inner, j, _x_in, e_in| {
+                    // Eval RightInstructionInputIsRs2(x) at (r', j, {0, inf}).
+                    let right_is_rs2_at_j_0 = self.right_is_rs2_poly.get_bound_coeff(j * 2);
+                    let right_is_rs2_at_j_inf =
+                        self.right_is_rs2_poly.get_bound_coeff(j * 2 + 1) - right_is_rs2_at_j_0;
+                    // Eval Rs2Value(x) at (r', j, {0, inf}).
+                    let rs2_value_at_j_0 = self.rs2_value_poly.get_bound_coeff(j * 2);
+                    let rs2_value_at_j_inf =
+                        self.rs2_value_poly.get_bound_coeff(j * 2 + 1) - rs2_value_at_j_0;
+                    // Eval RightInstructionInputIsImm(x) at (r', j, {0, inf}).
+                    let right_is_imm_at_j_0 = self.right_is_imm_poly.get_bound_coeff(j * 2);
+                    let right_is_imm_at_j_inf =
+                        self.right_is_imm_poly.get_bound_coeff(j * 2 + 1) - right_is_imm_at_j_0;
+                    // Eval Imm(x) at (r', j, {0, inf}).
+                    let imm_at_j_0 = self.imm_poly.get_bound_coeff(j * 2);
+                    let imm_at_j_inf = self.imm_poly.get_bound_coeff(j * 2 + 1) - imm_at_j_0;
+                    // Eval RightInstructionInput(x) at (r', j, {0, inf}).
+                    let right_at_j_0 =
+                        right_is_rs2_at_j_0 * rs2_value_at_j_0 + right_is_imm_at_j_0 * imm_at_j_0;
+                    let right_at_j_inf = right_is_rs2_at_j_inf * rs2_value_at_j_inf
+                        + right_is_imm_at_j_inf * imm_at_j_inf;
 
-        let e_out_stage_2 = self.eq_r_cycle_stage_2.E_out_current();
-        let e_in_stage_2 = self.eq_r_cycle_stage_2.E_in_current();
+                    // Eval LeftInstructionInputIsRs1(x) at (r', j, {0, inf}).
+                    let left_is_rs1_at_j_0 = self.left_is_rs1_poly.get_bound_coeff(j * 2);
+                    let left_is_rs1_at_j_inf =
+                        self.left_is_rs1_poly.get_bound_coeff(j * 2 + 1) - left_is_rs1_at_j_0;
+                    // Eval Rs1Value(x) at (r', j, {0, inf}).
+                    let rs1_value_at_j_0 = self.rs1_value_poly.get_bound_coeff(j * 2);
+                    let rs1_value_at_j_inf =
+                        self.rs1_value_poly.get_bound_coeff(j * 2 + 1) - rs1_value_at_j_0;
+                    // Eval LeftInstructionInputIsPc(x) at (r', j, {0, inf}).
+                    let left_is_pc_at_j_0 = self.left_is_pc_poly.get_bound_coeff(j * 2);
+                    let left_is_pc_at_j_inf =
+                        self.left_is_pc_poly.get_bound_coeff(j * 2 + 1) - left_is_pc_at_j_0;
+                    // Eval UnexpandedPc(x) at (r', j, {0, inf}).
+                    let unexpanded_pc_at_j_0 = self.unexpanded_pc_poly.get_bound_coeff(j * 2);
+                    let unexpanded_pc_at_j_inf =
+                        self.unexpanded_pc_poly.get_bound_coeff(j * 2 + 1) - unexpanded_pc_at_j_0;
+                    // Eval LeftInstructionInput(x) at (r', {0, inf}, j).
+                    let left_at_j_0 = left_is_rs1_at_j_0 * rs1_value_at_j_0
+                        + left_is_pc_at_j_0 * unexpanded_pc_at_j_0;
+                    let left_at_j_inf = left_is_rs1_at_j_inf * rs1_value_at_j_inf
+                        + left_is_pc_at_j_inf * unexpanded_pc_at_j_inf;
 
-        // Fold over stage 1's split-eq; use indices to access stage 2's corresponding weights
-        let [eval_at_0_for_stage_1, eval_at_inf_for_stage_1, eval_at_0_for_stage_2, eval_at_inf_for_stage_2] =
-            self.eq_r_cycle_stage_1
-                .par_fold_out_in(
-                    || [F::Unreduced::<9>::zero(); 4],
-                    |inner, j, x_in, e_in1| {
-                        // Eval RightInstructionInputIsRs2(x) at (r', j, {0, inf}).
-                        let right_is_rs2_at_j_0 = self.right_is_rs2_poly.get_bound_coeff(j * 2);
-                        let right_is_rs2_at_j_inf =
-                            self.right_is_rs2_poly.get_bound_coeff(j * 2 + 1) - right_is_rs2_at_j_0;
-                        // Eval Rs2Value(x) at (r', j, {0, inf}).
-                        let rs2_value_at_j_0 = self.rs2_value_poly.get_bound_coeff(j * 2);
-                        let rs2_value_at_j_inf =
-                            self.rs2_value_poly.get_bound_coeff(j * 2 + 1) - rs2_value_at_j_0;
-                        // Eval RightInstructionInputIsImm(x) at (r', j, {0, inf}).
-                        let right_is_imm_at_j_0 = self.right_is_imm_poly.get_bound_coeff(j * 2);
-                        let right_is_imm_at_j_inf =
-                            self.right_is_imm_poly.get_bound_coeff(j * 2 + 1) - right_is_imm_at_j_0;
-                        // Eval Imm(x) at (r', j, {0, inf}).
-                        let imm_at_j_0 = self.imm_poly.get_bound_coeff(j * 2);
-                        let imm_at_j_inf = self.imm_poly.get_bound_coeff(j * 2 + 1) - imm_at_j_0;
-                        // Eval RightInstructionInput(x) at (r', j, {0, inf}).
-                        let right_at_j_0 = right_is_rs2_at_j_0 * rs2_value_at_j_0
-                            + right_is_imm_at_j_0 * imm_at_j_0;
-                        let right_at_j_inf = right_is_rs2_at_j_inf * rs2_value_at_j_inf
-                            + right_is_imm_at_j_inf * imm_at_j_inf;
+                    // Eval Input(x) = RightInstructionInput(x) + gamma * LeftInstructionInput(x) at (r', {0, inf}, j).
+                    let input_at_j_0 = right_at_j_0 + self.params.gamma * left_at_j_0;
+                    let input_at_j_inf = right_at_j_inf + self.params.gamma * left_at_j_inf;
 
-                        // Eval LeftInstructionInputIsRs1(x) at (r', j, {0, inf}).
-                        let left_is_rs1_at_j_0 = self.left_is_rs1_poly.get_bound_coeff(j * 2);
-                        let left_is_rs1_at_j_inf =
-                            self.left_is_rs1_poly.get_bound_coeff(j * 2 + 1) - left_is_rs1_at_j_0;
-                        // Eval Rs1Value(x) at (r', j, {0, inf}).
-                        let rs1_value_at_j_0 = self.rs1_value_poly.get_bound_coeff(j * 2);
-                        let rs1_value_at_j_inf =
-                            self.rs1_value_poly.get_bound_coeff(j * 2 + 1) - rs1_value_at_j_0;
-                        // Eval LeftInstructionInputIsPc(x) at (r', j, {0, inf}).
-                        let left_is_pc_at_j_0 = self.left_is_pc_poly.get_bound_coeff(j * 2);
-                        let left_is_pc_at_j_inf =
-                            self.left_is_pc_poly.get_bound_coeff(j * 2 + 1) - left_is_pc_at_j_0;
-                        // Eval UnexpandedPc(x) at (r', j, {0, inf}).
-                        let unexpanded_pc_at_j_0 = self.unexpanded_pc_poly.get_bound_coeff(j * 2);
-                        let unexpanded_pc_at_j_inf =
-                            self.unexpanded_pc_poly.get_bound_coeff(j * 2 + 1)
-                                - unexpanded_pc_at_j_0;
-                        // Eval LeftInstructionInput(x) at (r', {0, inf}, j).
-                        let left_at_j_0 = left_is_rs1_at_j_0 * rs1_value_at_j_0
-                            + left_is_pc_at_j_0 * unexpanded_pc_at_j_0;
-                        let left_at_j_inf = left_is_rs1_at_j_inf * rs1_value_at_j_inf
-                            + left_is_pc_at_j_inf * unexpanded_pc_at_j_inf;
+                    // Accumulate in Montgomery-unreduced form to minimize reductions
+                    inner[0] += e_in.mul_to_product_accum(input_at_j_0);
+                    inner[1] += e_in.mul_to_product_accum(input_at_j_inf);
+                },
+                |_x_out, e_out, inner| {
+                    let mut out = [F::UnreducedProductAccum::zero(); 2];
+                    let reduced0 = F::reduce_product_accum(inner[0]);
+                    let reduced1 = F::reduce_product_accum(inner[1]);
+                    out[0] = e_out.mul_to_product_accum(reduced0);
+                    out[1] = e_out.mul_to_product_accum(reduced1);
+                    out
+                },
+                |mut a, b| {
+                    for i in 0..2 {
+                        a[i] += b[i];
+                    }
+                    a
+                },
+            )
+            .map(|x| F::reduce_product_accum(x));
 
-                        // Eval Input(x) = RightInstructionInput(x) + gamma * LeftInstructionInput(x) at (r', {0, inf}, j).
-                        let input_at_j_0 = right_at_j_0 + self.params.gamma * left_at_j_0;
-                        let input_at_j_inf = right_at_j_inf + self.params.gamma * left_at_j_inf;
-
-                        // Stage 2 e_in mirrors stage 1's x_in indexing; when fully bound, treat as 1
-                        let e_in2 = if e_in_stage_2.len() <= 1 {
-                            F::one()
-                        } else {
-                            e_in_stage_2[x_in]
-                        };
-
-                        // Accumulate in Montgomery-unreduced form to minimize reductions
-                        inner[0] += e_in1.mul_unreduced::<9>(input_at_j_0);
-                        inner[1] += e_in1.mul_unreduced::<9>(input_at_j_inf);
-                        inner[2] += e_in2.mul_unreduced::<9>(input_at_j_0);
-                        inner[3] += e_in2.mul_unreduced::<9>(input_at_j_inf);
-                    },
-                    |x_out, e_out1, inner| {
-                        let mut out = [F::Unreduced::<9>::zero(); 4];
-                        let reduced0 = F::from_montgomery_reduce::<9>(inner[0]);
-                        let reduced1 = F::from_montgomery_reduce::<9>(inner[1]);
-                        let reduced2 = F::from_montgomery_reduce::<9>(inner[2]);
-                        let reduced3 = F::from_montgomery_reduce::<9>(inner[3]);
-                        let e_out2 = if e_out_stage_2.len() <= 1 {
-                            F::one()
-                        } else {
-                            e_out_stage_2[x_out]
-                        };
-                        out[0] = e_out1.mul_unreduced::<9>(reduced0);
-                        out[1] = e_out1.mul_unreduced::<9>(reduced1);
-                        out[2] = e_out2.mul_unreduced::<9>(reduced2);
-                        out[3] = e_out2.mul_unreduced::<9>(reduced3);
-                        out
-                    },
-                    |mut a, b| {
-                        for i in 0..4 {
-                            a[i] += b[i];
-                        }
-                        a
-                    },
-                )
-                .map(|x| F::from_montgomery_reduce::<9>(x));
-
-        let round_poly_stage_1 = self.eq_r_cycle_stage_1.gruen_poly_deg_3(
-            eval_at_0_for_stage_1,
-            eval_at_inf_for_stage_1,
-            self.prev_claim_stage_1,
-        );
-        let round_poly_stage_2 = self.eq_r_cycle_stage_2.gruen_poly_deg_3(
-            eval_at_0_for_stage_2,
-            eval_at_inf_for_stage_2,
-            self.prev_claim_stage_2,
-        );
-        let gamma_squared = self.params.gamma.square();
-        let res = &round_poly_stage_1 + &(&round_poly_stage_2 * gamma_squared);
-        self.prev_round_poly_stage_1 = Some(round_poly_stage_1);
-        self.prev_round_poly_stage_2 = Some(round_poly_stage_2);
-        res
+        self.eq_r_cycle_stage_2
+            .gruen_poly_deg_3(eval_at_0, eval_at_inf, previous_claim)
     }
 
     #[tracing::instrument(skip_all, name = "InstructionInputSumcheckProver::ingest_challenge")]
@@ -420,12 +400,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
             rs2_value_poly,
             imm_poly,
             unexpanded_pc_poly,
-            eq_r_cycle_stage_1,
             eq_r_cycle_stage_2,
-            prev_claim_stage_1,
-            prev_claim_stage_2,
-            prev_round_poly_stage_1,
-            prev_round_poly_stage_2,
             params: _,
         } = self;
         left_is_rs1_poly.bind_parallel(r_j, BindingOrder::LowToHigh);
@@ -436,70 +411,58 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
         rs2_value_poly.bind_parallel(r_j, BindingOrder::LowToHigh);
         imm_poly.bind_parallel(r_j, BindingOrder::LowToHigh);
         unexpanded_pc_poly.bind_parallel(r_j, BindingOrder::LowToHigh);
-        eq_r_cycle_stage_1.bind(r_j);
         eq_r_cycle_stage_2.bind(r_j);
-        *prev_claim_stage_1 = prev_round_poly_stage_1.take().unwrap().evaluate(&r_j);
-        *prev_claim_stage_2 = prev_round_poly_stage_2.take().unwrap().evaluate(&r_j);
     }
 
     fn cache_openings(
         &self,
         accumulator: &mut ProverOpeningAccumulator<F>,
-        transcript: &mut T,
         sumcheck_challenges: &[F::Challenge],
     ) {
         let r = self.params.normalize_opening_point(sumcheck_challenges);
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::InstructionFlags(InstructionFlags::LeftOperandIsRs1Value),
             SumcheckId::InstructionInputVirtualization,
             r.clone(),
             self.left_is_rs1_poly.final_sumcheck_claim(),
         );
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::Rs1Value,
             SumcheckId::InstructionInputVirtualization,
             r.clone(),
             self.rs1_value_poly.final_sumcheck_claim(),
         );
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::InstructionFlags(InstructionFlags::LeftOperandIsPC),
             SumcheckId::InstructionInputVirtualization,
             r.clone(),
             self.left_is_pc_poly.final_sumcheck_claim(),
         );
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::UnexpandedPC,
             SumcheckId::InstructionInputVirtualization,
             r.clone(),
             self.unexpanded_pc_poly.final_sumcheck_claim(),
         );
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::InstructionFlags(InstructionFlags::RightOperandIsRs2Value),
             SumcheckId::InstructionInputVirtualization,
             r.clone(),
             self.right_is_rs2_poly.final_sumcheck_claim(),
         );
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::Rs2Value,
             SumcheckId::InstructionInputVirtualization,
             r.clone(),
             self.rs2_value_poly.final_sumcheck_claim(),
         );
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::InstructionFlags(InstructionFlags::RightOperandIsImm),
             SumcheckId::InstructionInputVirtualization,
             r.clone(),
             self.right_is_imm_poly.final_sumcheck_claim(),
         );
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::Imm,
             SumcheckId::InstructionInputVirtualization,
             r,
@@ -516,7 +479,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
 /// A sumcheck instance for:
 ///
 /// ```text
-/// sum_j (eq(r_cycle_stage_1, j) + gamma^2 * eq(r_cycle_stage_2, j)) * (RightInstructionInput(j) + gamma * LeftInstructionInput(j))
+/// sum_j eq(r_cycle_stage_2, j) * (RightInstructionInput(j) + gamma * LeftInstructionInput(j))
 /// ```
 ///
 /// Where
@@ -527,7 +490,6 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
 /// ```
 ///
 /// Note:
-/// - `r_cycle_stage_1` is the randomness from the log(T) rounds of Spartan outer sumcheck (stage 1).
 /// - `r_cycle_stage_2` is the randomness from instruction product sumcheck (stage 2).
 pub struct InstructionInputSumcheckVerifier<F: JoltField> {
     params: InstructionInputParams<F>,
@@ -546,6 +508,23 @@ impl<F: JoltField> InstructionInputSumcheckVerifier<F> {
 impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
     for InstructionInputSumcheckVerifier<F>
 {
+    fn input_claim(&self, accumulator: &VerifierOpeningAccumulator<F>) -> F {
+        let result = self.params.input_claim(accumulator);
+
+        #[cfg(test)]
+        {
+            let claims = Self::input_output_claims();
+            let gamma_pows: Vec<F> =
+                std::iter::successors(Some(F::one()), |prev| Some(*prev * self.params.gamma))
+                    .take(claims.claims.len())
+                    .collect();
+            let reference_result = claims.input_claim(&gamma_pows, accumulator);
+            assert_eq!(result, reference_result);
+        }
+
+        result
+    }
+
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         &self.params
     }
@@ -556,7 +535,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
         sumcheck_challenges: &[F::Challenge],
     ) -> F {
         let r = self.params.normalize_opening_point(sumcheck_challenges);
-        let eq_eval_at_r_cycle_stage_1 = EqPolynomial::mle_endian(&r, &self.params.r_cycle_stage_1);
+
         let eq_eval_at_r_cycle_stage_2 = EqPolynomial::mle_endian(&r, &self.params.r_cycle_stage_2);
 
         let (_, rs1_value_eval) = accumulator.get_virtual_polynomial_opening(
@@ -597,64 +576,116 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
         let right_instruction_input =
             right_is_rs2_eval * rs2_value_eval + right_is_imm_eval * imm_eval;
 
-        (eq_eval_at_r_cycle_stage_1 + self.params.gamma.square() * eq_eval_at_r_cycle_stage_2)
-            * (right_instruction_input + self.params.gamma * left_instruction_input)
+        let result = eq_eval_at_r_cycle_stage_2
+            * (right_instruction_input + self.params.gamma * left_instruction_input);
+
+        #[cfg(test)]
+        {
+            let claims = Self::input_output_claims();
+            let gamma_pows: Vec<F> =
+                std::iter::successors(Some(F::one()), |prev| Some(*prev * self.params.gamma))
+                    .take(claims.claims.len())
+                    .collect();
+            let reference_result = claims.expected_output_claim(&r, &gamma_pows, accumulator);
+
+            assert_eq!(result, reference_result);
+        }
+
+        result
     }
 
     fn cache_openings(
         &self,
         accumulator: &mut VerifierOpeningAccumulator<F>,
-        transcript: &mut T,
         sumcheck_challenges: &[F::Challenge],
     ) {
         let r = self.params.normalize_opening_point(sumcheck_challenges);
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::InstructionFlags(InstructionFlags::LeftOperandIsRs1Value),
             SumcheckId::InstructionInputVirtualization,
             r.clone(),
         );
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::Rs1Value,
             SumcheckId::InstructionInputVirtualization,
             r.clone(),
         );
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::InstructionFlags(InstructionFlags::LeftOperandIsPC),
             SumcheckId::InstructionInputVirtualization,
             r.clone(),
         );
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::UnexpandedPC,
             SumcheckId::InstructionInputVirtualization,
             r.clone(),
         );
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::InstructionFlags(InstructionFlags::RightOperandIsRs2Value),
             SumcheckId::InstructionInputVirtualization,
             r.clone(),
         );
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::Rs2Value,
             SumcheckId::InstructionInputVirtualization,
             r.clone(),
         );
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::InstructionFlags(InstructionFlags::RightOperandIsImm),
             SumcheckId::InstructionInputVirtualization,
             r.clone(),
         );
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::Imm,
             SumcheckId::InstructionInputVirtualization,
             r,
         );
+    }
+}
+
+impl<F: JoltField> SumcheckFrontend<F> for InstructionInputSumcheckVerifier<F> {
+    fn input_output_claims() -> InputOutputClaims<F> {
+        let right_instruction_input: ClaimExpr<F> = VirtualPolynomial::RightInstructionInput.into();
+        let left_instruction_input: ClaimExpr<F> = VirtualPolynomial::LeftInstructionInput.into();
+
+        let rs1_value: ClaimExpr<F> = VirtualPolynomial::Rs1Value.into();
+        let left_is_rs1: ClaimExpr<F> =
+            VirtualPolynomial::InstructionFlags(InstructionFlags::LeftOperandIsRs1Value).into();
+        let unexpanded_pc: ClaimExpr<F> = VirtualPolynomial::UnexpandedPC.into();
+        let left_is_pc: ClaimExpr<F> =
+            VirtualPolynomial::InstructionFlags(InstructionFlags::LeftOperandIsPC).into();
+        let rs2_value: ClaimExpr<F> = VirtualPolynomial::Rs2Value.into();
+        let right_is_rs2: ClaimExpr<F> =
+            VirtualPolynomial::InstructionFlags(InstructionFlags::RightOperandIsRs2Value).into();
+        let imm: ClaimExpr<F> = VirtualPolynomial::Imm.into();
+        let right_is_imm: ClaimExpr<F> =
+            VirtualPolynomial::InstructionFlags(InstructionFlags::RightOperandIsImm).into();
+
+        let left_instruction_input_eval = left_is_rs1 * rs1_value + left_is_pc * unexpanded_pc;
+        let right_instruction_input_eval = right_is_rs2 * rs2_value + right_is_imm * imm;
+
+        let eq_r_stage2 = VerifierEvaluablePolynomial::Eq(CachedPointRef {
+            opening: PolynomialId::Virtual(VirtualPolynomial::LeftInstructionInput),
+            sumcheck: SumcheckId::SpartanProductVirtualization,
+            part: ChallengePart::Cycle,
+        });
+
+        InputOutputClaims {
+            claims: vec![
+                Claim {
+                    input_sumcheck_id: SumcheckId::SpartanProductVirtualization,
+                    input_claim_expr: right_instruction_input,
+                    batching_poly: eq_r_stage2,
+                    expected_output_claim_expr: right_instruction_input_eval,
+                },
+                Claim {
+                    input_sumcheck_id: SumcheckId::SpartanProductVirtualization,
+                    input_claim_expr: left_instruction_input,
+                    batching_poly: eq_r_stage2,
+                    expected_output_claim_expr: left_instruction_input_eval,
+                },
+            ],
+            output_sumcheck_id: SumcheckId::InstructionInputVirtualization,
+        }
     }
 }

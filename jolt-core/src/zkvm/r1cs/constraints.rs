@@ -39,7 +39,7 @@
 use super::inputs::JoltR1CSInputs;
 use crate::zkvm::instruction::{CircuitFlags, InstructionFlags};
 use crate::zkvm::witness::VirtualPolynomial;
-use strum::EnumCount;
+use strum::EnumCount as EnumCountTrait;
 use strum_macros::{EnumCount, EnumIter};
 
 pub use super::ops::{Term, LC};
@@ -323,24 +323,29 @@ pub static R1CS_CONSTRAINTS: [NamedR1CSConstraint; NUM_R1CS_CONSTRAINTS] = [
         if { { JoltR1CSInputs::OpFlags(CircuitFlags::Assert) } }
         => ( { JoltR1CSInputs::LookupOutput } ) == ( { 1i128 } )
     ),
-    // if Rd != 0 && WriteLookupOutputToRD {
+    // if WriteLookupOutputToRD {
     //     assert!(RdWriteValue == LookupOutput)
     // }
+    // No longer guarded by IsRdZero: trace rewriting at preprocessing
+    // ensures rd=x0 instructions are replaced with ADDI x0,x0,0 (where
+    // LookupOutput == 0 == RdWriteValue) so the constraint is trivially satisfied.
     r1cs_eq_conditional!(
         label: R1CSConstraintLabel::RdWriteEqLookupIfWriteLookupToRd,
-        if { { JoltR1CSInputs::WriteLookupOutputToRD } }
+        if { { JoltR1CSInputs::OpFlags(CircuitFlags::WriteLookupOutputToRD) } }
         => ( { JoltR1CSInputs::RdWriteValue } ) == ( { JoltR1CSInputs::LookupOutput } )
     ),
-    // if Rd != 0 && Jump {
+    // if Jump {
     //     if !isCompressed {
     //          assert!(RdWriteValue == UnexpandedPC + 4)
     //     } else {
     //          assert!(RdWriteValue == UnexpandedPC + 2)
     //     }
     // }
+    // No longer guarded by IsRdZero: trace rewriting remaps jumps with
+    // rd=x0 to use a virtual register, so Jump implies rd != x0.
     r1cs_eq_conditional!(
         label: R1CSConstraintLabel::RdWriteEqPCPlusConstIfWritePCtoRD,
-        if { { JoltR1CSInputs::WritePCtoRD } }
+        if { { JoltR1CSInputs::OpFlags(CircuitFlags::Jump) } }
         => ( { JoltR1CSInputs::RdWriteValue } ) == ( { JoltR1CSInputs::UnexpandedPC } + { 4i128 } - { 2 * JoltR1CSInputs::OpFlags(CircuitFlags::IsCompressed) } )
     ),
     // if Jump && !NextIsNoop {
@@ -378,12 +383,16 @@ pub static R1CS_CONSTRAINTS: [NamedR1CSConstraint; NUM_R1CS_CONSTRAINTS] = [
                 - { 4 * JoltR1CSInputs::OpFlags(CircuitFlags::DoNotUpdateUnexpandedPC) }
                 - { 2 * JoltR1CSInputs::OpFlags(CircuitFlags::IsCompressed) } )
     ),
-    // if Inline {
+    // if VirtualInstruction && !IsLastInSequence {
     //     assert!(NextPC == PC + 1)
     // }
+    // Guard = OpFlags(VirtualInstruction) − OpFlags(IsLastInSequence).
+    // For valid boolean inputs where IsLast=1 implies VI=1, this equals VI && !IsLast.
+    // Skips the constraint when JALR terminates a virtual sequence (NextPC may jump
+    // to a trap handler) and when the instruction is not part of an inline sequence.
     r1cs_eq_conditional!(
         label: R1CSConstraintLabel::NextPCEqPCPlusOneIfInline,
-        if { { JoltR1CSInputs::OpFlags(CircuitFlags::VirtualInstruction) } }
+        if { { JoltR1CSInputs::OpFlags(CircuitFlags::VirtualInstruction) } - { JoltR1CSInputs::OpFlags(CircuitFlags::IsLastInSequence) } }
         => ( { JoltR1CSInputs::NextPC } ) == ( { JoltR1CSInputs::PC } + { 1i128 } )
     ),
     // if NextIsVirtual && !NextIsFirstInSequence {
@@ -517,7 +526,7 @@ pub static R1CS_CONSTRAINTS_SECOND_GROUP: [NamedR1CSConstraint; NUM_REMAINING_R1
     filter_r1cs_constraints(&R1CS_CONSTRAINTS_SECOND_GROUP_LABELS);
 
 /// Domain sizing for product-virtualization univariate-skip (size-5 window)
-pub const NUM_PRODUCT_VIRTUAL: usize = 5;
+pub const NUM_PRODUCT_VIRTUAL: usize = 3;
 pub const PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DOMAIN_SIZE: usize = NUM_PRODUCT_VIRTUAL;
 pub const PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE: usize = NUM_PRODUCT_VIRTUAL - 1;
 pub const PRODUCT_VIRTUAL_UNIVARIATE_SKIP_EXTENDED_DOMAIN_SIZE: usize =
@@ -531,8 +540,6 @@ pub const PRODUCT_VIRTUAL_FIRST_ROUND_POLY_DEGREE_BOUND: usize =
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, EnumCount, EnumIter)]
 pub enum ProductConstraintLabel {
     Instruction,
-    WriteLookupOutputToRD,
-    WritePCtoRD,
     ShouldBranch,
     ShouldJump,
 }
@@ -558,63 +565,17 @@ pub struct ProductConstraint {
     pub output: VirtualPolynomial,
 }
 
-
-/// 乘法约束（Product Constraints）的规范列表。
-/// 这个列表的顺序必须与乘法虚拟化阶段（product virtualization stage）使用的 `PRODUCT_VIRTUAL_TERMS` 完全一致。
-///
-/// 这里的每一个约束都定义了一个乘法关系：`Left * Right = Output`。
-/// 这些约束用于在 R1CS 系统中验证指令执行逻辑的正确性（例如控制流标志的计算）。
+/// Canonical list of the product constraints in the same order as
+/// `PRODUCT_VIRTUAL_TERMS` used by the product virtualization stage.
 pub const PRODUCT_CONSTRAINTS: [ProductConstraint; NUM_PRODUCT_CONSTRAINTS] = [
     // 0: Product = LeftInstructionInput · RightInstructionInput
-    //
-    // 指令操作数乘积约束。
-    // 验证虚拟多项式 `Product` 的值等于 `LeftInstructionInput` 和 `RightInstructionInput` 的乘积。
-    // 这通常用于处理指令的核心运算逻辑或查找表索引构建，确保输入与预期的运算结果（作为输入对的乘积）一致。
     ProductConstraint {
         label: ProductConstraintLabel::Instruction,
         left: ProductFactorExpr::Var(VirtualPolynomial::LeftInstructionInput),
         right: ProductFactorExpr::Var(VirtualPolynomial::RightInstructionInput),
         output: VirtualPolynomial::Product,
     },
-    // 1: WriteLookupOutputToRD = IsRdNotZero · OpFlags(WriteLookupOutputToRD)
-    //
-    // 写入查找表结果到目标寄存器 (RD) 的控制信号约束。
-    // 在 RISC-V 中，寄存器 x0 硬编码为 0，对其写入会被忽略。
-    // 此约束确保只有当：
-    // 1. 指令本身意图写入查找结果到 RD (`OpFlags` 中 WriteLookupOutputToRD 标志为真)
-    // 2. AND 目标寄存器索引不是 x0 (`IsRdNotZero` 为真)
-    // 此时，实际的逻辑写入信号 `WriteLookupOutputToRD` 才为真。
-    ProductConstraint {
-        label: ProductConstraintLabel::WriteLookupOutputToRD,
-        left: ProductFactorExpr::Var(VirtualPolynomial::InstructionFlags(
-            InstructionFlags::IsRdNotZero,
-        )),
-        right: ProductFactorExpr::Var(VirtualPolynomial::OpFlags(
-            CircuitFlags::WriteLookupOutputToRD,
-        )),
-        output: VirtualPolynomial::WriteLookupOutputToRD,
-    },
-    // 2: WritePCtoRD = IsRdNotZero · OpFlags(Jump)
-    //
-    // 跳转指令写入 PC 到 RD 的控制信号约束 (用于 JAL/JALR 指令)。
-    // 同样遵循 x0 不可写的原则。
-    // 只有当指令是跳转指令 (`OpFlags(Jump)`) 且 RD 不是 x0 时，
-    // `WritePCtoRD` 信号才为真，允许将返回地址 (PC+4) 提交到寄存器堆。
-    ProductConstraint {
-        label: ProductConstraintLabel::WritePCtoRD,
-        left: ProductFactorExpr::Var(VirtualPolynomial::InstructionFlags(
-            InstructionFlags::IsRdNotZero,
-        )),
-        right: ProductFactorExpr::Var(VirtualPolynomial::OpFlags(CircuitFlags::Jump)),
-        output: VirtualPolynomial::WritePCtoRD,
-    },
-    // 3: ShouldBranch = LookupOutput · InstructionFlags(Branch)
-    //
-    // 条件分支判定约束。
-    // 决定是否应该执行分支跳转 (例如 BEQ, BNE)。
-    // 逻辑：如果当前指令是分支指令 (`InstructionFlags(Branch)`)，
-    // 并且条件比较的结果 (`LookupOutput`，在此上下文中作为布尔值 0 或 1) 为真，
-    // 则 `ShouldBranch` 信号为真。
+    // 1: ShouldBranch = LookupOutput · InstructionFlags(Branch)
     ProductConstraint {
         label: ProductConstraintLabel::ShouldBranch,
         left: ProductFactorExpr::Var(VirtualPolynomial::LookupOutput),
@@ -623,13 +584,7 @@ pub const PRODUCT_CONSTRAINTS: [ProductConstraint; NUM_PRODUCT_CONSTRAINTS] = [
         )),
         output: VirtualPolynomial::ShouldBranch,
     },
-    // 4: ShouldJump = OpFlags(Jump) · (1 − NextIsNoop)
-    //
-    // 无条件跳转判定约束。
-    // 决定是否执行无条件跳转 (JAL, JALR)。
-    // 逻辑：如果当前指令标记为跳转 (`OpFlags(Jump)`)，
-    // 并且下一个状态不是 Noop (即 `1 - NextIsNoop` 为 1，表示它是活跃的执行步骤)，
-    // 则 `ShouldJump` 为真。这防止了在 Trace 填充或非活跃周期错误地触发跳转逻辑。
+    // 2: ShouldJump = OpFlags(Jump) · (1 − NextIsNoop)
     ProductConstraint {
         label: ProductConstraintLabel::ShouldJump,
         left: ProductFactorExpr::Var(VirtualPolynomial::OpFlags(CircuitFlags::Jump)),

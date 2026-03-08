@@ -172,8 +172,10 @@ impl Mmu {
                 ea <= layout.io_end,
                 "I/O overflow: Attempted to {verb} 0x{ea:X}. Out of bounds.\n{layout:#?}",
             );
+            // Allow addresses in zero-padding range (below RAM_START_ADDRESS - 8)
+            // OR in the I/O device range (>= get_lowest_address())
             assert!(
-                ea >= layout.get_lowest_address(),
+                ea >= layout.get_lowest_address() || ea <= RAM_START_ADDRESS - 8,
                 "I/O underflow: Attempted to {verb} 0x{ea:X}. Out of bounds.\n{layout:#?}",
             );
 
@@ -184,13 +186,14 @@ impl Mmu {
                     || jolt_device.is_panic(ea)
                     || jolt_device.is_termination(ea)
             } else {
-                // loads also from input
+                // loads from input/advice/output/panic/termination OR zero-padding range
                 jolt_device.is_input(ea)
                     || jolt_device.is_trusted_advice(ea)
                     || jolt_device.is_untrusted_advice(ea)
                     || jolt_device.is_output(ea)
                     || jolt_device.is_panic(ea)
                     || jolt_device.is_termination(ea)
+                    || ea <= RAM_START_ADDRESS - 8
             };
             assert!(
                 ok,
@@ -204,16 +207,20 @@ impl Mmu {
                 // attempt to write to the stack vs heap, but they're trying their best
                 assert!(
                     ea <= layout.stack_end || ea > layout.stack_end + STACK_CANARY_SIZE,
-                    "Stack overflow: Triggered Stack Canary. Attempted to {verb} 0x{ea:X}.\n{layout:#?}",
+                    "Stack overflow: attempted to {verb} 0x{ea:X}, which is in the stack canary region. \
+                    Increase stack_size in MemoryConfig (currently {} bytes).",
+                    layout.stack_size,
                 );
                 assert!(
-                    ea < layout.memory_end,
-                    "Heap overflow: Attempted to {verb} 0x{ea:X}. Heap too small.\n{layout:#?}",
+                    ea < layout.heap_end,
+                    "Heap overflow: attempted to {verb} 0x{ea:X}, which is beyond the heap. \
+                    Increase heap_size in MemoryConfig (currently {} bytes).",
+                    layout.heap_size,
                 );
             } else {
                 // allow reads across the whole designated memory region as long as the address is valid
                 assert!(
-                    ea < layout.memory_end,
+                    ea < layout.heap_end,
                     "Illegal Memory Access: Attempted to {verb} 0x{ea:X}.\n{layout:#?}",
                 );
             }
@@ -509,6 +516,7 @@ impl Mmu {
                             || jolt_device.is_output(effective_address)
                             || jolt_device.is_panic(effective_address)
                             || jolt_device.is_termination(effective_address)
+                            || effective_address <= RAM_START_ADDRESS - 8
                         {
                             return jolt_device.load(effective_address);
                         }
@@ -1206,7 +1214,6 @@ impl MemoryWrapper {
 mod test_mmu {
     use super::*;
     use crate::emulator::terminal::DummyTerminal;
-    use common::constants::DEFAULT_MEMORY_SIZE;
     use common::jolt_device::MemoryConfig;
 
     fn setup_mmu() -> Mmu {
@@ -1217,7 +1224,13 @@ mod test_mmu {
             ..Default::default()
         };
         mmu.jolt_device = Some(JoltDevice::new(&memory_config));
-        mmu.init_memory(DEFAULT_MEMORY_SIZE);
+        let capacity = mmu
+            .jolt_device
+            .as_ref()
+            .unwrap()
+            .memory_layout
+            .get_total_memory_size();
+        mmu.init_memory(capacity);
 
         mmu
     }
@@ -1228,12 +1241,12 @@ mod test_mmu {
         let mut mmu = setup_mmu();
 
         // Try to write beyond the allocated memory
-        let overflow_address = mmu.jolt_device.as_ref().unwrap().memory_layout.memory_end + 1;
+        let overflow_address = mmu.jolt_device.as_ref().unwrap().memory_layout.heap_end + 1;
         mmu.trace_store(overflow_address, 0xc50513);
     }
 
     #[test]
-    #[should_panic(expected = "Stack Canary")]
+    #[should_panic(expected = "Stack overflow")]
     fn test_stack_overflow() {
         let mut mmu = setup_mmu();
 
@@ -1242,7 +1255,7 @@ mod test_mmu {
     }
 
     #[test]
-    #[should_panic(expected = "I/O underflow")]
+    #[should_panic(expected = "Unknown memory mapping")]
     fn test_io_underflow() {
         let mut mmu = setup_mmu();
         let trusted_advice_size = mmu
@@ -1261,7 +1274,9 @@ mod test_mmu {
             - 1
             - trusted_advice_size
             - untrusted_advice_size;
-        // illegal write to inputs
+        // Write to address below I/O region - rejected as unknown mapping
+        // (Note: address is in "zero-padding" range so passes underflow check,
+        // but fails device I/O check since it's not a valid write target)
         mmu.store_bytes(invalid_addr, 0xc50513, 2).unwrap();
     }
 

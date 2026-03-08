@@ -3,28 +3,36 @@ mod build_wasm;
 use std::{
     fs::{self, File},
     io::Write,
+    path::PathBuf,
+    process::{exit, Command},
 };
 
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use eyre::Result;
+use log::{debug, info};
 use rand::prelude::SliceRandom;
 use sysinfo::System;
 
 use build_wasm::{build_wasm, modify_cargo_toml};
-use jolt_core::host::toolchain;
+use zeroos_build::cmds::{build::BacktraceMode, BuildArgs, StdMode};
+use zeroos_build::spec::TargetRenderOptions;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Linker script template embedded at compile time.
+/// This linker script is for Jolt zkVM guests.
+static LINKER_TEMPLATE: &str = include_str!("linker.ld.template");
 
 #[derive(Parser)]
 #[command(version = version(), about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: JoltCommand,
 }
 
 #[derive(Subcommand)]
-enum Command {
+enum JoltCommand {
     /// Creates a new Jolt project with the specified name
     New {
         /// Project name
@@ -32,13 +40,71 @@ enum Command {
         /// Whether to generate WASM compatible files
         #[arg(short, long)]
         wasm: bool,
+        /// Generate project with zero-knowledge (PrivateInput) support
+        #[arg(long)]
+        zk: bool,
     },
-    /// Installs the required RISC-V toolchains for Rust
-    InstallToolchain,
-    /// Uninstalls the RISC-V toolchains for Rust
-    UninstallToolchain,
+
+    /// Build a guest program for Jolt zkVM
+    Build(JoltBuildArgs),
+
+    /// Run an ELF binary on the Jolt emulator
+    Run(RunArgs),
+
+    /// Generate target specs or linker scripts
+    #[command(subcommand)]
+    Generate(GenerateCmd),
+
     /// Handles preprocessing and generates WASM compatible files
     BuildWasm,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum GenerateCmd {
+    /// Generate a custom target specification JSON file
+    Target(JoltGenerateTargetArgs),
+
+    /// Generate a linker script with custom memory layout
+    Linker(JoltGenerateLinkerArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct JoltBuildArgs {
+    #[command(flatten)]
+    base: BuildArgs,
+}
+
+#[derive(clap::Args, Debug)]
+struct RunArgs {
+    /// Path to the ELF binary to run
+    #[arg(value_name = "BINARY")]
+    binary: PathBuf,
+
+    /// Path to jolt-emu binary (defaults to searching PATH, then common locations)
+    #[arg(long, env = "JOLT_EMU_PATH")]
+    jolt_emu: Option<PathBuf>,
+
+    /// Additional arguments to pass to jolt-emu
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub emu_args: Vec<String>,
+}
+
+#[derive(clap::Args, Debug)]
+struct JoltGenerateTargetArgs {
+    #[command(flatten)]
+    base: zeroos_build::cmds::GenerateTargetArgs,
+
+    #[arg(long, short = 'o')]
+    output: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+struct JoltGenerateLinkerArgs {
+    #[command(flatten)]
+    base: zeroos_build::cmds::GenerateLinkerArgs,
+
+    #[arg(long, short = 'o', default_value = "linker.ld")]
+    output: PathBuf,
 }
 
 fn version() -> &'static str {
@@ -53,38 +119,300 @@ fn version() -> &'static str {
 }
 
 fn main() {
+    env_logger::Builder::from_default_env()
+        .format_timestamp(None)
+        .format_module_path(false)
+        .init();
+
+    debug!("jolt starting");
+
     let cli = Cli::parse();
-    match cli.command {
-        Command::New { name, wasm } => create_project(name, wasm),
-        Command::InstallToolchain => install_toolchain(),
-        Command::UninstallToolchain => uninstall_toolchain(),
-        Command::BuildWasm => build_wasm(),
+    let result = match cli.command {
+        JoltCommand::New { name, wasm, zk } => {
+            create_project(name, wasm, zk);
+            Ok(())
+        }
+        JoltCommand::Build(args) => build_command(args),
+        JoltCommand::Run(args) => run_command(args),
+        JoltCommand::Generate(gen_cmd) => match gen_cmd {
+            GenerateCmd::Target(args) => generate_target_command(args),
+            GenerateCmd::Linker(args) => generate_linker_command(args),
+        },
+        JoltCommand::BuildWasm => {
+            build_wasm();
+            Ok(())
+        }
+    };
+
+    if let Err(e) = result {
+        eprintln!("Error: {e:#}");
+        exit(1);
     }
 }
 
-fn create_project(name: String, wasm: bool) {
+// ============================================================================
+// Build command (from cargo-jolt)
+// ============================================================================
+
+/// Resolve the guest optimization level from `JOLT_GUEST_OPT` env var (default: "3").
+fn guest_opt_flag() -> String {
+    let level = std::env::var("JOLT_GUEST_OPT").unwrap_or_else(|_| "3".to_string());
+    match level.as_str() {
+        "0" | "1" | "2" | "3" | "s" | "z" => {}
+        _ => panic!("Invalid JOLT_GUEST_OPT value: {level}. Allowed values are 0, 1, 2, 3, s, z"),
+    }
+    format!("-Copt-level={level}")
+}
+
+fn build_command(args: JoltBuildArgs) -> Result<()> {
+    debug!("build_command: {args:?}");
+
+    let workspace_root = zeroos_build::cmds::find_workspace_root()?;
+    debug!("workspace_root: {}", workspace_root.display());
+
+    // Use the embedded linker template (compiled into the binary)
+    let linker_tpl = LINKER_TEMPLATE.to_string();
+
+    let fully = args.base.mode == StdMode::Std || args.base.fully;
+
+    let toolchain_paths = if args.base.mode == StdMode::Std || fully {
+        let tc_cfg = zeroos_build::toolchain::ToolchainConfig::default();
+        let install_cfg = zeroos_build::toolchain::InstallConfig::default();
+        let paths = zeroos_build::toolchain::get_or_install_or_build_toolchain(
+            args.base.musl_lib_path.clone(),
+            args.base.gcc_lib_path.clone(),
+            &tc_cfg,
+            &install_cfg,
+            fully,
+        )
+        .map(|p| (p.musl_lib, p.gcc_lib))
+        .map_err(|e| anyhow::anyhow!("Toolchain setup failed: {e}"))?;
+        Some(paths)
+    } else {
+        None
+    };
+
+    let opt_flag = guest_opt_flag();
+
+    // Strip symbols for smaller ELFs. Preserve them when JOLT_BACKTRACE is set
+    // or --backtrace enable is passed, so the tracer can symbolize panic backtraces.
+    // In auto mode (default), strip for release and preserve for debug/dev profiles.
+    let backtrace_via_env = std::env::var("JOLT_BACKTRACE")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+
+    let force_frame_pointers = matches!(
+        args.base.backtrace,
+        BacktraceMode::Dwarf | BacktraceMode::FramePointers
+    );
+
+    let preserve_symbols = backtrace_via_env
+        || force_frame_pointers
+        || match args.base.backtrace {
+            BacktraceMode::Auto => {
+                let profile = zeroos_build::project::detect_profile(&args.base.cargo_args);
+                matches!(profile.as_str(), "debug" | "dev")
+            }
+            _ => false,
+        };
+
+    let mut jolt_rustflags: Vec<&str> = vec![
+        "-Cpasses=lower-atomic",
+        "-Cpanic=abort",
+        &opt_flag,
+        // Disable MachineOutliner: generates broken call patterns on RISC-V (infinite loops).
+        "-Cllvm-args=-enable-machine-outliner=never",
+        "--cfg=getrandom_backend=\"custom\"",
+    ];
+
+    // Also set medany for C code (cc crate reads CFLAGS_{target}).
+    let cflags_target = match args.base.mode {
+        StdMode::Std => "riscv64imac_zero_linux_musl",
+        StdMode::NoStd => "riscv64imac_unknown_none_elf",
+    };
+    let cflags_key = format!("CFLAGS_{cflags_target}");
+    let mut cflags = std::env::var(&cflags_key).unwrap_or_default();
+    if !cflags.contains("-mcmodel=medany") {
+        if !cflags.is_empty() {
+            cflags.push(' ');
+        }
+        cflags.push_str("-mcmodel=medany");
+        std::env::set_var(&cflags_key, &cflags);
+    }
+
+    if !preserve_symbols {
+        jolt_rustflags.push("-Cstrip=symbols");
+    }
+
+    // Frame pointers change generated code — only enable for explicit --backtrace modes,
+    // never for JOLT_BACKTRACE (which only needs symbol metadata).
+    if force_frame_pointers {
+        jolt_rustflags.push("-Cforce-frame-pointers=yes");
+    }
+
+    zeroos_build::cmds::build_binary_with_rustflags(
+        &workspace_root,
+        &args.base,
+        toolchain_paths,
+        Some(linker_tpl),
+        Some(&jolt_rustflags),
+    )?;
+
+    Ok(())
+}
+
+// ============================================================================
+// Run command (from cargo-jolt)
+// ============================================================================
+
+fn find_jolt_emu() -> Option<PathBuf> {
+    // First check if jolt-emu is in PATH
+    if let Ok(output) = Command::new("which").arg("jolt-emu").output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Some(PathBuf::from(path));
+            }
+        }
+    }
+
+    // Check common locations relative to the jolt repository
+    let common_paths = [
+        // Relative to current working directory (if in jolt repo)
+        "target/release/jolt-emu",
+        "target/debug/jolt-emu",
+        // Common sibling directory layout
+        "../jolt/target/release/jolt-emu",
+        "../jolt/target/debug/jolt-emu",
+    ];
+
+    for path in &common_paths {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            return Some(p.canonicalize().unwrap_or(p));
+        }
+    }
+
+    None
+}
+
+fn run_command(args: RunArgs) -> Result<()> {
+    if !args.binary.exists() {
+        anyhow::bail!("Binary not found: {}", args.binary.display());
+    }
+
+    let jolt_emu = args.jolt_emu.or_else(find_jolt_emu).ok_or_else(|| {
+        anyhow::anyhow!(
+            "jolt-emu not found. Please specify --jolt-emu or set JOLT_EMU_PATH environment variable"
+        )
+    })?;
+
+    debug!("Running binary: {}", args.binary.display());
+    debug!("Using jolt-emu: {}", jolt_emu.display());
+
+    println!("Running on Jolt emulator...\n");
+
+    let mut cmd = Command::new(&jolt_emu);
+    cmd.arg(&args.binary);
+    cmd.args(&args.emu_args);
+
+    let args_vec: Vec<String> = cmd
+        .get_args()
+        .map(|s| s.to_string_lossy().to_string())
+        .collect();
+    let cmd_str = format!("{} {}", jolt_emu.display(), args_vec.join(" "));
+    debug!("Command: {cmd_str}");
+
+    let status = cmd
+        .status()
+        .with_context(|| format!("Failed to execute jolt-emu at {}", jolt_emu.display()))?;
+
+    if !status.success() {
+        exit(status.code().unwrap_or(1));
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Generate commands (from cargo-jolt)
+// ============================================================================
+
+fn generate_target_command(cli_args: JoltGenerateTargetArgs) -> Result<()> {
+    use zeroos_build::cmds::generate_target_spec;
+    use zeroos_build::spec::{load_target_profile, parse_target_triple};
+
+    let target_triple = if let Some(profile_name) = &cli_args.base.profile {
+        load_target_profile(profile_name)
+            .ok_or_else(|| anyhow::anyhow!("Unknown profile: {profile_name}"))?
+            .config
+            .target_triple()
+    } else if let Some(target) = &cli_args.base.target {
+        parse_target_triple(target)
+            .ok_or_else(|| anyhow::anyhow!("Cannot parse target triple: {target}"))?
+            .target_triple()
+    } else {
+        return Err(anyhow::anyhow!("Either --profile or --target is required"));
+    };
+
+    let json_content = generate_target_spec(&cli_args.base, TargetRenderOptions::default())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let output_path = cli_args
+        .output
+        .unwrap_or_else(|| PathBuf::from(format!("{target_triple}.json")));
+
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create output directory: {}", parent.display()))?;
+    }
+
+    fs::write(&output_path, &json_content)
+        .with_context(|| format!("Failed to write target spec to {}", output_path.display()))?;
+
+    info!("Generated target spec: {}", output_path.display());
+    info!("Target triple: {target_triple}");
+
+    Ok(())
+}
+
+fn generate_linker_command(cli_args: JoltGenerateLinkerArgs) -> Result<()> {
+    use zeroos_build::cmds::generate_linker_script;
+
+    let result = generate_linker_script(&cli_args.base)?;
+
+    if let Some(parent) = cli_args.output.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create output directory: {}", parent.display()))?;
+    }
+
+    fs::write(&cli_args.output, &result.script_content).with_context(|| {
+        format!(
+            "Failed to write linker script to {}",
+            cli_args.output.display()
+        )
+    })?;
+
+    info!("Generated linker script: {}", cli_args.output.display());
+
+    Ok(())
+}
+
+// ============================================================================
+// Project scaffolding (original jolt new)
+// ============================================================================
+
+fn create_project(name: String, wasm: bool, zk: bool) {
     create_folder_structure(&name).expect("could not create directory");
-    create_host_files(&name).expect("file creation failed");
-    create_guest_files(&name).expect("file creation failed");
+    create_host_files(&name, zk).expect("file creation failed");
+    create_guest_files(&name, zk).expect("file creation failed");
     if wasm {
         modify_cargo_toml(&name).expect("Failed to update Cargo.toml");
-    }
-}
-
-fn install_toolchain() {
-    if let Err(err) = toolchain::install_toolchain() {
-        panic!("toolchain install failed: {err}");
     }
     display_welcome();
 }
 
-fn uninstall_toolchain() {
-    if let Err(err) = toolchain::uninstall_toolchain() {
-        panic!("toolchain uninstall failed: {err}");
-    }
-}
-
-fn create_folder_structure(name: &str) -> Result<()> {
+fn create_folder_structure(name: &str) -> eyre::Result<()> {
     fs::create_dir(name)?;
     fs::create_dir(format!("{name}/src"))?;
     fs::create_dir(format!("{name}/guest"))?;
@@ -93,29 +421,37 @@ fn create_folder_structure(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn create_host_files(name: &str) -> Result<()> {
+fn create_host_files(name: &str, zk: bool) -> eyre::Result<()> {
     let mut toolchain_file = File::create(format!("{name}/rust-toolchain.toml"))?;
     toolchain_file.write_all(RUST_TOOLCHAIN.as_bytes())?;
 
     let mut gitignore_file = File::create(format!("{name}/.gitignore"))?;
     gitignore_file.write_all(GITIGNORE.as_bytes())?;
 
-    let cargo_file_contents = HOST_CARGO_TEMPLATE.replace("{NAME}", name);
+    let template = if zk {
+        HOST_CARGO_TEMPLATE_ZK
+    } else {
+        HOST_CARGO_TEMPLATE
+    };
+    let cargo_file_contents = template.replace("{NAME}", name);
     let mut cargo_file = File::create(format!("{name}/Cargo.toml"))?;
     cargo_file.write_all(cargo_file_contents.as_bytes())?;
 
+    let main = if zk { HOST_MAIN_ZK } else { HOST_MAIN };
     let mut main_file = File::create(format!("{name}/src/main.rs"))?;
-    main_file.write_all(HOST_MAIN.as_bytes())?;
+    main_file.write_all(main.as_bytes())?;
 
     Ok(())
 }
 
-fn create_guest_files(name: &str) -> Result<()> {
+fn create_guest_files(name: &str, zk: bool) -> eyre::Result<()> {
+    let cargo = if zk { GUEST_CARGO_ZK } else { GUEST_CARGO };
     let mut cargo_file = File::create(format!("{name}/guest/Cargo.toml"))?;
-    cargo_file.write_all(GUEST_CARGO.as_bytes())?;
+    cargo_file.write_all(cargo.as_bytes())?;
 
+    let lib = if zk { GUEST_LIB_ZK } else { GUEST_LIB };
     let mut lib_file = File::create(format!("{name}/guest/src/lib.rs"))?;
-    lib_file.write_all(GUEST_LIB.as_bytes())?;
+    lib_file.write_all(lib.as_bytes())?;
 
     let mut main_file = File::create(format!("{name}/guest/src/main.rs"))?;
     main_file.write_all(GUEST_MAIN.as_bytes())?;
@@ -124,6 +460,9 @@ fn create_guest_files(name: &str) -> Result<()> {
 }
 
 fn display_welcome() {
+    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        return;
+    }
     display_greeting();
     println!("{}", "-".repeat(80));
     display_sysinfo();
@@ -161,9 +500,9 @@ fn display_greeting() {
 }
 
 fn display_sysinfo() {
-    let mut sys = System::new_all();
-
-    sys.refresh_all();
+    let mut sys = System::new();
+    sys.refresh_memory();
+    sys.refresh_cpu_all();
 
     println!(
         "OS:             {}",
@@ -227,13 +566,70 @@ pub fn main() {
     let prover_preprocessing = guest::preprocess_prover_fib(shared_preprocessing.clone());
     let verifier_setup = prover_preprocessing.generators.to_verifier_setup();
     let verifier_preprocessing =
-        guest::preprocess_verifier_fib(shared_preprocessing, verifier_setup);
+        guest::preprocess_verifier_fib(shared_preprocessing, verifier_setup, None);
 
     let prove_fib = guest::build_prover_fib(program, prover_preprocessing);
     let verify_fib = guest::build_verifier_fib(verifier_preprocessing);
 
     let (output, proof, io_device) = prove_fib(50);
     let is_valid = verify_fib(50, output, io_device.panic, proof);
+
+    info!("output: {output}");
+    info!("valid: {is_valid}");
+}
+"#;
+
+const HOST_CARGO_TEMPLATE_ZK: &str = r#"[package]
+name = "{NAME}"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = ["guest"]
+
+[profile.release]
+debug = 1
+codegen-units = 1
+lto = "fat"
+
+[dependencies]
+jolt-sdk = { git = "https://github.com/a16z/jolt", features = ["host", "zk"] }
+guest = { path = "./guest" }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[patch.crates-io]
+ark-ff = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
+ark-ec = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
+jolt-optimizations = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
+ark-serialize = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
+ark-bn254 = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
+allocative = { git = "https://github.com/facebookexperimental/allocative", rev = "85b773d85d526d068ce94724ff7a7b81203fc95e" }
+"#;
+
+const HOST_MAIN_ZK: &str = r#"use jolt_sdk::PrivateInput;
+use tracing::info;
+
+pub fn main() {
+    tracing_subscriber::fmt::init();
+
+    let target_dir = "/tmp/jolt-guest-targets";
+    let mut program = guest::compile_fib(target_dir);
+
+    let shared_preprocessing = guest::preprocess_shared_fib(&mut program);
+
+    let prover_preprocessing = guest::preprocess_prover_fib(shared_preprocessing.clone());
+    let verifier_setup = prover_preprocessing.generators.to_verifier_setup();
+    let blindfold_setup = prover_preprocessing.blindfold_setup();
+    let verifier_preprocessing =
+        guest::preprocess_verifier_fib(shared_preprocessing, verifier_setup, Some(blindfold_setup));
+
+    let prove_fib = guest::build_prover_fib(program, prover_preprocessing);
+    let verify_fib = guest::build_verifier_fib(verifier_preprocessing);
+
+    // n is private — verifier doesn't receive it
+    let (output, proof, io_device) = prove_fib(PrivateInput::new(50));
+    let is_valid = verify_fib(output, io_device.panic, proof);
 
     info!("output: {output}");
     info!("valid: {is_valid}");
@@ -254,14 +650,44 @@ guest = []
 jolt = { package = "jolt-sdk", git = "https://github.com/a16z/jolt" }
 "#;
 
+const GUEST_CARGO_ZK: &str = r#"[package]
+name = "guest"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+guest = []
+
+[dependencies]
+jolt = { package = "jolt-sdk", git = "https://github.com/a16z/jolt", features = ["zk"] }
+"#;
+
 const GUEST_LIB: &str = r#"#![cfg_attr(feature = "guest", no_std)]
 
-#[jolt::provable(memory_size = 32768, max_trace_length = 65536)]
+#[jolt::provable(heap_size = 32768, max_trace_length = 65536)]
 fn fib(n: u32) -> u128 {
     let mut a: u128 = 0;
     let mut b: u128 = 1;
     let mut sum: u128;
     for _ in 1..n {
+        sum = a + b;
+        a = b;
+        b = sum;
+    }
+
+    b
+}
+"#;
+
+const GUEST_LIB_ZK: &str = r#"#![cfg_attr(feature = "guest", no_std)]
+use jolt::PrivateInput;
+
+#[jolt::provable(heap_size = 32768, max_trace_length = 65536)]
+fn fib(n: PrivateInput<u32>) -> u128 {
+    let mut a: u128 = 0;
+    let mut b: u128 = 1;
+    let mut sum: u128;
+    for _ in 1..*n {
         sum = a + b;
         a = b;
         b = sum;

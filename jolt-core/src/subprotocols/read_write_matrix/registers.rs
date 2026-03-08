@@ -9,10 +9,16 @@ use num::Integer;
 use crate::field::JoltField;
 use crate::field::OptimizedMul;
 use crate::poly::multilinear_polynomial::MultilinearPolynomial;
+use crate::poly::split_eq_poly::GruenSplitEqPolynomial;
+use crate::poly::unipoly::UniPoly;
 use crate::subprotocols::read_write_matrix::address_major::AddressMajorMatrixEntry;
 use crate::subprotocols::read_write_matrix::cycle_major::CycleMajorMatrixEntry;
+use crate::subprotocols::read_write_matrix::one_hot_coeffs::LookupTableIndex;
+use crate::subprotocols::read_write_matrix::one_hot_coeffs::OneHotCoeff;
+use crate::subprotocols::read_write_matrix::one_hot_coeffs::OneHotCoeffLookupTable;
 use crate::subprotocols::read_write_matrix::ReadWriteMatrixAddressMajor;
 use crate::subprotocols::read_write_matrix::ReadWriteMatrixCycleMajor;
+use crate::utils::math::Math;
 use crate::utils::thread::unsafe_allocate_zero_vec;
 use rayon::prelude::*;
 use tracer::instruction::Cycle;
@@ -32,12 +38,14 @@ use tracer::instruction::Cycle;
 /// # Type Parameters
 ///
 /// - `F`: The field type for coefficients.
+///
+/// Fields are ordered largest-first to minimize padding when `C` is small
+/// (e.g. `LookupTableIndex(u16)`): `col: u8` packs into the tail padding
+/// alongside `ra_coeff` and `wa_coeff`, keeping the struct at 64 bytes.
 #[derive(Allocative, Debug, PartialEq, Clone, Copy, Default)]
-pub struct RegistersCycleMajorEntry<F: JoltField> {
-    /// The row index. Before binding, row \in [0, T)
-    pub row: usize,
-    /// The column index. Before binding, col \in [0, K)
-    pub col: u8,
+pub struct RegistersCycleMajorEntry<F: JoltField, C: OneHotCoeff<F>> {
+    /// The Val coefficient for this matrix entry.
+    pub val_coeff: F,
     /// In round i, each ReadWriteEntry represents a coefficient
     ///   Val(k, j', r)
     /// which is some combination of Val(k, j', 00...0), ...
@@ -46,242 +54,221 @@ pub struct RegistersCycleMajorEntry<F: JoltField> {
     /// Val(k, j', 00...0) –– abusing notation, `prev_val` is
     /// Val(k, j'-1, 11...1)
     pub(crate) prev_val: u64,
-    /// In round i, each ReadWriteEntry represents a coefficient
-    ///   Val(k, j', r)
-    /// which is some combination of Val(k, j', 00...0), ...
-    /// Val(k, j', 11...1).
     /// `next_val` contains the unbound coefficient after
     /// Val(k, j', 00...0) –– abusing notation, `next_val` is
     /// Val(k, j'+1, 00...0)
     pub(crate) next_val: u64,
-    /// The Val coefficient for this matrix entry.
-    pub val_coeff: F,
+    /// Row index (cycle count, row \in [0, T)).
+    row: usize,
     /// Coefficient for the combined ra polynomial, equal to
     /// gamma * rs1_ra + gamma^2 * rs2_ra
-    pub ra_coeff: F,
-    pub wa_coeff: F,
+    pub ra_coeff: C,
+    pub wa_coeff: C,
+    /// Column index (register index, col \in [0, K), K=128).
+    col: u8,
 }
 
-impl<F: JoltField> ReadWriteMatrixCycleMajor<F, RegistersCycleMajorEntry<F>> {
-        /// 计算单个 Cycle 涉及的**不同**寄存器数量 (0–3)。
-        ///
-        /// 在构建稀疏矩阵时，核心关注点是“(Cycle, Register)”元组。
-        /// 即使一条指令涉及多个操作数（rs1, rs2, rd），如果它们指向同一个物理寄存器（例如 `add x1, x1, x1`），
-        /// 则在矩阵中应被视为同一个条目，其读写系数会被累加。
-        ///
-        /// 返回值 `len` 表示矩阵中该 Cycle 对应的行将包含多少个非零元素。
-        #[inline]
-        fn entry_count_for_cycle(cycle: &Cycle) -> u8 {
-            let mut regs: [Option<_>; 3] = [None, None, None];
-            let mut len = 0;
+impl<F: JoltField> ReadWriteMatrixCycleMajor<F, RegistersCycleMajorEntry<F, LookupTableIndex>> {
+    /// Count how many distinct registers this cycle touches (0–3).
+    #[inline]
+    fn entry_count_for_cycle(cycle: &Cycle) -> u8 {
+        let mut regs: [Option<_>; 3] = [None, None, None];
+        let mut len = 0;
 
-            // 检查 rs1 是否是新出现的寄存器
-            if let Some((rs1, _)) = cycle.rs1_read() {
-                if !regs[..len].contains(&Some(rs1)) {
-                    regs[len] = Some(rs1);
-                    len += 1;
-                }
+        if let Some((rs1, _)) = cycle.rs1_read() {
+            if !regs[..len].contains(&Some(rs1)) {
+                regs[len] = Some(rs1);
+                len += 1;
             }
-            // 检查 rs2 是否是新出现的寄存器
-            if let Some((rs2, _)) = cycle.rs2_read() {
-                if !regs[..len].contains(&Some(rs2)) {
-                    regs[len] = Some(rs2);
-                    len += 1;
-                }
+        }
+        if let Some((rs2, _)) = cycle.rs2_read() {
+            if !regs[..len].contains(&Some(rs2)) {
+                regs[len] = Some(rs2);
+                len += 1;
             }
-            // 检查 rd 是否是新出现的寄存器
-            if let Some((rd, ..)) = cycle.rd_write() {
-                if !regs[..len].contains(&Some(rd)) {
-                    regs[len] = Some(rd);
-                    len += 1;
-                }
+        }
+        if let Some((rd, ..)) = cycle.rd_write() {
+            if !regs[..len].contains(&Some(rd)) {
+                len += 1;
             }
-
-            len as u8
         }
 
-        /// 填充单个 Cycle 的矩阵条目，并按列 (寄存器索引) 排序。
-        ///
-        /// ### 数学公式与聚合逻辑
-        /// 我们需要构建读写多项式的系数。对于每个活跃的寄存器 $k$ 和周期 $j$：
-        ///
-        /// 1.  **Read Address Indicator (ra)**:
-        ///     使用 Verifier 提供的随机数 $\gamma$ 区分 rs1 和 rs2：
-        ///     $$ ra(k, j) = \gamma \cdot \mathbb{I}(rs1_j = k) + \gamma^2 \cdot \mathbb{I}(rs2_j = k) $$
-        ///     这意味着如果同一个寄存器既是 rs1 又是 rs2，系数相加。
-        ///
-        /// 2.  **Write Address Indicator (wa)**:
-        ///     $$ wa(k, j) = \mathbb{I}(rd_j = k) $$
-        ///     如果发生写入，系数为 1。
-        ///
-        /// 3.  **Values (val/prev/next)**:
-        ///     - `val_coeff` / `prev_val`: 操作**前**的值 $v_{pre}$。
-        ///     - `next_val`: 操作**后**的值 $v_{post}$。
-        #[inline]
-        fn fill_entries_for_cycle(
-            row: usize, // 当前 Cycle 索引 j
-            cycle: &Cycle,
-            out: &mut [RegistersCycleMajorEntry<F>],
-            gamma: F,
-            gamma_squared: F,
-        ) {
-            debug_assert!(out.len() <= 3);
-            let mut len = 0usize;
+        len as u8
+    }
 
-            // --- 处理 rs1 (源寄存器 1) ---
-            // 贡献: ra += gamma
-            if let Some((rs1, rs1_val)) = cycle.rs1_read() {
+    /// Fill the per-cycle entries into `out` (length 0–3), sorted by `col`.
+    #[inline]
+    fn fill_entries_for_cycle(
+        row: usize,
+        cycle: &Cycle,
+        out: &mut [RegistersCycleMajorEntry<F, LookupTableIndex>],
+    ) {
+        debug_assert!(out.len() <= 3);
+        let mut len = 0usize;
+
+        if let Some((rs1, rs1_val)) = cycle.rs1_read() {
+            out[len] = RegistersCycleMajorEntry {
+                row,
+                col: rs1,
+                prev_val: rs1_val,
+                next_val: rs1_val,
+                val_coeff: F::from_u64(rs1_val),
+                ra_coeff: LookupTableIndex(1),
+                wa_coeff: LookupTableIndex(0),
+            };
+            len += 1;
+        }
+
+        if let Some((rs2, rs2_val)) = cycle.rs2_read() {
+            if let Some(e) = out[..len].iter_mut().find(|e| e.column() as u8 == rs2) {
+                e.ra_coeff = LookupTableIndex(3); // rs1_ra = rs2_ra = 1
+            } else {
                 out[len] = RegistersCycleMajorEntry {
                     row,
-                    col: rs1,
-                    prev_val: rs1_val,
-                    next_val: rs1_val,          // 默认为读，值不变
-                    val_coeff: F::from_u64(rs1_val),
-                    ra_coeff: gamma,            // rs1 贡献 gamma
-                    wa_coeff: F::zero(),
+                    col: rs2,
+                    prev_val: rs2_val,
+                    next_val: rs2_val,
+                    val_coeff: F::from_u64(rs2_val),
+                    ra_coeff: LookupTableIndex(2),
+                    wa_coeff: LookupTableIndex(0),
                 };
                 len += 1;
             }
+        }
 
-            // --- 处理 rs2 (源寄存器 2) ---
-            // 贡献: ra += gamma^2
-            if let Some((rs2, rs2_val)) = cycle.rs2_read() {
-                // 检查 rs2 是否与 rs1 是同一个寄存器
-                if let Some(e) = out[..len].iter_mut().find(|e| e.col == rs2) {
-                    //如果是同一寄存器，累加 ra 系数
-                    // Formula: ra = ra_old + gamma^2 = gamma + gamma^2
-                    e.ra_coeff += gamma_squared;
-                } else {
-                    // 如果是新寄存器，创建新条目
-                    out[len] = RegistersCycleMajorEntry {
-                        row,
-                        col: rs2,
-                        prev_val: rs2_val,
-                        next_val: rs2_val,
-                        val_coeff: F::from_u64(rs2_val),
-                        ra_coeff: gamma_squared,    // rs2 贡献 gamma^2
-                        wa_coeff: F::zero(),
-                    };
-                    len += 1;
-                }
-            }
-
-            // --- 处理 rd (目标寄存器) ---
-            // 贡献: wa += 1, 且更新 next_val
-            if let Some((rd, rd_pre_val, rd_post_val)) = cycle.rd_write() {
-                if let Some(e) = out[..len].iter_mut().find(|e| e.col == rd) {
-                    // 如果 rd 之前已被读取 (是 rs1 或 rs2)
-                    // Formula: wa = 1
-                    e.wa_coeff = F::one();
-                    // Formula: next_val = v_post (写入的新值)
-                    e.next_val = rd_post_val;
-                } else {
-                    // 如果只是被写入 (如 ADDI x1, x0, 10)，创建新条目
-                    out[len] = RegistersCycleMajorEntry {
-                        row,
-                        col: rd,
-                        prev_val: rd_pre_val,
-                        next_val: rd_post_val,
-                        // val_coeff 始终存储操作前的值 v_pre
-                        val_coeff: F::from_u64(rd_pre_val),
-                        ra_coeff: F::zero(),
-                        wa_coeff: F::one(), // rd 贡献 wa = 1
-                    };
-                    len += 1;
-                }
-            }
-
-            debug_assert_eq!(len, out.len());
-
-            // --- 排序 ---
-            // 对输出条目按寄存器索引 (col) 进行排序。
-            // 这对于后续 Sumcheck Phase 2 转换为 Address-Major 格式至关重要。
-            // 由于 len <= 3，使用简单的比较交换网络 (Sorting Network) 即可。
-            match len {
-                0 | 1 => {}
-                2 => {
-                    if out[0].col > out[1].col {
-                        out.swap(0, 1);
-                    }
-                }
-                3 => {
-                    if out[0].col > out[1].col {
-                        out.swap(0, 1);
-                    }
-                    if out[1].col > out[2].col {
-                        out.swap(1, 2);
-                    }
-                    if out[0].col > out[1].col {
-                        out.swap(0, 1);
-                    }
-                }
-                _ => unreachable!(),
+        if let Some((rd, rd_pre_val, rd_post_val)) = cycle.rd_write() {
+            if let Some(e) = out[..len].iter_mut().find(|e| e.column() as u8 == rd) {
+                // Same register is read and then written this cycle.
+                e.wa_coeff = LookupTableIndex(1);
+                e.next_val = rd_post_val;
+            } else {
+                out[len] = RegistersCycleMajorEntry {
+                    row,
+                    col: rd,
+                    prev_val: rd_pre_val,
+                    next_val: rd_post_val,
+                    // val_coeff stores the value *before* any access at this cycle.
+                    val_coeff: F::from_u64(rd_pre_val),
+                    ra_coeff: LookupTableIndex(0),
+                    wa_coeff: LookupTableIndex(1),
+                };
+                len += 1;
             }
         }
 
-        /// 创建新的 `ReadWriteMatrixCycleMajor` 实例。
-        ///
-        /// 这个函数采用 **"Count -> Offset -> Fill"** 的并行模式来高效构建稀疏矩阵。
-        ///
-        /// 1. **Parallel Count**: 并行统计每个 Cycle 生成的寄存器数量。
-        /// 2. **Prefix Sum**: 计算偏移量，确定每个 Cycle 的数据在扁平数组中的位置。
-        /// 3. **Parallel Fill**: 并行填充实际数据，无锁且内存访问不冲突。
-        #[tracing::instrument(skip_all, name = "ReadWriteMatrixCycleMajor::new")]
-        pub fn new(trace: &[Cycle], gamma: F) -> Self {
-            // [Pass 1]: 并行统计每个 cycle 的寄存器数量 (0, 1, 2 或 3)
-            let counts: Vec<u8> = trace
-                .par_iter()
-                .map(|cycle| Self::entry_count_for_cycle(cycle))
-                .collect();
+        debug_assert_eq!(len, out.len());
 
-            // [Prefix Sum]: 计算前缀和，得到每个 cycle 在结果数组中的起始偏移量
-            // offsets[j] = sum(counts[0..j])
-            let mut offsets: Vec<usize> = Vec::with_capacity(counts.len() + 1);
-            offsets.push(0);
-            let mut total: usize = 0;
-            for &c in &counts {
-                total += c as usize;
-                offsets.push(total);
-            }
-            let total_entries = total;
-
-            // [Allocation]: 分配未初始化的内存
-            // 使用 unsafe set_len 避免初始化开销，因为我们保证在 Pass 2 会填充所有位置。
-            let mut entries: Vec<RegistersCycleMajorEntry<F>> = Vec::with_capacity(total_entries);
-            unsafe {
-                entries.set_len(total_entries);
-            }
-            let entries_ptr = entries.as_mut_ptr() as usize;
-
-            // [Pass 2]: 并行填充数据，为每个trace的每个寄存器，保持对应的RegistersCycleMajorEntry状态，如row,col,prev_val,next_val,val_coeff,ra_coeff,wa_coeff
-            // 每个线程拿到自己对应的 trace cycle 和 target buffer slice，互不干扰。
-            let gamma_squared = gamma.square();
-            trace.par_iter().enumerate().for_each(|(j, cycle)| {
-                let count = counts[j] as usize;
-                if count == 0 {
-                    return;
+        // Sort by col for this row; len <= 3 so do a tiny manual sort.
+        match len {
+            0 | 1 => {}
+            2 => {
+                if out[0].column() > out[1].column() {
+                    out.swap(0, 1);
                 }
-
-                let start = offsets[j] as isize;
-                // 将 usize 指针转回裸指针
-                let entries_ptr = entries_ptr as *mut RegistersCycleMajorEntry<F>;
-                unsafe {
-                    // 计算当前任务的写入起始地址
-                    let dst = entries_ptr.offset(start);
-                    // 创建一个可变切片供 fill_entries_for_cycle 写入
-                    let slice = std::slice::from_raw_parts_mut(dst, count);
-                    Self::fill_entries_for_cycle(j, cycle, slice, gamma, gamma_squared);
-                }
-            });
-
-            ReadWriteMatrixCycleMajor {
-                entries,
-                val_init: vec![F::zero(); REGISTER_COUNT as usize].into(),
             }
+            3 => {
+                if out[0].column() > out[1].column() {
+                    out.swap(0, 1);
+                }
+                if out[1].column() > out[2].column() {
+                    out.swap(1, 2);
+                }
+                if out[0].column() > out[1].column() {
+                    out.swap(0, 1);
+                }
+            }
+            _ => unreachable!(),
         }
     }
 
-impl<F: JoltField> CycleMajorMatrixEntry<F> for RegistersCycleMajorEntry<F> {
+    /// Creates a new `ReadWriteMatrixCycleMajor` to represent the ra, wa and Val polynomials
+    /// for the registers read/write checking sumcheck.
+    #[tracing::instrument(skip_all, name = "ReadWriteMatrixCycleMajor::new")]
+    pub fn new(trace: &[Cycle], gamma: F) -> Self {
+        // ---- Pass 1: per-cycle entry counts (parallel) ----
+        let counts: Vec<u8> = trace
+            .par_iter()
+            .map(|cycle| Self::entry_count_for_cycle(cycle))
+            .collect();
+
+        // ---- Prefix sum: counts -> offsets (sequential, linear) ----
+        let mut offsets: Vec<usize> = Vec::with_capacity(counts.len() + 1);
+        offsets.push(0);
+        let mut total: usize = 0;
+        for &c in &counts {
+            total += c as usize;
+            offsets.push(total);
+        }
+        let total_entries = total;
+
+        // ---- Allocate entries and set_len unsafely; we'll fill everything in pass 2 ----
+        let mut entries: Vec<RegistersCycleMajorEntry<F, LookupTableIndex>> =
+            Vec::with_capacity(total_entries);
+        unsafe {
+            entries.set_len(total_entries);
+        }
+        let entries_ptr = entries.as_mut_ptr() as usize;
+
+        // ---- Pass 2: fill entries in parallel, disjoint slices per row ----
+        let gamma_squared = gamma.square();
+        trace.par_iter().enumerate().for_each(|(j, cycle)| {
+            let count = counts[j] as usize;
+            if count == 0 {
+                return;
+            }
+
+            let start = offsets[j] as isize;
+            let entries_ptr = entries_ptr as *mut RegistersCycleMajorEntry<F, LookupTableIndex>;
+            unsafe {
+                let dst = entries_ptr.offset(start);
+                let slice = std::slice::from_raw_parts_mut(dst, count);
+                Self::fill_entries_for_cycle(j, cycle, slice);
+            }
+        });
+
+        ReadWriteMatrixCycleMajor {
+            entries,
+            ra_lookup_table: Some(OneHotCoeffLookupTable::new(vec![
+                F::zero(),             // rs1_ra = 0, rs2_ra = 0
+                gamma,                 // rs1_ra = 1, rs2_ra = 0
+                gamma_squared,         // rs1_ra = 0, rs2_ra = 1
+                gamma + gamma_squared, // rs1_ra = 1, rs2_ra = 1
+            ])),
+            wa_lookup_table: Some(OneHotCoeffLookupTable::new(vec![F::zero(), F::one()])),
+            val_init: vec![F::zero(); REGISTER_COUNT as usize].into(),
+        }
+    }
+
+    pub fn deref_coeffs(self) -> ReadWriteMatrixCycleMajor<F, RegistersCycleMajorEntry<F, F>> {
+        let val_init = self.val_init;
+        let ra_lookup_table = self.ra_lookup_table.unwrap();
+        let wa_lookup_table = self.wa_lookup_table.unwrap();
+        let entries = self
+            .entries
+            .into_par_iter()
+            .map(|entry| RegistersCycleMajorEntry {
+                row: entry.row,
+                col: entry.col,
+                prev_val: entry.prev_val,
+                next_val: entry.next_val,
+                val_coeff: entry.val_coeff,
+                ra_coeff: ra_lookup_table[entry.ra_coeff],
+                wa_coeff: wa_lookup_table[entry.wa_coeff],
+            })
+            .collect();
+
+        ReadWriteMatrixCycleMajor {
+            entries,
+            ra_lookup_table: None,
+            wa_lookup_table: None,
+            val_init,
+        }
+    }
+}
+
+impl<F: JoltField, C: OneHotCoeff<F>> CycleMajorMatrixEntry<F> for RegistersCycleMajorEntry<F, C> {
+    type AddressMajor = RegistersAddressMajorEntry<F>;
+
     fn row(&self) -> usize {
         self.row
     }
@@ -290,17 +277,33 @@ impl<F: JoltField> CycleMajorMatrixEntry<F> for RegistersCycleMajorEntry<F> {
         self.col as usize
     }
 
-    fn bind_entries(even: Option<&Self>, odd: Option<&Self>, r: F::Challenge) -> Self {
+    fn bind_entries(
+        even: Option<&Self>,
+        odd: Option<&Self>,
+        r: F::Challenge,
+        ra_lookup_table: Option<&OneHotCoeffLookupTable<F>>,
+        wa_lookup_table: Option<&OneHotCoeffLookupTable<F>>,
+    ) -> Self {
         match (even, odd) {
             (Some(even), Some(odd)) => {
-                debug_assert!(even.row.is_even());
-                debug_assert!(odd.row.is_odd());
-                debug_assert_eq!(even.col, odd.col);
+                debug_assert!(even.row().is_even());
+                debug_assert!(odd.row().is_odd());
+                debug_assert_eq!(even.column(), odd.column());
                 RegistersCycleMajorEntry {
                     row: even.row / 2,
                     col: even.col,
-                    ra_coeff: even.ra_coeff + r.mul_01_optimized(odd.ra_coeff - even.ra_coeff),
-                    wa_coeff: even.wa_coeff + r.mul_01_optimized(odd.wa_coeff - even.wa_coeff),
+                    ra_coeff: OneHotCoeff::bind(
+                        Some(&even.ra_coeff),
+                        Some(&odd.ra_coeff),
+                        r,
+                        ra_lookup_table,
+                    ),
+                    wa_coeff: OneHotCoeff::bind(
+                        Some(&even.wa_coeff),
+                        Some(&odd.wa_coeff),
+                        r,
+                        wa_lookup_table,
+                    ),
                     val_coeff: even.val_coeff + r.mul_0_optimized(odd.val_coeff - even.val_coeff),
                     prev_val: even.prev_val,
                     next_val: odd.next_val,
@@ -316,8 +319,8 @@ impl<F: JoltField> CycleMajorMatrixEntry<F> for RegistersCycleMajorEntry<F> {
                 RegistersCycleMajorEntry {
                     row: even.row / 2,
                     col: even.col,
-                    ra_coeff: (F::one() - r).mul_01_optimized(even.ra_coeff),
-                    wa_coeff: (F::one() - r).mul_01_optimized(even.wa_coeff),
+                    ra_coeff: OneHotCoeff::bind(Some(&even.ra_coeff), None, r, ra_lookup_table),
+                    wa_coeff: OneHotCoeff::bind(Some(&even.wa_coeff), None, r, wa_lookup_table),
                     val_coeff: even.val_coeff + r.mul_0_optimized(odd_val_coeff - even.val_coeff),
                     prev_val: even.prev_val,
                     next_val: even.next_val,
@@ -333,8 +336,8 @@ impl<F: JoltField> CycleMajorMatrixEntry<F> for RegistersCycleMajorEntry<F> {
                 RegistersCycleMajorEntry {
                     row: odd.row / 2,
                     col: odd.col,
-                    ra_coeff: r.mul_01_optimized(odd.ra_coeff),
-                    wa_coeff: r.mul_01_optimized(odd.wa_coeff),
+                    ra_coeff: OneHotCoeff::bind(None, Some(&odd.ra_coeff), r, ra_lookup_table),
+                    wa_coeff: OneHotCoeff::bind(None, Some(&odd.wa_coeff), r, wa_lookup_table),
                     val_coeff: even_val_coeff + r.mul_0_optimized(odd.val_coeff - even_val_coeff),
                     prev_val: odd.prev_val,
                     next_val: odd.next_val,
@@ -349,51 +352,71 @@ impl<F: JoltField> CycleMajorMatrixEntry<F> for RegistersCycleMajorEntry<F> {
         odd: Option<&Self>,
         inc_evals: [F; 2],
         _gamma: F,
-    ) -> [F::Unreduced<8>; 2] {
+        ra_lookup_table: Option<&OneHotCoeffLookupTable<F>>,
+        wa_lookup_table: Option<&OneHotCoeffLookupTable<F>>,
+    ) -> [F::UnreducedProduct; 2] {
         match (even, odd) {
             (Some(even), Some(odd)) => {
-                debug_assert!(even.row.is_even());
-                debug_assert!(odd.row.is_odd());
-                debug_assert_eq!(even.col, odd.col);
-                let ra_evals = [even.ra_coeff, odd.ra_coeff - even.ra_coeff];
-                let wa_evals = [even.wa_coeff, odd.wa_coeff - even.wa_coeff];
+                debug_assert!(even.row().is_even());
+                debug_assert!(odd.row().is_odd());
+                debug_assert_eq!(even.column(), odd.column());
+                let ra_evals =
+                    OneHotCoeff::evals(Some(&even.ra_coeff), Some(&odd.ra_coeff), ra_lookup_table);
+                let wa_evals =
+                    OneHotCoeff::evals(Some(&even.wa_coeff), Some(&odd.wa_coeff), wa_lookup_table);
                 let val_evals = [even.val_coeff, odd.val_coeff - even.val_coeff];
                 [
-                    ra_evals[0].mul_unreduced::<8>(val_evals[0])
-                        + wa_evals[0].mul_unreduced::<8>(val_evals[0] + inc_evals[0]),
-                    ra_evals[1].mul_unreduced::<8>(val_evals[1])
-                        + wa_evals[1].mul_unreduced::<8>(val_evals[1] + inc_evals[1]),
+                    ra_evals[0].mul_to_product(val_evals[0])
+                        + wa_evals[0].mul_to_product(val_evals[0] + inc_evals[0]),
+                    ra_evals[1].mul_to_product(val_evals[1])
+                        + wa_evals[1].mul_to_product(val_evals[1] + inc_evals[1]),
                 ]
             }
             (Some(even), None) => {
                 let odd_val_coeff = F::from_u64(even.next_val);
-                let ra_evals = [even.ra_coeff, -even.ra_coeff];
-                let wa_evals = [even.wa_coeff, -even.wa_coeff];
+                let ra_evals = OneHotCoeff::evals(Some(&even.ra_coeff), None, ra_lookup_table);
+                let wa_evals = OneHotCoeff::evals(Some(&even.wa_coeff), None, wa_lookup_table);
                 let val_evals = [even.val_coeff, odd_val_coeff - even.val_coeff];
                 [
-                    ra_evals[0].mul_unreduced::<8>(val_evals[0])
-                        + wa_evals[0].mul_unreduced::<8>(val_evals[0] + inc_evals[0]),
-                    ra_evals[1].mul_unreduced::<8>(val_evals[1])
-                        + wa_evals[1].mul_unreduced::<8>(val_evals[1] + inc_evals[1]),
+                    ra_evals[0].mul_to_product(val_evals[0])
+                        + wa_evals[0].mul_to_product(val_evals[0] + inc_evals[0]),
+                    ra_evals[1].mul_to_product(val_evals[1])
+                        + wa_evals[1].mul_to_product(val_evals[1] + inc_evals[1]),
                 ]
             }
             (None, Some(odd)) => {
                 let even_val_coeff = F::from_u64(odd.prev_val);
-                let ra_evals = [F::zero(), odd.ra_coeff];
-                let wa_evals = [F::zero(), odd.wa_coeff];
+                let ra_evals = OneHotCoeff::evals(None, Some(&odd.ra_coeff), ra_lookup_table);
+                let wa_evals = OneHotCoeff::evals(None, Some(&odd.wa_coeff), wa_lookup_table);
                 let val_evals = [even_val_coeff, odd.val_coeff - even_val_coeff];
                 [
-                    F::Unreduced::zero(),
-                    ra_evals[1].mul_unreduced::<8>(val_evals[1])
-                        + wa_evals[1].mul_unreduced::<8>(val_evals[1] + inc_evals[1]),
+                    F::UnreducedProduct::zero(),
+                    ra_evals[1].mul_to_product(val_evals[1])
+                        + wa_evals[1].mul_to_product(val_evals[1] + inc_evals[1]),
                 ]
             }
             (None, None) => panic!("Both entries are None"),
         }
     }
+
+    fn to_address_major(
+        self,
+        ra_lookup_table: Option<&OneHotCoeffLookupTable<F>>,
+        wa_lookup_table: Option<&OneHotCoeffLookupTable<F>>,
+    ) -> Self::AddressMajor {
+        RegistersAddressMajorEntry {
+            row: self.row,
+            col: self.col,
+            prev_val: F::from_u64(self.prev_val),
+            next_val: F::from_u64(self.next_val),
+            val_coeff: self.val_coeff,
+            ra_coeff: self.ra_coeff.to_field(ra_lookup_table),
+            wa_coeff: self.wa_coeff.to_field(wa_lookup_table),
+        }
+    }
 }
 
-impl<F: JoltField> ReadWriteMatrixCycleMajor<F, RegistersCycleMajorEntry<F>> {
+impl<F: JoltField, C: OneHotCoeff<F>> ReadWriteMatrixCycleMajor<F, RegistersCycleMajorEntry<F, C>> {
     /// Materializes the ra, wa and Val polynomials represented by this `ReadWriteMatrixCycleMajor`.
     ///
     /// After partial binding of cycle and address variables, there are `K_prime` columns
@@ -434,40 +457,103 @@ impl<F: JoltField> ReadWriteMatrixCycleMajor<F, RegistersCycleMajorEntry<F>> {
                 let ra_p = ra_ptr as *mut F;
                 let wa_p = wa_ptr as *mut F;
                 let val_p = val_ptr as *mut F;
-                *ra_p.add(idx) = entry.ra_coeff;
-                *wa_p.add(idx) = entry.wa_coeff;
+                *ra_p.add(idx) = entry.ra_coeff.to_field(self.ra_lookup_table.as_ref());
+                *wa_p.add(idx) = entry.wa_coeff.to_field(self.wa_lookup_table.as_ref());
                 *val_p.add(idx) = entry.val_coeff;
             }
         });
 
         [ra.into(), wa.into(), val.into()]
     }
+
+    pub fn compute_message(
+        &self,
+        inc: &MultilinearPolynomial<F>,
+        gruen_eq: &GruenSplitEqPolynomial<F>,
+        gamma: F,
+        previous_claim: F,
+    ) -> UniPoly<F> {
+        // Compute quadratic coefficients using Gruen's optimization.
+        // When E_in is fully bound (len <= 1), we use E_in_eval = 1 and num_x_in_bits = 0,
+        // which makes the outer chunking degenerate to row pairs and skips the inner sum.
+        let e_in = gruen_eq.E_in_current();
+        let e_in_len = e_in.len();
+        let num_x_in_bits = e_in_len.max(1).log_2(); // max(1) so log_2 of 0 or 1 gives 0
+        let x_bitmask = (1 << num_x_in_bits) - 1;
+
+        let quadratic_coeffs: [F; 2] = self
+            .entries
+            // Chunk by x_out (when E_in is bound, this is just row pairs)
+            .par_chunk_by(|a, b| ((a.row() / 2) >> num_x_in_bits) == ((b.row() / 2) >> num_x_in_bits))
+            .map(|entries| {
+                let x_out = (entries[0].row() / 2) >> num_x_in_bits;
+                let E_out_eval = gruen_eq.E_out_current()[x_out];
+
+                let outer_sum_evals = entries
+                    .par_chunk_by(|a, b| a.row() / 2 == b.row() / 2)
+                    .map(|entries| {
+                        let odd_row_start_index = entries.partition_point(|entry| entry.row().is_even());
+                        let (even_row, odd_row) = entries.split_at(odd_row_start_index);
+                        let j_prime = 2 * (entries[0].row() / 2);
+
+                        // When E_in is fully bound, x_in = 0 and E_in_eval = 1
+                        let E_in_eval = if e_in_len <= 1 {
+                            F::one()
+                        } else {
+                            let x_in = (j_prime / 2) & x_bitmask;
+                            e_in[x_in]
+                        };
+
+                        let inc_evals = {
+                            let inc_0 = inc.get_bound_coeff(j_prime);
+                            let inc_1 = inc.get_bound_coeff(j_prime + 1);
+                            let inc_infty = inc_1 - inc_0;
+                            [inc_0, inc_infty]
+                        };
+
+                        let inner_sum_evals = self.prover_message_contribution(
+                            even_row,
+                            odd_row,
+                            inc_evals,
+                            gamma,
+                        );
+
+                    [
+                        E_in_eval.mul_to_product_accum(inner_sum_evals[0]),
+                        E_in_eval.mul_to_product_accum(inner_sum_evals[1]),
+                    ]
+                })
+                .reduce(
+                    || [F::UnreducedProductAccum::zero(); 2],
+                    |running, new| [running[0] + new[0], running[1] + new[1]],
+                )
+                .map(F::reduce_product_accum);
+
+                [
+                    E_out_eval.mul_to_product_accum(outer_sum_evals[0]),
+                    E_out_eval.mul_to_product_accum(outer_sum_evals[1]),
+                ]
+            })
+            .reduce(
+                || [F::UnreducedProductAccum::zero(); 2],
+                |running, new| [running[0] + new[0], running[1] + new[1]],
+            )
+            .map(F::reduce_product_accum);
+
+        // Convert quadratic coefficients to cubic evaluations
+        gruen_eq.gruen_poly_deg_3(quadratic_coeffs[0], quadratic_coeffs[1], previous_claim)
+    }
 }
 
 /// Represents a non-zero entry in the ra(k, j) and Val(k, j) polynomials.
 /// Conceptually, both ra and Val can be seen as K x T matrices.
 ///
-/// # Type Parameters
-///
-/// - `F`: The field type for coefficients.
 #[derive(Allocative, Debug, PartialEq, Clone, Copy, Default)]
 pub struct RegistersAddressMajorEntry<F: JoltField> {
-    /// The row index. Before binding, row \in [0, T)
-    pub row: usize,
-    /// The column index. Before binding, col \in [0, K)
-    pub col: u8,
-    /// In round i, each ReadWriteEntry represents a coefficient
-    ///   Val(k, j', r)
-    /// which is some combination of Val(k, j', 00...0), ...
-    /// Val(k, j', 11...1).
     /// `prev_val` contains the unbound coefficient before
     /// Val(k, j', 00...0) –– abusing notation, `prev_val` is
     /// Val(k, j'-1, 11...1)
     pub(crate) prev_val: F,
-    /// In round i, each ReadWriteEntry represents a coefficient
-    ///   Val(k, j', r)
-    /// which is some combination of Val(k, j', 00...0), ...
-    /// Val(k, j', 11...1).
     /// `next_val` contains the unbound coefficient after
     /// Val(k, j', 00...0) –– abusing notation, `next_val` is
     /// Val(k, j'+1, 00...0)
@@ -476,20 +562,10 @@ pub struct RegistersAddressMajorEntry<F: JoltField> {
     pub val_coeff: F,
     pub ra_coeff: F,
     pub wa_coeff: F,
-}
-
-impl<F: JoltField> From<RegistersCycleMajorEntry<F>> for RegistersAddressMajorEntry<F> {
-    fn from(entry: RegistersCycleMajorEntry<F>) -> Self {
-        RegistersAddressMajorEntry {
-            row: entry.row,
-            col: entry.col,
-            prev_val: F::from_u64(entry.prev_val),
-            next_val: F::from_u64(entry.next_val),
-            val_coeff: entry.val_coeff,
-            ra_coeff: entry.ra_coeff,
-            wa_coeff: entry.wa_coeff,
-        }
-    }
+    /// Row index (cycle count, row \in [0, T)).
+    row: usize,
+    /// Column index (register index, col \in [0, K), K=128).
+    col: u8,
 }
 
 impl<F: JoltField> AddressMajorMatrixEntry<F> for RegistersAddressMajorEntry<F> {
@@ -518,9 +594,9 @@ impl<F: JoltField> AddressMajorMatrixEntry<F> for RegistersAddressMajorEntry<F> 
     ) -> Self {
         match (even, odd) {
             (Some(even), Some(odd)) => {
-                debug_assert!(even.col.is_even());
-                debug_assert!(odd.col.is_odd());
-                debug_assert_eq!(even.row, odd.row);
+                debug_assert!(even.column().is_even());
+                debug_assert!(odd.column().is_odd());
+                debug_assert_eq!(even.row(), odd.row());
                 RegistersAddressMajorEntry {
                     row: even.row,
                     col: even.col / 2,
@@ -575,12 +651,12 @@ impl<F: JoltField> AddressMajorMatrixEntry<F> for RegistersAddressMajorEntry<F> 
         inc_eval: F,
         eq_eval: F,
         _gamma: F,
-    ) -> [F::Unreduced<8>; 2] {
+    ) -> [F::UnreducedProduct; 2] {
         match (even, odd) {
             (Some(even), Some(odd)) => {
-                debug_assert!(even.col.is_even());
-                debug_assert!(odd.col.is_odd());
-                debug_assert_eq!(even.row, odd.row);
+                debug_assert!(even.column().is_even());
+                debug_assert!(odd.column().is_odd());
+                debug_assert_eq!(even.row(), odd.row());
                 let ra_evals = [even.ra_coeff, odd.ra_coeff + odd.ra_coeff - even.ra_coeff];
                 let wa_evals = [even.wa_coeff, odd.wa_coeff + odd.wa_coeff - even.wa_coeff];
                 let val_evals = [
@@ -588,20 +664,15 @@ impl<F: JoltField> AddressMajorMatrixEntry<F> for RegistersAddressMajorEntry<F> 
                     odd.val_coeff + odd.val_coeff - even.val_coeff,
                 ];
                 [
-                    eq_eval.mul_unreduced(
+                    eq_eval.mul_to_product(
                         ra_evals[0] * val_evals[0] + wa_evals[0] * (val_evals[0] + inc_eval),
                     ),
-                    eq_eval.mul_unreduced(
+                    eq_eval.mul_to_product(
                         ra_evals[1] * val_evals[1] + wa_evals[1] * (val_evals[1] + inc_eval),
                     ),
                 ]
             }
             (Some(even), None) => {
-                // For SparseMatrixPolynomial, the absence of a matrix entry implies
-                // that its coeff has not been bound yet.
-                // The absence of an odd-row entry in the same column as even
-                // means that its implicit Val coeff is odd_checkpoint, and its implicit
-                // ra coeff is 0.
                 let ra_evals = [even.ra_coeff, -even.ra_coeff];
                 let wa_evals = [even.wa_coeff, -even.wa_coeff];
                 let val_evals = [
@@ -609,20 +680,15 @@ impl<F: JoltField> AddressMajorMatrixEntry<F> for RegistersAddressMajorEntry<F> 
                     odd_checkpoint + odd_checkpoint - even.val_coeff,
                 ];
                 [
-                    eq_eval.mul_unreduced(
+                    eq_eval.mul_to_product(
                         ra_evals[0] * val_evals[0] + wa_evals[0] * (val_evals[0] + inc_eval),
                     ),
-                    eq_eval.mul_unreduced(
+                    eq_eval.mul_to_product(
                         ra_evals[1] * val_evals[1] + wa_evals[1] * (val_evals[1] + inc_eval),
                     ),
                 ]
             }
             (None, Some(odd)) => {
-                // For SparseMatrixPolynomial, the absence of a matrix entry implies
-                // that its coeff has not been bound yet.
-                // The absence of an even-row entry in the same column as odd
-                // means that its implicit Val coeff is even_checkpoint, and its implicit
-                // ra coeff is 0.
                 let ra_evals = [F::zero(), odd.ra_coeff + odd.ra_coeff];
                 let wa_evals = [F::zero(), odd.wa_coeff + odd.wa_coeff];
                 let val_evals = [
@@ -630,8 +696,8 @@ impl<F: JoltField> AddressMajorMatrixEntry<F> for RegistersAddressMajorEntry<F> 
                     odd.val_coeff + odd.val_coeff - even_checkpoint,
                 ];
                 [
-                    F::Unreduced::<8>::zero(), // ra_evals[0] is zero
-                    eq_eval.mul_unreduced(
+                    F::UnreducedProduct::zero(),
+                    eq_eval.mul_to_product(
                         ra_evals[1] * val_evals[1] + wa_evals[1] * (val_evals[1] + inc_eval),
                     ),
                 ]

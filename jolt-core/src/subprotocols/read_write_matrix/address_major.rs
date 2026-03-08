@@ -70,7 +70,7 @@ pub trait AddressMajorMatrixEntry<F: JoltField>: Send + Sync + Sized {
         inc_eval: F,
         eq_eval: F,
         gamma: F,
-    ) -> [F::Unreduced<8>; 2];
+    ) -> [F::UnreducedProduct; 2];
 }
 
 /// Represents the ra(k, j) and Val(k, j) polynomials for the RAM
@@ -85,8 +85,8 @@ pub struct ReadWriteMatrixAddressMajor<F: JoltField, E: AddressMajorMatrixEntry<
     pub(crate) val_init: MultilinearPolynomial<F>,
 }
 
-impl<F: JoltField, E1: CycleMajorMatrixEntry<F>, E2: AddressMajorMatrixEntry<F> + From<E1>>
-    From<ReadWriteMatrixCycleMajor<F, E1>> for ReadWriteMatrixAddressMajor<F, E2>
+impl<F: JoltField, E1: CycleMajorMatrixEntry<F>> From<ReadWriteMatrixCycleMajor<F, E1>>
+    for ReadWriteMatrixAddressMajor<F, E1::AddressMajor>
 {
     fn from(mut cycle_major: ReadWriteMatrixCycleMajor<F, E1>) -> Self {
         let mut entries = std::mem::take(&mut cycle_major.entries);
@@ -96,7 +96,15 @@ impl<F: JoltField, E1: CycleMajorMatrixEntry<F>, E2: AddressMajorMatrixEntry<F> 
             Ordering::Greater => Ordering::Greater,
             Ordering::Equal => a.row().cmp(&b.row()),
         });
-        let entries = entries.into_par_iter().map(|entry| entry.into()).collect();
+        let entries = entries
+            .into_par_iter()
+            .map(|entry| {
+                entry.to_address_major(
+                    cycle_major.ra_lookup_table.as_ref(),
+                    cycle_major.wa_lookup_table.as_ref(),
+                )
+            })
+            .collect();
         ReadWriteMatrixAddressMajor { entries, val_init }
     }
 }
@@ -501,7 +509,7 @@ impl<F: JoltField, E: AddressMajorMatrixEntry<F>> ReadWriteMatrixAddressMajor<F,
     ) -> [F; 2] {
         let mut i = 0;
         let mut j = 0;
-        let mut evals_accumulator = [F::Unreduced::<9>::zero(); 2];
+        let mut evals_accumulator = [F::UnreducedProductAccum::zero(); 2];
 
         while i < even.len() && j < odd.len() {
             if even[i].row() == odd[j].row() {
@@ -578,8 +586,8 @@ impl<F: JoltField, E: AddressMajorMatrixEntry<F>> ReadWriteMatrixAddressMajor<F,
         }
 
         [
-            F::from_montgomery_reduce(evals_accumulator[0]),
-            F::from_montgomery_reduce(evals_accumulator[1]),
+            F::reduce_product_accum(evals_accumulator[0]),
+            F::reduce_product_accum(evals_accumulator[1]),
         ]
     }
 }

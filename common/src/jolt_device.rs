@@ -1,4 +1,6 @@
+#[cfg(feature = "std")]
 use allocative::Allocative;
+#[cfg(feature = "std")]
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use serde::{Deserialize, Serialize};
 
@@ -8,9 +10,9 @@ use alloc::vec::Vec;
 use std::vec::Vec;
 
 use crate::constants::{
-    DEFAULT_MAX_INPUT_SIZE, DEFAULT_MAX_OUTPUT_SIZE, DEFAULT_MAX_TRUSTED_ADVICE_SIZE,
-    DEFAULT_MAX_UNTRUSTED_ADVICE_SIZE, DEFAULT_MEMORY_SIZE, DEFAULT_STACK_SIZE, RAM_START_ADDRESS,
-    STACK_CANARY_SIZE,
+    DEFAULT_HEAP_SIZE, DEFAULT_MAX_INPUT_SIZE, DEFAULT_MAX_OUTPUT_SIZE,
+    DEFAULT_MAX_TRUSTED_ADVICE_SIZE, DEFAULT_MAX_UNTRUSTED_ADVICE_SIZE, DEFAULT_STACK_SIZE,
+    RAM_START_ADDRESS, STACK_CANARY_SIZE,
 };
 
 #[allow(clippy::too_long_first_doc_paragraph)]
@@ -18,49 +20,10 @@ use crate::constants::{
 /// all reads from the reserved memory address space for program inputs and all writes
 /// to the reserved memory address space for program outputs.
 /// The inputs and outputs are part of the public inputs to the proof.
-/*
-`JoltDevice` 结构体在 Jolt 的 RISC-V 模拟器中扮演着“外围设备”（Peripheral Device）的角色。它负责处理所有指向特定保留内存
-区域的读写操作，用于管理程序的输入、输出以及辅助输入（Advice）。
-1.  **`inputs: Vec<u8>`**
-    *   **含义**: 存储宿主环境传递给 Guest 程序的标准输入数据。
-    *   **作用**: 当 Guest 程序尝试从内存布局中定义的输入区域（`input_start` 到 `input_end`）读取数据时，实际上是从这个
-     `Vec` 中读取字节。它是零知识证明中的主要公共输入（Public Inputs）之一。
-
-2.  **`trusted_advice: Vec<u8>`**
-    *   **含义**: 存储“可信辅助输入”（Trusted Advice）。
-    *   **作用**: 这通常指在预处理阶段就已知或已被承诺的数据。Guest 程序可以像读取内存一样读取这些数据。在零知识证明系统中，
-    这部分数据通常对应于 Verifier 已知或者在设置阶段固定的信息。
-
-3.  **`untrusted_advice: Vec<u8>`**
-    *   **含义**: 存储“不可信辅助输入”（Untrusted Advice）。
-    *   **作用**: 这是 Prover 在运行时提供的辅助信息（Hint），用于帮助计算或优化证明过程。由于它是不可信的，Verifier 需要
-    通过计算来验证其一致性（例如通过 Commit 机制）。Guest 程序也可以通过内存地址访问它。
-
-4.  **`outputs: Vec<u8>`**
-    *   **含义**: 存储 Guest 程序执行过程中产生的输出数据。
-    *   **作用**: 当 Guest 程序向内存布局中定义的输出区域（`output_start` 到 `output_end`）写入数据时，数据会被
-    追加或更新到这个 `Vec` 中。证明生成后，Verifier 会检查这些输出是否与 Prover 声称的一致。
-
-5.  **`panic: bool`**
-    *   **含义**: 一个布尔标志，指示 Guest 程序是否发生了恐慌（Panic）或异常终止。
-    *   **作用**: 对应于内存布局中的 `panic` 地址位。如果 Guest 程序在执行期间写入了该特定地址，这个标志会被置为 `true`。
-    Verifier 可以检查此标志来确认程序是否正常结束。
-
-6.  **`memory_layout: MemoryLayout`**
-    *   **含义**: 定义了上述所有数据（输入、输出、Advice、Panic 等）在 RISC-V 虚拟内存空间中的地址范围映射。
-    *   **作用**: 它充当路由表。例如，当 CPU 访问地址 `0x1000` 时，`load` 方法会查阅 `memory_layout`，
-    判断 `0x1000` 是属于 `inputs` 还是 `outputs`，然后从对应的 `Vec` 中读取数据。它还定义了栈（Stack）和堆（Heap）的边界。
- */
-#[derive(
-    Allocative,
-    Default,
-    Debug,
-    Clone,
-    PartialEq,
-    Serialize,
-    Deserialize,
-    CanonicalSerialize,
-    CanonicalDeserialize,
+#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "std",
+    derive(Allocative, CanonicalSerialize, CanonicalDeserialize)
 )]
 pub struct JoltDevice {
     pub inputs: Vec<u8>,
@@ -131,6 +94,14 @@ impl JoltDevice {
         }
 
         let internal_address = self.convert_write_address(address);
+        let max_output_size =
+            (self.memory_layout.output_end - self.memory_layout.output_start) as usize;
+        assert!(
+            internal_address < max_output_size,
+            "Output too long: guest wrote {} bytes, max is {} bytes (set by MemoryConfig.max_output_size).",
+            internal_address + 1,
+            max_output_size,
+        );
         if self.outputs.len() <= internal_address {
             self.outputs.resize(internal_address + 1, 0);
         }
@@ -191,7 +162,7 @@ pub struct MemoryConfig {
     pub max_untrusted_advice_size: u64,
     pub max_output_size: u64,
     pub stack_size: u64,
-    pub memory_size: u64,
+    pub heap_size: u64,
     pub program_size: Option<u64>,
 }
 
@@ -203,21 +174,16 @@ impl Default for MemoryConfig {
             max_untrusted_advice_size: DEFAULT_MAX_UNTRUSTED_ADVICE_SIZE,
             max_output_size: DEFAULT_MAX_OUTPUT_SIZE,
             stack_size: DEFAULT_STACK_SIZE,
-            memory_size: DEFAULT_MEMORY_SIZE,
+            heap_size: DEFAULT_HEAP_SIZE,
             program_size: None,
         }
     }
 }
 
-#[derive(
-    Allocative,
-    Default,
-    Clone,
-    PartialEq,
-    Serialize,
-    Deserialize,
-    CanonicalSerialize,
-    CanonicalDeserialize,
+#[derive(Default, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "std",
+    derive(Allocative, CanonicalSerialize, CanonicalDeserialize)
 )]
 pub struct MemoryLayout {
     /// The total size of the elf's sections, including the .text, .data, .rodata, and .bss sections.
@@ -235,11 +201,9 @@ pub struct MemoryLayout {
     pub output_start: u64,
     pub output_end: u64,
     pub stack_size: u64,
-    /// Stack starts from (RAM_START_ADDRESS + `program_size` + `stack_size`) and grows in descending addresses by `stack_size` bytes.
     pub stack_end: u64,
-    pub memory_size: u64,
-    /// Heap starts just after the start of the stack and is `memory_size` bytes.
-    pub memory_end: u64,
+    pub heap_size: u64,
+    pub heap_end: u64,
     pub panic: u64,
     pub termination: u64,
     /// End of the memory region containing inputs, outputs, the panic bit,
@@ -277,8 +241,8 @@ impl core::fmt::Debug for MemoryLayout {
             .field("output_end", &format_args!("{:#X}", self.output_end))
             .field("stack_size", &format_args!("{:#X}", self.stack_size))
             .field("stack_end", &format_args!("{:#X}", self.stack_end))
-            .field("memory_size", &format_args!("{:#X}", self.memory_size))
-            .field("memory_end", &format_args!("{:#X}", self.memory_end))
+            .field("heap_size", &format_args!("{:#X}", self.heap_size))
+            .field("heap_end", &format_args!("{:#X}", self.heap_end))
             .field("panic", &format_args!("{:#X}", self.panic))
             .field("termination", &format_args!("{:#X}", self.termination))
             .field("io_end", &format_args!("{:#X}", self.io_end))
@@ -314,7 +278,7 @@ impl MemoryLayout {
         let max_input_size = align_up(config.max_input_size, 8);
         let max_output_size = align_up(config.max_output_size, 8);
         let stack_size = align_up(config.stack_size, 8);
-        let memory_size = align_up(config.memory_size, 8);
+        let heap_size = align_up(config.heap_size, 8);
 
         // Critical for ValEvaluation and ValFinal sumchecks in RAM
         assert!(
@@ -392,18 +356,19 @@ impl MemoryLayout {
 
         let program_size = config.program_size.unwrap();
 
-        // stack grows downwards (decreasing addresses) from the bytecode_end + stack_size up to bytecode_end
+        // stack grows downwards (decreasing addresses) from the top of the stack down to stack_end
         let stack_end = RAM_START_ADDRESS
             .checked_add(program_size)
             .expect("stack_end overflow");
         let stack_start = stack_end
-            .checked_add(stack_size)
+            .checked_add(STACK_CANARY_SIZE)
+            .and_then(|s| s.checked_add(stack_size))
             .expect("stack_start overflow");
 
-        // heap grows *up* (increasing addresses) from the stack of the stack
-        let memory_end = stack_start
-            .checked_add(memory_size)
-            .expect("memory_end overflow");
+        // heap grows *up* (increasing addresses) from the top of the stack
+        let heap_end = stack_start
+            .checked_add(heap_size)
+            .expect("heap_end overflow");
 
         Self {
             program_size,
@@ -421,8 +386,8 @@ impl MemoryLayout {
             output_end,
             stack_size,
             stack_end,
-            memory_size,
-            memory_end,
+            heap_size,
+            heap_end,
             panic,
             termination,
             io_end,
@@ -434,8 +399,28 @@ impl MemoryLayout {
         self.trusted_advice_start.min(self.untrusted_advice_start)
     }
 
-    /// Returns the total emulator memory
+    /// Returns the total emulator memory (program + canary + stack + heap).
     pub fn get_total_memory_size(&self) -> u64 {
-        self.memory_size + self.stack_size + STACK_CANARY_SIZE
+        self.heap_end - RAM_START_ADDRESS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "Output too long")]
+    fn panics_when_output_exceeds_max() {
+        let memory_config = MemoryConfig {
+            program_size: Some(1024),
+            max_output_size: 8,
+            ..Default::default()
+        };
+        let mut device = JoltDevice::new(&memory_config);
+        // Use io_end which bypasses panic/termination early returns
+        // but still lands past the output region in convert_write_address
+        let overflow_address = device.memory_layout.io_end;
+        device.store(overflow_address, 0x42);
     }
 }

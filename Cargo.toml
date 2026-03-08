@@ -36,6 +36,7 @@ members = [
     "jolt-inlines/blake3",
     "jolt-inlines/bigint",
     "jolt-inlines/secp256k1",
+    "jolt-inlines/grumpkin",
     "examples/btreemap/host",
     "examples/btreemap/guest",
     "examples/collatz",
@@ -64,6 +65,9 @@ members = [
     "examples/overflow/guest",
     "examples/memory-ops",
     "examples/memory-ops/guest",
+    "examples/backtrace",
+    "examples/backtrace/guest-nostd",
+    "examples/backtrace/guest-std",
     "examples/recursion",
     "examples/recursion/guest",
     "examples/recover-ecdsa",
@@ -76,6 +80,12 @@ members = [
     "examples/merkle-tree/guest",
     "examples/hash-bench",
     "examples/hash-bench/guest",
+    "examples/modinv",
+    "examples/modinv/guest",
+    "examples/advice-demo",
+    "examples/advice-demo/guest",
+    "examples/sig-recovery/host",
+    "examples/sig-recovery/guest",
     "zklean-extractor",
     "z3-verifier",
 ]
@@ -97,13 +107,16 @@ mimalloc.workspace = true
 rand.workspace = true
 sysinfo.workspace = true
 syn.workspace = true
-serde.workspace = true
-rmp-serde.workspace = true
 toml_edit.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+zeroos-build.workspace = true
+
+ark-bn254.workspace = true
 
 jolt-sdk = { workspace = true, features = ["host"] }
 jolt-core = { workspace = true, features = ["default"] }
-tracer = { workspace = true, features = ["default"] }
 common = { workspace = true, features = ["std"] }
 
 [profile.test]
@@ -123,6 +136,9 @@ overflow-checks = true
 [profile.guest]
 inherits = "release"
 debug = false
+lto = "fat"
+strip = false
+codegen-units = 1
 
 [patch.crates-io]
 ark-bn254 = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
@@ -151,19 +167,19 @@ sha3 = "0.10.8"
 blake2 = "0.10"
 blake3 = { version = "1.5.0" }
 jolt-optimizations = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
-dory = { package = "dory-pcs", version = "0.1.0", features = ["backends", "cache", "disk-persistence"] }
+dory = { package = "dory-pcs", version = "0.3.0", features = ["backends", "cache", "disk-persistence"] }
 
 # Core Utilities
 clap = { version = "4.5.4", features = ["derive"] }
 eyre = "0.6.12"
 anyhow = "1.0.97"
-thiserror = "1.0.58"
+thiserror = "2.0.18"
 derive_more = { version = "2.0.1", features = [
     "from",
 ], default-features = false }
-strum = { version = "0.26.3", default-features = false }
-strum_macros = "0.26.4"
-itertools = "0.10.0"
+strum = { version = "0.28.0", default-features = false }
+strum_macros = "0.28.0"
+itertools = "0.14.0"
 paste = "1.0.15"
 fixedbitset = "0.5.0"
 chrono = { version = "0.4.42" }
@@ -178,9 +194,11 @@ rand_distr = "0.4.3"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0.108", default-features = false }
 rmp-serde = "1.3.0"
-bincode = "1.3.3"
-postcard = { version = "1.0.8", default-features = false }
-toml_edit = "0.22.14"
+bincode = { version = "2", features = ["serde"] }
+postcard = { version = "1.0.8", default-features = false, features = ["embedded-io-06"] }
+toml_edit = "0.25"
+bytemuck = "1.23.2"
+bytemuck_derive = "1.10.1"
 
 # Numeric
 num = "0.4.3"
@@ -190,15 +208,9 @@ num-derive = "0.4.2"
 num-traits = { version = "0.2.19", default-features = false }
 
 # System and Platform
-sysinfo = "0.30.8"
-target-lexicon = { version = "0.12.14" }
-dirs = { version = "5.0.1" }
+sysinfo = "0.38"
 memory-stats = { version = "1.0.0", features = ["always_use_statm"] }
 mimalloc = "0.1"
-
-# Async and Networking
-tokio = { version = "1.38.0" }
-reqwest = { version = "0.12.3", features = ["json", "blocking"] }
 
 # Parallel Processing
 rayon = { version = "^1.8.0" }
@@ -207,36 +219,53 @@ rayon = { version = "^1.8.0" }
 tracing = { version = "0.1.37", default-features = false }
 tracing-chrome = "0.7.1"
 tracing-subscriber = { version = "0.3.20", features = ["fmt", "env-filter"] }
-indicatif = { version = "0.17.8" }
 inferno = { version = "0.12.3" }
 allocative = { git = "https://github.com/facebookexperimental/allocative", rev = "85b773d85d526d068ce94724ff7a7b81203fc95e" }
 
 # Parsing
-syn = { version = "1.0.0", features = ["full"] }
+syn = { version = "2", features = ["full"] }
 quote = "1.0"
 proc-macro2 = "1.0.79"
 
 # Platform-specific
 fnv = { version = "1.0.7", default-features = false }
-object = { version = "0.36.7", features = [
+object = { version = "0.38.1", features = [
     "build_core",
     "elf",
 ], default-features = false }
-addr2line = "0.25.1"
+addr2line = "0.26.0"
 getrandom = { version = "0.2.16", default-features = false }
 getrandom_v02 = { version = "0.2.16", package = "getrandom", default-features = false }
 getrandom_v03 = { version = "0.3.3", package = "getrandom", default-features = false }
 
 # Build and Development
-ctor = { version = "0.2" }
+ctor = { version = "0.6" }
 hex-literal = "0.4.1"
 hex = "0.4.3"
-spinners = { version = "4.1.1", default-features = false }
+spinners = { version = "4.2.0", default-features = false }
 
 # Testing
 criterion = { version = "0.5.1", features = ["html_reports"] }
-iai-callgrind = "0.10.2"
-serial_test = "3.2.0"
+iai-callgrind = "0.16.1"
+serial_test = "3.4.0"
+
+# Logging
+log = { version = "0.4" }
+env_logger = { version = "0.11" }
+
+# ZeroOS build system
+zeroos-build = { git = "https://github.com/LayerZero-Labs/ZeroOS.git", default-features = false, rev = "3b132ce862ba6769a4261d151f69ff32c5f0dc30" }
+zeroos = { git = "https://github.com/LayerZero-Labs/ZeroOS.git", default-features = false, rev = "3b132ce862ba6769a4261d151f69ff32c5f0dc30" }
+cfg-if = "1.0"
+riscv = { version = "0.16", default-features = false }
+
+# Ethereum/Crypto (for sig-recovery example)
+alloy-primitives = "1"
+alloy-consensus = "1"
+alloy-eips = "1"
+reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth", features = ["rayon", "serde"] }
+reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", features = ["serde"] }
+secp256k1 = { version = "0.30", features = ["recovery", "rand"] }
 
 # Internal dependencies
 common = { path = "./common", default-features = false }
@@ -251,3 +280,4 @@ jolt-inlines-blake2 = { path = "./jolt-inlines/blake2", default-features = false
 jolt-inlines-blake3 = { path = "./jolt-inlines/blake3", default-features = false }
 jolt-inlines-bigint = { path = "./jolt-inlines/bigint", default-features = false }
 jolt-inlines-secp256k1 = { path = "./jolt-inlines/secp256k1", default-features = false }
+jolt-inlines-grumpkin = { path = "./jolt-inlines/grumpkin", default-features = false }

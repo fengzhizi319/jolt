@@ -10,6 +10,7 @@ use crate::field::OptimizedMul;
 use crate::poly::multilinear_polynomial::MultilinearPolynomial;
 use crate::subprotocols::read_write_matrix::address_major::AddressMajorMatrixEntry;
 use crate::subprotocols::read_write_matrix::cycle_major::CycleMajorMatrixEntry;
+use crate::subprotocols::read_write_matrix::OneHotCoeffLookupTable;
 use crate::subprotocols::read_write_matrix::ReadWriteMatrixAddressMajor;
 use crate::subprotocols::read_write_matrix::ReadWriteMatrixCycleMajor;
 use crate::utils::thread::unsafe_allocate_zero_vec;
@@ -36,9 +37,9 @@ use tracer::instruction::{Cycle, RAMAccess};
 #[derive(Allocative, Debug, PartialEq, Clone, Copy, Default)]
 pub struct RamCycleMajorEntry<F: JoltField> {
     /// The row index. Before binding, row \in [0, T)
-    pub row: usize,// 时间坐标 (Cycle Index)
+    pub row: usize,
     /// The column index. Before binding, col \in [0, K)
-    pub col: usize,// 空间坐标 (Address Index)
+    pub col: usize,
     /// In round i, each ReadWriteEntry represents a coefficient
     ///   Val(k, j', r)
     /// which is some combination of Val(k, j', 00...0), ...
@@ -46,7 +47,7 @@ pub struct RamCycleMajorEntry<F: JoltField> {
     /// `prev_val` contains the unbound coefficient before
     /// Val(k, j', 00...0) –– abusing notation, `prev_val` is
     /// Val(k, j'-1, 11...1)
-    pub(crate) prev_val: u64,// 上一个时刻/维度的值
+    pub(crate) prev_val: u64,
     /// In round i, each ReadWriteEntry represents a coefficient
     ///   Val(k, j', r)
     /// which is some combination of Val(k, j', 00...0), ...
@@ -54,12 +55,12 @@ pub struct RamCycleMajorEntry<F: JoltField> {
     /// `next_val` contains the unbound coefficient after
     /// Val(k, j', 00...0) –– abusing notation, `next_val` is
     /// Val(k, j'+1, 00...0)
-    pub(crate) next_val: u64,// 下一个时刻/维度的值
+    pub(crate) next_val: u64,
     /// The Val coefficient for this matrix entry.
-    pub val_coeff: F,// 内存值 (Value) 的域元素表示
+    pub val_coeff: F,
     /// The ra coefficient for this matrix entry. Note that for RAM,
     /// ra and wa are the same polynomial.
-    pub ra_coeff: F,// 访问系数 (Access Coefficient)
+    pub ra_coeff: F,
 }
 
 impl<F: JoltField> RamCycleMajorEntry<F> {
@@ -98,56 +99,25 @@ impl<F: JoltField> ReadWriteMatrixCycleMajor<F, RamCycleMajorEntry<F>> {
     /// Creates a new `ReadWriteMatrixCycleMajor` to represent the ra and Val polynomials
     /// for the RAM read/write checking sumcheck.
     #[tracing::instrument(skip_all, name = "ReadWriteMatrixCycleMajor::new")]
-
-    /// Creates a new `ReadWriteMatrixCycleMajor` to represent the ra and Val polynomials
-    /// for the RAM read/write checking sumcheck.
-    ///
-    /// [中文解释]
-    /// 该函数将线性的执行轨迹（trace）转换为稀疏矩阵表示（Entries），用于后续的 RAM 读写一致性 Sumcheck。
-    /// 这里的“Matrix”概念上是一个 [Addresses x Cycles] 的矩阵，但由于它是极度稀疏的
-    /// （大多数指令不访问内存，或只访问特定地址），我们只存储非零的 Entry。
-    ///
-    /// # 作用
-    /// 1. **过滤**：剔除没有 RAM 操作的指令（如 ADD, SUB 等寄存器操作）。
-    /// 2. **映射**：将 Trace 中的 `RAMAccess` 转换为矩阵条目 `RamCycleMajorEntry`。
-    /// 3. **初始化**：绑定初始内存状态 `val_init`。
-    ///
-    /// # 举例说明
-    /// 假设内存地址 0x10 初始值为 100。
-    /// 1. **Cycle 0**: `ADD R1, R2` (无内存访问) -> **不生成 Entry**。
-    /// 2. **Cycle 5**: `LW R1, 0x10` (读取 0x10) -> 生成 Entry:
-    ///    - row: 5 (时间)
-    ///    - col: map(0x10) (地址索引)
-    ///    - val_coeff: 100, prev: 100, next: 100 (读操作不改变状态)
-    /// 3. **Cycle 8**: `SW 200, 0x10` (写入 200 到 0x10) -> 生成 Entry:
-    ///    - row: 8 (时间)
-    ///    - col: map(0x10) (地址索引)
-    ///    - val_coeff: 100 (写入前的旧值), prev: 100, next: 200 (状态流转)
-    #[tracing::instrument(skip_all, name = "ReadWriteMatrixCycleMajor::new")]
     pub fn new(trace: &[Cycle], val_init: Vec<F>, memory_layout: &MemoryLayout) -> Self {
-        // 使用并行迭代器 (par_iter) 提高处理长 Trace 的效率
         let entries: Vec<_> = trace
             .par_iter()
-            .enumerate() // 获取指令的序号，即 "时间戳" (j)
-            .filter_map(|(j, cycle)| {
-                // 调用 Entry 的构造函数。
-                // 如果当前 cycle 是 RAM 读/写操作，返回 Some(Entry)；
-                // 如果是纯计算指令，返回 None，被 filter_map 过滤掉。
-                RamCycleMajorEntry::from_cycle(cycle, j, memory_layout)
-            })
+            .enumerate()
+            .filter_map(|(j, cycle)| RamCycleMajorEntry::from_cycle(cycle, j, memory_layout))
             .collect();
 
-        // 返回构建好的稀疏矩阵结构体
-        // entries: 按时间顺序排列的内存访问记录
-        // val_init: 内存的初始“快照”（Time=0 时的状态）
         ReadWriteMatrixCycleMajor {
             entries,
+            ra_lookup_table: None,
+            wa_lookup_table: None,
             val_init: val_init.into(),
         }
     }
 }
 
 impl<F: JoltField> CycleMajorMatrixEntry<F> for RamCycleMajorEntry<F> {
+    type AddressMajor = RamAddressMajorEntry<F>;
+
     fn row(&self) -> usize {
         self.row
     }
@@ -156,7 +126,13 @@ impl<F: JoltField> CycleMajorMatrixEntry<F> for RamCycleMajorEntry<F> {
         self.col
     }
 
-    fn bind_entries(even: Option<&Self>, odd: Option<&Self>, r: F::Challenge) -> Self {
+    fn bind_entries(
+        even: Option<&Self>,
+        odd: Option<&Self>,
+        r: F::Challenge,
+        _ra_lookup_table: Option<&OneHotCoeffLookupTable<F>>,
+        _wa_lookup_table: Option<&OneHotCoeffLookupTable<F>>,
+    ) -> Self {
         match (even, odd) {
             (Some(even), Some(odd)) => {
                 debug_assert!(even.row.is_even());
@@ -212,7 +188,9 @@ impl<F: JoltField> CycleMajorMatrixEntry<F> for RamCycleMajorEntry<F> {
         odd: Option<&Self>,
         inc_evals: [F; 2],
         gamma: F,
-    ) -> [F::Unreduced<8>; 2] {
+        _ra_lookup_table: Option<&OneHotCoeffLookupTable<F>>,
+        _wa_lookup_table: Option<&OneHotCoeffLookupTable<F>>,
+    ) -> [F::UnreducedProduct; 2] {
         match (even, odd) {
             (Some(even), Some(odd)) => {
                 debug_assert!(even.row.is_even());
@@ -221,8 +199,10 @@ impl<F: JoltField> CycleMajorMatrixEntry<F> for RamCycleMajorEntry<F> {
                 let ra_evals = [even.ra_coeff, odd.ra_coeff - even.ra_coeff];
                 let val_evals = [even.val_coeff, odd.val_coeff - even.val_coeff];
                 [
-                    ra_evals[0].mul_unreduced(val_evals[0] + gamma * (inc_evals[0] + val_evals[0])),
-                    ra_evals[1].mul_unreduced(val_evals[1] + gamma * (inc_evals[1] + val_evals[1])),
+                    ra_evals[0]
+                        .mul_to_product(val_evals[0] + gamma * (inc_evals[0] + val_evals[0])),
+                    ra_evals[1]
+                        .mul_to_product(val_evals[1] + gamma * (inc_evals[1] + val_evals[1])),
                 ]
             }
             (Some(even), None) => {
@@ -230,8 +210,10 @@ impl<F: JoltField> CycleMajorMatrixEntry<F> for RamCycleMajorEntry<F> {
                 let ra_evals = [even.ra_coeff, -even.ra_coeff];
                 let val_evals = [even.val_coeff, odd_val_coeff - even.val_coeff];
                 [
-                    ra_evals[0].mul_unreduced(val_evals[0] + gamma * (inc_evals[0] + val_evals[0])),
-                    ra_evals[1].mul_unreduced(val_evals[1] + gamma * (inc_evals[1] + val_evals[1])),
+                    ra_evals[0]
+                        .mul_to_product(val_evals[0] + gamma * (inc_evals[0] + val_evals[0])),
+                    ra_evals[1]
+                        .mul_to_product(val_evals[1] + gamma * (inc_evals[1] + val_evals[1])),
                 ]
             }
             (None, Some(odd)) => {
@@ -239,11 +221,27 @@ impl<F: JoltField> CycleMajorMatrixEntry<F> for RamCycleMajorEntry<F> {
                 let ra_evals = [F::zero(), odd.ra_coeff];
                 let val_evals = [even_val_coeff, odd.val_coeff - even_val_coeff];
                 [
-                    F::Unreduced::<8>::zero(), // ra_evals[0] is zero
-                    ra_evals[1].mul_unreduced(val_evals[1] + gamma * (inc_evals[1] + val_evals[1])),
+                    F::UnreducedProduct::zero(),
+                    ra_evals[1]
+                        .mul_to_product(val_evals[1] + gamma * (inc_evals[1] + val_evals[1])),
                 ]
             }
             (None, None) => panic!("Both entries are None"),
+        }
+    }
+
+    fn to_address_major(
+        self,
+        _: Option<&OneHotCoeffLookupTable<F>>,
+        _: Option<&OneHotCoeffLookupTable<F>>,
+    ) -> Self::AddressMajor {
+        RamAddressMajorEntry {
+            row: self.row,
+            col: self.col,
+            prev_val: F::from_u64(self.prev_val),
+            next_val: F::from_u64(self.next_val),
+            val_coeff: self.val_coeff,
+            ra_coeff: self.ra_coeff,
         }
     }
 }
@@ -347,19 +345,6 @@ pub struct RamAddressMajorEntry<F: JoltField> {
     pub ra_coeff: F,
 }
 
-impl<F: JoltField> From<RamCycleMajorEntry<F>> for RamAddressMajorEntry<F> {
-    fn from(entry: RamCycleMajorEntry<F>) -> Self {
-        RamAddressMajorEntry {
-            row: entry.row,
-            col: entry.col,
-            prev_val: F::from_u64(entry.prev_val),
-            next_val: F::from_u64(entry.next_val),
-            val_coeff: entry.val_coeff,
-            ra_coeff: entry.ra_coeff,
-        }
-    }
-}
-
 impl<F: JoltField> AddressMajorMatrixEntry<F> for RamAddressMajorEntry<F> {
     fn row(&self) -> usize {
         self.row
@@ -440,7 +425,7 @@ impl<F: JoltField> AddressMajorMatrixEntry<F> for RamAddressMajorEntry<F> {
         inc_eval: F,
         eq_eval: F,
         gamma: F,
-    ) -> [F::Unreduced<8>; 2] {
+    ) -> [F::UnreducedProduct; 2] {
         match (even, odd) {
             (Some(even), Some(odd)) => {
                 debug_assert!(even.col.is_even());
@@ -452,48 +437,38 @@ impl<F: JoltField> AddressMajorMatrixEntry<F> for RamAddressMajorEntry<F> {
                     odd.val_coeff + odd.val_coeff - even.val_coeff,
                 ];
                 [
-                    eq_eval.mul_unreduced(
+                    eq_eval.mul_to_product(
                         ra_evals[0] * (val_evals[0] + gamma * (inc_eval + val_evals[0])),
                     ),
-                    eq_eval.mul_unreduced(
+                    eq_eval.mul_to_product(
                         ra_evals[1] * (val_evals[1] + gamma * (inc_eval + val_evals[1])),
                     ),
                 ]
             }
             (Some(even), None) => {
-                // For SparseMatrixPolynomial, the absence of a matrix entry implies
-                // that its coeff has not been bound yet.
-                // The absence of an odd-row entry in the same column as even
-                // means that its implicit Val coeff is odd_checkpoint, and its implicit
-                // ra coeff is 0.
                 let ra_evals = [even.ra_coeff, -even.ra_coeff];
                 let val_evals = [
                     even.val_coeff,
                     odd_checkpoint + odd_checkpoint - even.val_coeff,
                 ];
                 [
-                    eq_eval.mul_unreduced(
+                    eq_eval.mul_to_product(
                         ra_evals[0] * (val_evals[0] + gamma * (inc_eval + val_evals[0])),
                     ),
-                    eq_eval.mul_unreduced(
+                    eq_eval.mul_to_product(
                         ra_evals[1] * (val_evals[1] + gamma * (inc_eval + val_evals[1])),
                     ),
                 ]
             }
             (None, Some(odd)) => {
-                // For SparseMatrixPolynomial, the absence of a matrix entry implies
-                // that its coeff has not been bound yet.
-                // The absence of an even-row entry in the same column as odd
-                // means that its implicit Val coeff is even_checkpoint, and its implicit
-                // ra coeff is 0.
                 let ra_evals = [F::zero(), odd.ra_coeff + odd.ra_coeff];
                 let val_evals = [
                     even_checkpoint,
                     odd.val_coeff + odd.val_coeff - even_checkpoint,
                 ];
                 [
-                    F::Unreduced::<8>::zero(), // ra_evals[0] is zero
-                    eq_eval.mul_unreduced(
+                    F::UnreducedProduct::zero(),
+                    eq_eval.mul_to_product(
                         ra_evals[1] * (val_evals[1] + gamma * (inc_eval + val_evals[1])),
                     ),
                 ]

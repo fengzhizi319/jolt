@@ -12,11 +12,21 @@ use crate::poly::eq_poly::EqPolynomial;
 use crate::poly::multilinear_polynomial::{
     BindingOrder, MultilinearPolynomial, PolynomialBinding, PolynomialEvaluation,
 };
+#[cfg(feature = "zk")]
+use crate::poly::opening_proof::OpeningId;
 use crate::poly::opening_proof::{
-    OpeningAccumulator, OpeningPoint, ProverOpeningAccumulator, SumcheckId,
+    OpeningAccumulator, OpeningPoint, PolynomialId, ProverOpeningAccumulator, SumcheckId,
     VerifierOpeningAccumulator, BIG_ENDIAN, LITTLE_ENDIAN,
 };
 use crate::poly::unipoly::UniPoly;
+#[cfg(feature = "zk")]
+use crate::subprotocols::blindfold::{
+    InputClaimConstraint, OutputClaimConstraint, ProductTerm, ValueSource,
+};
+use crate::subprotocols::sumcheck_claim::{
+    CachedPointRef, ChallengePart, Claim, ClaimExpr, InputOutputClaims, SumcheckFrontend,
+    VerifierEvaluablePolynomial,
+};
 use crate::subprotocols::sumcheck_prover::SumcheckInstanceProver;
 use crate::subprotocols::sumcheck_verifier::{SumcheckInstanceParams, SumcheckInstanceVerifier};
 use crate::transcripts::Transcript;
@@ -53,59 +63,26 @@ pub struct ShiftSumcheckParams<F: JoltField> {
 }
 
 impl<F: JoltField> ShiftSumcheckParams<F> {
-    /// 初始化移位检查参数
-    ///
-    /// # 参数
-    /// - `n_cycle_vars`: 周期变量的数量 (即 log2(Trace长度))。
-    ///   如果 Trace 有 2^k 行，那么就需要 k 个布尔变量来索引行号。
-    /// - `opening_accumulator`: 之前阶段 (Stage 1/2) 的累加器。
-    ///   它存储了之前所有 Sumcheck 产生的随机点 $r$ 和多项式评估值。
-    /// - `transcript`: Fiat-Shamir 副本，用于生成新的密码学随机数。
     pub fn new(
         n_cycle_vars: usize,
         opening_accumulator: &dyn OpeningAccumulator<F>,
         transcript: &mut impl Transcript,
     ) -> Self {
-        // [算法 1: Fiat-Shamir Batching]
-        // 我们有多个不同的移位约束要检查（例如：PC更新、RAM指针移动等）。
-        // 也就是要同时证明 C1(x)=0, C2(x)=0, ...
-        // 为了高效，Verifer 提供一个随机数 gamma。
-        // 我们将这些约束线性组合：Final(x) = C1(x) + gamma*C2(x) + gamma^2*C3(x)...
-        //
-        // 这里请求了 gamma 的 0 到 4 次幂 (共5个)，暗示可能有 5 类移位约束。
         let gamma_powers = transcript.challenge_scalar_powers(5).try_into().unwrap();
-
-        // [算法 2: 获取 Spartan Outer 阶段的随机点]
-        // 在 Stage 1 (Spartan Proof) 中，Verifier 已经挑选了一个随机向量 r_outer。
-        // NextPC 是一个虚拟多项式，代表 "PC 列的下一个值"。
-        // 我们需要获取之前针对这个多项式生成的随机点，以确保 Stage 3 的证明与 Stage 1 是关联的。
         let (outer_sumcheck_r, _) = opening_accumulator
             .get_virtual_polynomial_opening(VirtualPolynomial::NextPC, SumcheckId::SpartanOuter);
-
-        // [算法 3: 变量分割 (Variable Splitting)]
-        // r_outer 是一个长向量，包含 [周期变量 (Cycle Vars) | 其他变量 (Data Vars)]。
-        // 移位检查 (Shift Check) 主要关心的是 "行与行" 的关系，即周期变量。
-        //
-        // 举例：多项式 P(x_time, x_reg)。
-        // 我们只关心 x_time 部分，因为 Shift 是在时间维度上发生的 (t -> t+1)。
         let (r_outer, _rx_var) = outer_sumcheck_r.split_at(n_cycle_vars);
-
-        // [算法 4: 获取 Product Virtualization 阶段的随机点]
-        // 类似于上面，这是从另一个子协议 (Product Check) 中获取随机点。
-        // NextIsNoop 可能用于处理填充行或空指令的逻辑。
         let (product_sumcheck_r, _) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::NextIsNoop,
             SumcheckId::SpartanProductVirtualization,
         );
-
-        // 同样提取针对 "周期/时间" 维度的随机点部分。
         let (r_product, _) = product_sumcheck_r.split_at(n_cycle_vars);
 
         Self {
             gamma_powers,
             n_cycle_vars,
-            r_outer,   // 用于评估主逻辑移位的随机点
-            r_product, // 用于评估辅助逻辑移位的随机点
+            r_outer,
+            r_product,
         }
     }
 }
@@ -153,6 +130,120 @@ impl<F: JoltField> SumcheckInstanceParams<F> for ShiftSumcheckParams<F> {
     ) -> OpeningPoint<BIG_ENDIAN, F> {
         normalize_opening_point(challenges)
     }
+
+    #[cfg(feature = "zk")]
+    fn input_claim_constraint(&self) -> InputClaimConstraint {
+        let next_unexpanded_pc = OpeningId::virt(
+            VirtualPolynomial::NextUnexpandedPC,
+            SumcheckId::SpartanOuter,
+        );
+        let next_pc = OpeningId::virt(VirtualPolynomial::NextPC, SumcheckId::SpartanOuter);
+        let next_is_virtual =
+            OpeningId::virt(VirtualPolynomial::NextIsVirtual, SumcheckId::SpartanOuter);
+        let next_is_first_in_sequence = OpeningId::virt(
+            VirtualPolynomial::NextIsFirstInSequence,
+            SumcheckId::SpartanOuter,
+        );
+        let next_is_noop = OpeningId::virt(
+            VirtualPolynomial::NextIsNoop,
+            SumcheckId::SpartanProductVirtualization,
+        );
+
+        let terms = vec![
+            ProductTerm::single(ValueSource::Opening(next_unexpanded_pc)),
+            ProductTerm::scaled(
+                ValueSource::Challenge(0),
+                vec![ValueSource::Opening(next_pc)],
+            ),
+            ProductTerm::scaled(
+                ValueSource::Challenge(1),
+                vec![ValueSource::Opening(next_is_virtual)],
+            ),
+            ProductTerm::scaled(
+                ValueSource::Challenge(2),
+                vec![ValueSource::Opening(next_is_first_in_sequence)],
+            ),
+            ProductTerm::single(ValueSource::Challenge(3)), // gamma[4] constant term
+            ProductTerm::scaled(
+                ValueSource::Challenge(4),
+                vec![ValueSource::Opening(next_is_noop)],
+            ), // -gamma[4] * next_is_noop
+        ];
+        InputClaimConstraint::sum_of_products(terms)
+    }
+
+    #[cfg(feature = "zk")]
+    fn input_constraint_challenge_values(&self, _: &dyn OpeningAccumulator<F>) -> Vec<F> {
+        vec![
+            self.gamma_powers[1],
+            self.gamma_powers[2],
+            self.gamma_powers[3],
+            self.gamma_powers[4],
+            -self.gamma_powers[4],
+        ]
+    }
+
+    #[cfg(feature = "zk")]
+    fn output_claim_constraint(&self) -> Option<OutputClaimConstraint> {
+        let unexpanded_pc =
+            OpeningId::virt(VirtualPolynomial::UnexpandedPC, SumcheckId::SpartanShift);
+        let pc = OpeningId::virt(VirtualPolynomial::PC, SumcheckId::SpartanShift);
+        let is_virtual = OpeningId::virt(
+            VirtualPolynomial::OpFlags(CircuitFlags::VirtualInstruction),
+            SumcheckId::SpartanShift,
+        );
+        let is_first_in_sequence = OpeningId::virt(
+            VirtualPolynomial::OpFlags(CircuitFlags::IsFirstInSequence),
+            SumcheckId::SpartanShift,
+        );
+        let is_noop = OpeningId::virt(
+            VirtualPolynomial::InstructionFlags(InstructionFlags::IsNoop),
+            SumcheckId::SpartanShift,
+        );
+
+        let terms = vec![
+            ProductTerm::scaled(
+                ValueSource::Challenge(0),
+                vec![ValueSource::Opening(unexpanded_pc)],
+            ),
+            ProductTerm::scaled(ValueSource::Challenge(1), vec![ValueSource::Opening(pc)]),
+            ProductTerm::scaled(
+                ValueSource::Challenge(2),
+                vec![ValueSource::Opening(is_virtual)],
+            ),
+            ProductTerm::scaled(
+                ValueSource::Challenge(3),
+                vec![ValueSource::Opening(is_first_in_sequence)],
+            ),
+            ProductTerm::single(ValueSource::Challenge(4)),
+            ProductTerm::scaled(
+                ValueSource::Challenge(5),
+                vec![ValueSource::Opening(is_noop)],
+            ),
+        ];
+
+        Some(OutputClaimConstraint::sum_of_products(terms))
+    }
+
+    #[cfg(feature = "zk")]
+    fn output_constraint_challenge_values(&self, sumcheck_challenges: &[F::Challenge]) -> Vec<F> {
+        let r = normalize_opening_point::<F>(sumcheck_challenges);
+        let eq_plus_one_outer =
+            EqPlusOnePolynomial::<F>::new(self.r_outer.r.to_vec()).evaluate(&r.r);
+        let eq_plus_one_product =
+            EqPlusOnePolynomial::<F>::new(self.r_product.r.to_vec()).evaluate(&r.r);
+
+        let gamma_powers = &self.gamma_powers;
+
+        vec![
+            gamma_powers[0] * eq_plus_one_outer,
+            gamma_powers[1] * eq_plus_one_outer,
+            gamma_powers[2] * eq_plus_one_outer,
+            gamma_powers[3] * eq_plus_one_outer,
+            gamma_powers[4] * eq_plus_one_product,
+            -gamma_powers[4] * eq_plus_one_product,
+        ]
+    }
 }
 
 fn normalize_opening_point<F: JoltField>(
@@ -161,7 +252,6 @@ fn normalize_opening_point<F: JoltField>(
     OpeningPoint::<LITTLE_ENDIAN, F>::new(challenges.to_vec()).match_endianness()
 }
 
-/// Sumcheck prover for [`ShiftSumcheckVerifier`].
 #[derive(Allocative)]
 pub struct ShiftSumcheckProver<F: JoltField> {
     phase: ShiftSumcheckPhase<F>,
@@ -230,7 +320,6 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for ShiftSumcheck
     fn cache_openings(
         &self,
         accumulator: &mut ProverOpeningAccumulator<F>,
-        transcript: &mut T,
         sumcheck_challenges: &[<F as JoltField>::Challenge],
     ) {
         let ShiftSumcheckPhase::Phase2(state) = &self.phase else {
@@ -245,35 +334,30 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for ShiftSumcheck
 
         let opening_point = normalize_opening_point(sumcheck_challenges);
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::UnexpandedPC,
             SumcheckId::SpartanShift,
             opening_point.clone(),
             unexpanded_pc_eval,
         );
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::PC,
             SumcheckId::SpartanShift,
             opening_point.clone(),
             pc_eval,
         );
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::OpFlags(CircuitFlags::VirtualInstruction),
             SumcheckId::SpartanShift,
             opening_point.clone(),
             is_virtual_eval,
         );
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::OpFlags(CircuitFlags::IsFirstInSequence),
             SumcheckId::SpartanShift,
             opening_point.clone(),
             is_first_in_sequence_eval,
         );
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::InstructionFlags(InstructionFlags::IsNoop),
             SumcheckId::SpartanShift,
             opening_point,
@@ -303,6 +387,19 @@ impl<F: JoltField> ShiftSumcheckVerifier<F> {
 }
 
 impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T> for ShiftSumcheckVerifier<F> {
+    fn input_claim(&self, accumulator: &VerifierOpeningAccumulator<F>) -> F {
+        let result = self.params.input_claim(accumulator);
+
+        #[cfg(test)]
+        {
+            let reference_result =
+                Self::input_output_claims().input_claim(&self.params.gamma_powers, accumulator);
+            assert_eq!(result, reference_result);
+        }
+
+        result
+    }
+
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         &self.params
     }
@@ -312,6 +409,8 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T> for ShiftSumche
         accumulator: &VerifierOpeningAccumulator<F>,
         sumcheck_challenges: &[F::Challenge],
     ) -> F {
+        let r = normalize_opening_point::<F>(sumcheck_challenges);
+
         // Get the shift evaluations from the accumulator
         let (_, unexpanded_pc_claim) = accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::UnexpandedPC,
@@ -332,13 +431,12 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T> for ShiftSumche
             SumcheckId::SpartanShift,
         );
 
-        let r = normalize_opening_point::<F>(sumcheck_challenges);
         let eq_plus_one_r_outer_at_shift =
             EqPlusOnePolynomial::<F>::new(self.params.r_outer.r.to_vec()).evaluate(&r.r);
         let eq_plus_one_r_product_at_shift =
             EqPlusOnePolynomial::<F>::new(self.params.r_product.r.to_vec()).evaluate(&r.r);
 
-        [
+        let result = [
             unexpanded_pc_claim,
             pc_claim,
             is_virtual_claim,
@@ -351,46 +449,120 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T> for ShiftSumche
             * eq_plus_one_r_outer_at_shift
             + self.params.gamma_powers[4]
                 * (F::one() - is_noop_claim)
-                * eq_plus_one_r_product_at_shift
+                * eq_plus_one_r_product_at_shift;
+
+        #[cfg(test)]
+        {
+            let reference_result = Self::input_output_claims().expected_output_claim(
+                &r,
+                &self.params.gamma_powers,
+                accumulator,
+            );
+
+            assert_eq!(result, reference_result);
+        }
+
+        result
     }
 
     fn cache_openings(
         &self,
         accumulator: &mut VerifierOpeningAccumulator<F>,
-        transcript: &mut T,
         sumcheck_challenges: &[<F as JoltField>::Challenge],
     ) {
         let opening_point = normalize_opening_point(sumcheck_challenges);
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::UnexpandedPC,
             SumcheckId::SpartanShift,
             opening_point.clone(),
         );
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::PC,
             SumcheckId::SpartanShift,
             opening_point.clone(),
         );
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::OpFlags(CircuitFlags::VirtualInstruction),
             SumcheckId::SpartanShift,
             opening_point.clone(),
         );
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::OpFlags(CircuitFlags::IsFirstInSequence),
             SumcheckId::SpartanShift,
             opening_point.clone(),
         );
         accumulator.append_virtual(
-            transcript,
             VirtualPolynomial::InstructionFlags(InstructionFlags::IsNoop),
             SumcheckId::SpartanShift,
             opening_point,
         );
+    }
+}
+
+impl<F: JoltField> SumcheckFrontend<F> for ShiftSumcheckVerifier<F> {
+    fn input_output_claims() -> InputOutputClaims<F> {
+        let next_unexpanded_pc: ClaimExpr<F> = VirtualPolynomial::NextUnexpandedPC.into();
+        let next_pc: ClaimExpr<F> = VirtualPolynomial::NextPC.into();
+        let next_is_virtual: ClaimExpr<F> = VirtualPolynomial::NextIsVirtual.into();
+        let next_is_first_in_sequence: ClaimExpr<F> =
+            VirtualPolynomial::NextIsFirstInSequence.into();
+        let next_is_noop: ClaimExpr<F> = VirtualPolynomial::NextIsNoop.into();
+
+        let unexpanded_pc: ClaimExpr<F> = VirtualPolynomial::UnexpandedPC.into();
+        let pc: ClaimExpr<F> = VirtualPolynomial::PC.into();
+        let is_virtual: ClaimExpr<F> =
+            VirtualPolynomial::OpFlags(CircuitFlags::VirtualInstruction).into();
+        let is_first_in_sequence: ClaimExpr<F> =
+            VirtualPolynomial::OpFlags(CircuitFlags::IsFirstInSequence).into();
+        let is_noop: ClaimExpr<F> =
+            VirtualPolynomial::InstructionFlags(InstructionFlags::IsNoop).into();
+
+        let outer_sumcheck_r = VerifierEvaluablePolynomial::EqPlusOne(CachedPointRef {
+            opening: PolynomialId::Virtual(VirtualPolynomial::NextPC),
+            sumcheck: SumcheckId::SpartanOuter,
+            part: ChallengePart::Cycle,
+        });
+        let product_sumcheck_r = VerifierEvaluablePolynomial::EqPlusOne(CachedPointRef {
+            opening: PolynomialId::Virtual(VirtualPolynomial::NextIsNoop),
+            sumcheck: SumcheckId::SpartanProductVirtualization,
+            part: ChallengePart::Cycle,
+        });
+
+        InputOutputClaims {
+            claims: vec![
+                Claim {
+                    input_sumcheck_id: SumcheckId::SpartanOuter,
+                    input_claim_expr: next_unexpanded_pc,
+                    batching_poly: outer_sumcheck_r,
+                    expected_output_claim_expr: unexpanded_pc,
+                },
+                Claim {
+                    input_sumcheck_id: SumcheckId::SpartanOuter,
+                    input_claim_expr: next_pc,
+                    batching_poly: outer_sumcheck_r,
+                    expected_output_claim_expr: pc,
+                },
+                Claim {
+                    input_sumcheck_id: SumcheckId::SpartanOuter,
+                    input_claim_expr: next_is_virtual,
+                    batching_poly: outer_sumcheck_r,
+                    expected_output_claim_expr: is_virtual,
+                },
+                Claim {
+                    input_sumcheck_id: SumcheckId::SpartanOuter,
+                    input_claim_expr: next_is_first_in_sequence,
+                    batching_poly: outer_sumcheck_r,
+                    expected_output_claim_expr: is_first_in_sequence,
+                },
+                Claim {
+                    input_sumcheck_id: SumcheckId::SpartanProductVirtualization,
+                    input_claim_expr: ClaimExpr::Constant(F::one()) - next_is_noop,
+                    batching_poly: product_sumcheck_r,
+                    expected_output_claim_expr: ClaimExpr::Constant(F::one()) - is_noop,
+                },
+            ],
+            output_sumcheck_id: SumcheckId::SpartanShift,
+        }
     }
 }
 
@@ -410,34 +582,17 @@ struct Phase1State<F: JoltField> {
 }
 
 impl<F: JoltField> Phase1State<F> {
-    /// 生成 Phase 1 的证明状态 (Pre-computation Step)
-    ///
-    // [算法原理: Split Sumcheck / Tensor Product]
-    // 这里的核心思想是将多线性多项式 Eq(x, r) 分解为两部分：
-    // Eq(x, r) = Eq(x_lo, r_lo) * Eq(x_hi, r_hi)
-    //
-    // - `P` (Prefix): 对应 Eq(x_lo, r_lo)，只与低位变量有关。
-    // - `Q` (Suffix Sum): 对应 Σ [ Trace(x) * Eq(x_hi, r_hi) ]。
-    //
-    // 这里的 `gen` 函数主要负责计算向量 `Q`。
-    // 它遍历整个 Trace，把 Trace 的值与 "后缀多项式" 进行内积，压缩成一个较小的向量 `Q`。
-    // 这样，后续的 Sumcheck 只需要在较小的 `P` 和 `Q` 上进行 (大小为 2^prefix_vars)。
     fn gen(
         trace: Arc<Vec<Cycle>>,
         bytecode_preprocessing: &BytecodePreprocessing,
         params: &ShiftSumcheckParams<F>,
     ) -> Self {
-        // 1. 初始化 Eq 多项式的 Prefix 和 Suffix 部分
-        // EqPlusOnePrefixSuffixPoly 是一个专门处理 "Shift" (x -> x+1) 逻辑的工具。
-        // 它不仅计算 Eq(x, r)，还能处理 Eq(x+1, r) 的情况。
         let EqPlusOnePrefixSuffixPoly {
-            prefix_0: prefix_0_for_r_outer, // 对应 P 向量 (outer check)
-            suffix_0: suffix_0_for_r_outer, // 对应 Suffix (outer check)
+            prefix_0: prefix_0_for_r_outer,
+            suffix_0: suffix_0_for_r_outer,
             prefix_1: prefix_1_for_r_outer,
             suffix_1: suffix_1_for_r_outer,
         } = EqPlusOnePrefixSuffixPoly::new(&params.r_outer);
-
-        // 同样的逻辑，处理另一个校验 (Product Check)
         let EqPlusOnePrefixSuffixPoly {
             prefix_0: prefix_0_for_r_prod,
             suffix_0: suffix_0_for_r_prod,
@@ -445,28 +600,21 @@ impl<F: JoltField> Phase1State<F> {
             suffix_1: suffix_1_for_r_prod,
         } = EqPlusOnePrefixSuffixPoly::new(&params.r_product);
 
-        let prefix_n_vars = prefix_0_for_r_outer.len().ilog2(); // 低位变量数
-        let suffix_n_vars = suffix_0_for_r_outer.len().ilog2(); // 高位变量数
+        let prefix_n_vars = prefix_0_for_r_outer.len().ilog2();
+        let suffix_n_vars = suffix_0_for_r_outer.len().ilog2();
 
-        // [变量绑定]
-        // P 向量直接来自 Prefix 多项式评估值 (大小 2^prefix)。
+        // Prefix-suffix P and Q buffers.
+        // See <https://eprint.iacr.org/2025/611.pdf> (Appendix A).
         let P_0_for_r_outer = prefix_0_for_r_outer;
         let P_1_for_r_outer = prefix_1_for_r_outer;
         let P_0_for_r_prod = prefix_0_for_r_prod;
         let P_1_for_r_prod = prefix_1_for_r_prod;
-
-        // Q 向量用于存储 "Trace数据 * Suffix多项式" 的部分和。
-        // 初始化大小为 2^prefix，这比原始 Trace (2^total) 小得多。
         let mut Q_0_for_r_outer = vec![F::zero(); 1 << prefix_n_vars];
         let mut Q_1_for_r_outer = vec![F::zero(); 1 << prefix_n_vars];
         let mut Q_0_for_r_prod = vec![F::zero(); 1 << prefix_n_vars];
         let mut Q_1_for_r_prod = vec![F::zero(); 1 << prefix_n_vars];
 
-        const BLOCK_SIZE: usize = 32; // 并行处理块大小
-
-        // 2. 并行计算 Q 向量 (The Heavy Lifting)
-        // 这个循环计算：Q[x_lo] = Σ_{x_hi} ( Trace(x_lo, x_hi) * Suffix(x_hi) )
-        // 这相当于把巨大的 Trace 矩阵沿着 "高位" 维度压缩（Marginalization）。
+        const BLOCK_SIZE: usize = 32;
         (
             Q_0_for_r_outer.par_chunks_mut(BLOCK_SIZE),
             Q_1_for_r_outer.par_chunks_mut(BLOCK_SIZE),
@@ -477,34 +625,26 @@ impl<F: JoltField> Phase1State<F> {
             .enumerate()
             .for_each(
                 |(
-                     chunk_i, // 对应 x_lo 的分块索引
-                     (
-                         Q_0_for_r_outer_chunk,
-                         Q_1_for_r_outer_chunk,
-                         Q_0_for_r_prod_chunk,
-                         Q_1_for_r_prod_chunk,
-                     ),
-                 )| {
+                    chunk_i,
+                    (
+                        Q_0_for_r_outer_chunk,
+                        Q_1_for_r_outer_chunk,
+                        Q_0_for_r_prod_chunk,
+                        Q_1_for_r_prod_chunk,
+                    ),
+                )| {
                     let chunk_len = Q_0_for_r_outer_chunk.len();
+                    let mut Q_0_for_r_outer_unreduced =
+                        [F::UnreducedProductAccum::zero(); BLOCK_SIZE];
+                    let mut Q_1_for_r_outer_unreduced =
+                        [F::UnreducedProductAccum::zero(); BLOCK_SIZE];
+                    let mut Q_0_for_r_prod_unreduced = [F::UnreducedMulU64::zero(); BLOCK_SIZE];
+                    let mut Q_1_for_r_prod_unreduced = [F::UnreducedMulU64::zero(); BLOCK_SIZE];
 
-                    // [算法优化: Delayed Reduction]
-                    // 为了减少昂贵的模运算 (Modular Reduction)，我们使用 F::Unreduced 类型。
-                    // 它可以累加多次乘法结果，直到达到上限（如9次）才取模一次。
-                    let mut Q_0_for_r_outer_unreduced = [F::Unreduced::<9>::zero(); BLOCK_SIZE];
-                    let mut Q_1_for_r_outer_unreduced = [F::Unreduced::<9>::zero(); BLOCK_SIZE];
-                    let mut Q_0_for_r_prod_unreduced = [F::Unreduced::<5>::zero(); BLOCK_SIZE];
-                    let mut Q_1_for_r_prod_unreduced = [F::Unreduced::<5>::zero(); BLOCK_SIZE];
-
-                    // 遍历所有的高位组合 (Suffix part)
                     for x_hi in 0..1 << suffix_n_vars {
                         for i in 0..chunk_len {
-                            // 构造完整的 Trace 索引 x
-                            // x = x_lo + (x_hi * 2^prefix_len)
-                            // 这里 chunk_i * BLOCK_SIZE + i 就是 x_lo (低位)
                             let x_lo = chunk_i * BLOCK_SIZE + i;
                             let x = x_lo + (x_hi << prefix_n_vars);
-
-                            // 从 Trace 中解析第 x 行的状态
                             let ShiftSumcheckCycleState {
                                 unexpanded_pc,
                                 pc,
@@ -513,9 +653,6 @@ impl<F: JoltField> Phase1State<F> {
                                 is_noop,
                             } = ShiftSumcheckCycleState::new(&trace[x], bytecode_preprocessing);
 
-                            // [算法原理: Random Linear Combination (RLC)]
-                            // 将多个检查项 (PC正确性, 虚拟标志等) 用 gamma 的幂次加权合并。
-                            // v 代表了第 x 行 Trace 数据的 "指纹"。
                             let mut v =
                                 F::from_u64(unexpanded_pc) + params.gamma_powers[1].mul_u64(pc);
                             if is_virtual {
@@ -524,42 +661,32 @@ impl<F: JoltField> Phase1State<F> {
                             if is_first_in_sequence {
                                 v += params.gamma_powers[3];
                             }
-
-                            // 累加到 Q 向量中
-                            // Q_unreduced[i] += v * Suffix[x_hi]
-                            // 注意：这里用的是 x_hi 作为 Suffix 的索引
                             Q_0_for_r_outer_unreduced[i] +=
-                                v.mul_unreduced::<9>(suffix_0_for_r_outer[x_hi]);
+                                v.mul_to_product_accum(suffix_0_for_r_outer[x_hi]);
                             Q_1_for_r_outer_unreduced[i] +=
-                                v.mul_unreduced::<9>(suffix_1_for_r_outer[x_hi]);
+                                v.mul_to_product_accum(suffix_1_for_r_outer[x_hi]);
 
-                            // 处理 Product Check 的部分 (Noop 逻辑)
+                            // Q += suffix * (1 - is_noop)
                             if !is_noop {
                                 Q_0_for_r_prod_unreduced[i] +=
-                                    *suffix_0_for_r_prod[x_hi].as_unreduced_ref();
+                                    suffix_0_for_r_prod[x_hi].to_unreduced();
                                 Q_1_for_r_prod_unreduced[i] +=
-                                    *suffix_1_for_r_prod[x_hi].as_unreduced_ref();
+                                    suffix_1_for_r_prod[x_hi].to_unreduced();
                             }
                         }
                     }
 
-                    // 循环结束后，执行一次统一的取模还原 (Reduction)
                     for i in 0..chunk_len {
-                        // Montgomery Reduction 适用于一般的域乘法结果
                         Q_0_for_r_outer_chunk[i] =
-                            F::from_montgomery_reduce(Q_0_for_r_outer_unreduced[i]);
+                            F::reduce_product_accum(Q_0_for_r_outer_unreduced[i]);
                         Q_1_for_r_outer_chunk[i] =
-                            F::from_montgomery_reduce(Q_1_for_r_outer_unreduced[i]);
-                        // Barrett Reduction 适用于特定的加法累积结果
-                        Q_0_for_r_prod_chunk[i] =
-                            F::from_barrett_reduce(Q_0_for_r_prod_unreduced[i]);
-                        Q_1_for_r_prod_chunk[i] =
-                            F::from_barrett_reduce(Q_1_for_r_prod_unreduced[i]);
+                            F::reduce_product_accum(Q_1_for_r_outer_unreduced[i]);
+                        Q_0_for_r_prod_chunk[i] = F::reduce_mul_u64(Q_0_for_r_prod_unreduced[i]);
+                        Q_1_for_r_prod_chunk[i] = F::reduce_mul_u64(Q_1_for_r_prod_unreduced[i]);
                     }
                 },
             );
 
-        // 对 Q_prod 应用 gamma 权重 (RLC 的最后一部分)
         chain!(&mut Q_0_for_r_prod, &mut Q_1_for_r_prod).for_each(|v| *v *= params.gamma_powers[4]);
 
         let prefix_suffix_pairs = vec![
@@ -577,66 +704,38 @@ impl<F: JoltField> Phase1State<F> {
         }
     }
 
-    /// 计算当前 Sumcheck 轮次的消息 (多项式评估值)
-    ///
-    /// [算法原理: Sumcheck Round Execution]
-    /// 在 Phase 1 中，我们要证明的式子变成了 Σ_{x_lo} P(x_lo) * Q(x_lo)。
-    /// 每一轮 Sumcheck，Prover 都要发送一个单变量多项式（通常是二次或三次）。
-    /// 这个函数计算该多项式在特定点（0, 1, ...）的评估值。
     fn compute_message(&self, _params: &ShiftSumcheckParams<F>, previous_claim: F) -> UniPoly<F> {
         let evals = self
             .prefix_suffix_pairs
             .par_iter()
             .map(|(p, q)| {
-                // 并行处理每一对 (P, Q)
                 let mut evals = [F::zero(); DEGREE_BOUND];
-                // 遍历 P 和 Q 的前半部分（折叠操作）
                 for i in 0..p.len() / 2 {
-                    // [算法: Linear Time Sumcheck]
-                    // 计算 sumcheck_evals_array 是为了获得多项式在下一轮折叠需要的点。
-                    // BindingOrder::LowToHigh 表示我们正在从低位变量开始折叠 x_0, x_1...
                     let p_evals =
                         p.sumcheck_evals_array::<DEGREE_BOUND>(i, BindingOrder::LowToHigh);
                     let q_evals =
                         q.sumcheck_evals_array::<DEGREE_BOUND>(i, BindingOrder::LowToHigh);
-
-                    // 对应点相乘并累加： g(r) = P(r) * Q(r)
                     evals = array::from_fn(|i| evals[i] + p_evals[i] * q_evals[i]);
                 }
                 evals
             })
-            // 归约求和所有分块的结果
             .reduce(
                 || [F::zero(); DEGREE_BOUND],
                 |a, b| array::from_fn(|i| a[i] + b[i]),
             );
 
-        // 使用之前的 Claim 和计算出的评估点构造单变量多项式
         UniPoly::from_evals_and_hint(previous_claim, &evals)
     }
 
-    /// 绑定变量 (Bind / Fold)
-    ///
-    /// [算法原理: Polynomial Folding]
-    /// 当 Verifier 发送挑战 r_j 后，Prover 需要将多变量多项式 P(x_0, ..., x_k) 和 Q
-    /// 在变量 x_j = r_j 处进行求值/折叠，使其变数减少 1。
-    /// P_new(x) = P(x, 0) + r_j * (P(x, 1) - P(x, 0))
     fn bind(&mut self, r_j: F::Challenge) {
         assert!(!self.should_transition_to_phase2());
         self.sumcheck_challenges.push(r_j);
         self.prefix_suffix_pairs.iter_mut().for_each(|(p, q)| {
-            // 对 P 和 Q 向量分别进行折叠
-            // 长度减半： 2^k -> 2^{k-1}
             p.bind(r_j, BindingOrder::LowToHigh);
             q.bind(r_j, BindingOrder::LowToHigh);
         });
     }
 
-    /// 检查是否应转换到 Phase 2
-    ///
-    /// 当 P 和 Q 向量被折叠到只剩常数项（长度为1，即 log2(len)==0 实际上通常保留到最后一层）时，
-    /// Phase 1 (Prefix Sumcheck) 结束。
-    /// 接下来的 Phase 2 将处理 Suffix 部分的验证。
     fn should_transition_to_phase2(&self) -> bool {
         self.prefix_suffix_pairs[0].0.len().ilog2() == 1
     }
@@ -718,11 +817,11 @@ impl<F: JoltField> Phase2State<F> {
                     is_noop_eval,
                     trace_chunk,
                 )| {
-                    let mut unexpanded_pc_eval_unreduced = F::Unreduced::<5>::zero();
-                    let mut pc_eval_unreduced = F::Unreduced::<6>::zero();
-                    let mut is_virtual_eval_unreduced = F::Unreduced::<5>::zero();
-                    let mut is_first_in_sequence_eval_unreduced = F::Unreduced::<5>::zero();
-                    let mut is_noop_eval_unreduced = F::Unreduced::<5>::zero();
+                    let mut unexpanded_pc_eval_unreduced = F::UnreducedMulU64::zero();
+                    let mut pc_eval_unreduced = F::UnreducedMulU128::zero();
+                    let mut is_virtual_eval_unreduced = F::UnreducedMulU64::zero();
+                    let mut is_first_in_sequence_eval_unreduced = F::UnreducedMulU64::zero();
+                    let mut is_noop_eval_unreduced = F::UnreducedMulU64::zero();
 
                     for (i, cycle) in trace_chunk.iter().enumerate() {
                         let ShiftSumcheckCycleState {
@@ -736,22 +835,22 @@ impl<F: JoltField> Phase2State<F> {
                         unexpanded_pc_eval_unreduced += eq_eval.mul_u64_unreduced(unexpanded_pc);
                         pc_eval_unreduced += eq_eval.mul_u64_unreduced(pc);
                         if is_virtual {
-                            is_virtual_eval_unreduced += *eq_eval.as_unreduced_ref();
+                            is_virtual_eval_unreduced += eq_eval.to_unreduced();
                         }
                         if is_first_in_sequence {
-                            is_first_in_sequence_eval_unreduced += *eq_eval.as_unreduced_ref();
+                            is_first_in_sequence_eval_unreduced += eq_eval.to_unreduced();
                         }
                         if is_noop {
-                            is_noop_eval_unreduced += *eq_eval.as_unreduced_ref();
+                            is_noop_eval_unreduced += eq_eval.to_unreduced();
                         }
                     }
 
-                    *unexpanded_pc_eval = F::from_barrett_reduce(unexpanded_pc_eval_unreduced);
-                    *pc_eval = F::from_barrett_reduce(pc_eval_unreduced);
-                    *is_virtual_eval = F::from_barrett_reduce(is_virtual_eval_unreduced);
+                    *unexpanded_pc_eval = F::reduce_mul_u64(unexpanded_pc_eval_unreduced);
+                    *pc_eval = F::reduce_mul_u128(pc_eval_unreduced);
+                    *is_virtual_eval = F::reduce_mul_u64(is_virtual_eval_unreduced);
                     *is_first_in_sequence_eval =
-                        F::from_barrett_reduce(is_first_in_sequence_eval_unreduced);
-                    *is_noop_eval = F::from_barrett_reduce(is_noop_eval_unreduced);
+                        F::reduce_mul_u64(is_first_in_sequence_eval_unreduced);
+                    *is_noop_eval = F::reduce_mul_u64(is_noop_eval_unreduced);
                 },
             );
 

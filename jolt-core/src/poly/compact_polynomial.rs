@@ -14,7 +14,8 @@ use std::ops::Index;
 /// 2. `bound_coeffs` is a vector of field elements (e.g. big scalars)
 ///
 /// They are often initialized with `coeffs` and then converted to `bound_coeffs`
-/// when binding the polynomial.
+/// when binding the polynomial. After the first bind, `coeffs` is dropped to
+/// free memory since all subsequent binds operate on `bound_coeffs`.
 #[derive(Default, Debug, PartialEq, CanonicalSerialize, CanonicalDeserialize, Allocative)]
 pub struct CompactPolynomial<T: SmallScalar, F: JoltField> {
     num_vars: usize,
@@ -185,22 +186,15 @@ impl<T: SmallScalar, F: JoltField> PolynomialBinding<F> for CompactPolynomial<T,
             match order {
                 BindingOrder::LowToHigh => {
                     for i in 0..n {
-                        if self.bound_coeffs[2 * i + 1] == self.bound_coeffs[2 * i] {
-                            self.bound_coeffs[i] = self.bound_coeffs[2 * i];
-                        } else {
-                            self.bound_coeffs[i] = self.bound_coeffs[2 * i]
-                                + r * (self.bound_coeffs[2 * i + 1] - self.bound_coeffs[2 * i]);
-                        }
+                        self.bound_coeffs[i] = self.bound_coeffs[2 * i]
+                            + r * (self.bound_coeffs[2 * i + 1] - self.bound_coeffs[2 * i]);
                     }
                 }
                 BindingOrder::HighToLow => {
                     let (left, right) = self.bound_coeffs.split_at_mut(n);
-                    left.iter_mut()
-                        .zip(right.iter())
-                        .filter(|(a, b)| a != b)
-                        .for_each(|(a, b)| {
-                            *a += r * (*b - *a);
-                        });
+                    left.iter_mut().zip(right.iter()).for_each(|(a, b)| {
+                        *a += r * (*b - *a);
+                    });
                 }
             }
         } else {
@@ -233,22 +227,21 @@ impl<T: SmallScalar, F: JoltField> PolynomialBinding<F> for CompactPolynomial<T,
                     self.bound_coeffs = left
                         .iter()
                         .zip(right.iter())
-                        .map(|(&a, &b)| {
-                            match a.cmp(&b) {
-                                Ordering::Equal => a.to_field(),
-                                // a < b: Compute a + r * (b - a)
-                                Ordering::Less => {
-                                    a.to_field::<F>() + b.diff_mul_field::<F>(a, r.into())
-                                }
-                                // a > b: Compute a - r * (a - b)
-                                Ordering::Greater => {
-                                    a.to_field::<F>() - a.diff_mul_field::<F>(b, r.into())
-                                }
+                        .map(|(&a, &b)| match a.cmp(&b) {
+                            Ordering::Equal => a.to_field(),
+                            // a < b: Compute a + r * (b - a)
+                            Ordering::Less => {
+                                a.to_field::<F>() + b.diff_mul_field::<F>(a, r.into())
+                            }
+                            // a > b: Compute a - r * (a - b)
+                            Ordering::Greater => {
+                                a.to_field::<F>() - a.diff_mul_field::<F>(b, r.into())
                             }
                         })
                         .collect();
                 }
             }
+            self.coeffs = Vec::new();
         }
 
         self.num_vars -= 1;
@@ -267,13 +260,9 @@ impl<T: SmallScalar, F: JoltField> PolynomialBinding<F> for CompactPolynomial<T,
                         self.bound_coeffs.par_chunks_exact(2),
                     )
                         .into_par_iter()
-                        .with_min_len(512)
+                        .with_min_len(512 * 32 / F::NUM_BYTES)
                         .for_each(|(bound_coeff, coeffs)| {
-                            bound_coeff.write(if coeffs[1] == coeffs[0] {
-                                coeffs[0]
-                            } else {
-                                (coeffs[1] - coeffs[0]) * r + coeffs[0]
-                            });
+                            bound_coeff.write(coeffs[0] + (coeffs[1] - coeffs[0]) * r);
                         });
                     unsafe { bound_coeffs.set_len(n) };
                     self.bound_coeffs = bound_coeffs;
@@ -283,13 +272,16 @@ impl<T: SmallScalar, F: JoltField> PolynomialBinding<F> for CompactPolynomial<T,
                     left.par_iter_mut()
                         .zip(right.par_iter())
                         .with_min_len(4096)
-                        .filter(|(a, b)| a != b)
                         .for_each(|(a, b)| {
                             *a += r * (*b - *a);
                         });
                 }
             }
         } else {
+            // We want to compute `a * (1 - r) + b * r` where `a` and `b` are small scalars
+            // If `a == b`, we can just return `a`
+            // If `a < b`, we can compute `a + r * (b - a)`
+            // If `a > b`, we can compute `a - r * (a - b)`
             match order {
                 BindingOrder::LowToHigh => {
                     self.bound_coeffs = (0..n)
@@ -316,22 +308,21 @@ impl<T: SmallScalar, F: JoltField> PolynomialBinding<F> for CompactPolynomial<T,
                     self.bound_coeffs = left
                         .par_iter()
                         .zip(right.par_iter())
-                        .map(|(&a, &b)| {
-                            match a.cmp(&b) {
-                                Ordering::Equal => a.to_field(),
-                                // a < b: Compute a + r * (b - a)
-                                Ordering::Less => {
-                                    a.to_field::<F>() + b.diff_mul_field::<F>(a, r.into())
-                                }
-                                // a > b: Compute a - r * (a - b)
-                                Ordering::Greater => {
-                                    a.to_field::<F>() - a.diff_mul_field::<F>(b, r.into())
-                                }
+                        .map(|(&a, &b)| match a.cmp(&b) {
+                            Ordering::Equal => a.to_field(),
+                            // a < b: Compute a + r * (b - a)
+                            Ordering::Less => {
+                                a.to_field::<F>() + b.diff_mul_field::<F>(a, r.into())
+                            }
+                            // a > b: Compute a - r * (a - b)
+                            Ordering::Greater => {
+                                a.to_field::<F>() - a.diff_mul_field::<F>(b, r.into())
                             }
                         })
                         .collect();
                 }
             }
+            self.coeffs = Vec::new();
         }
         self.num_vars -= 1;
         self.len = n;

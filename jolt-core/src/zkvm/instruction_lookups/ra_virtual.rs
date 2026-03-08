@@ -1,5 +1,11 @@
 use std::sync::Arc;
 
+#[cfg(feature = "zk")]
+use crate::poly::opening_proof::OpeningId;
+#[cfg(feature = "zk")]
+use crate::subprotocols::blindfold::{
+    InputClaimConstraint, OutputClaimConstraint, ProductTerm, ValueSource,
+};
 use crate::{
     field::JoltField,
     poly::{
@@ -49,78 +55,38 @@ pub struct InstructionRaSumcheckParams<F: JoltField> {
 }
 
 impl<F: JoltField> InstructionRaSumcheckParams<F> {
-    /// 初始化上下文，负责重建完整的地址随机挑战点 `r_address` 并提取周期随机点 `r_cycle`。
-    ///
-    /// 在 Jolt 中，由于内存地址空间 (M) 可能很大（例如 2^64），直接对整个地址空间进行多项式承诺可能不切实际。
-    /// 因此，Read Access (RA) 多项式被切分成了多个“虚拟多项式” (`InstructionRa(i)`)，每个负责地址的一部分比特。
-    ///
-    /// 此函数的任务是将这些分散的随机点片段（chunks）重新拼接，以还原出 Verifier 在整个地址空间上进行一致性检查所需的完整随机向量。
-    ///
-    /// # 举例说明
-    ///
-    /// 假设系统的参数如下：
-    /// - `LOG_K` (总地址位数) = 64
-    /// - `ra_virtual_log_k_chunk` (每个虚拟多项式负责的地址位数) = 16
-    ///
-    /// 则 `n_virtual_ra_polys` = 64 / 16 = 4。我们需要 4 个虚拟多项式来覆盖整个地址空间。
-    ///
-    /// 在 Sumcheck 过程中，Prover 针对这 4 个多项式分别提供了 Opening，对应的随机点结构如下：
-    /// - `InstructionRa(0)` 打开点: `P0 = [r_addr_bits_0..16,  r_cycle_bits]`
-    /// - `InstructionRa(1)` 打开点: `P1 = [r_addr_bits_16..32, r_cycle_bits]`
-    /// - `InstructionRa(2)` 打开点: `P2 = [r_addr_bits_32..48, r_cycle_bits]`
-    /// - `InstructionRa(3)` 打开点: `P3 = [r_addr_bits_48..64, r_cycle_bits]`
-    ///
-    /// 此函数会遍历这 4 个 Opening：
-    /// 1. 调用 `split_at_r` 将 `r_cycle` 分离。
-    /// 2. 提取前半部分的地址片段 `r_address_chunk`。
-    /// 3. 将这些片段依次追加到 `r_address` Vec 中。
-    ///
-    /// 最终得到的 `r_address` 包含了完整的 64 个比特的随机性：`[r_addr_bits_0..64]`。
     pub fn new(
         one_hot_params: &OneHotParams,
         opening_accumulator: &dyn OpeningAccumulator<F>,
         transcript: &mut impl Transcript,
     ) -> Self {
-        // 用于存放重建后的完整地址随机挑战点 (长度应为 LOG_K)
+        // Extract the full r_address from the virtual ra_i openings.
         let mut r_address = Vec::new();
 
         let ra_virtual_log_k_chunk = one_hot_params.lookups_ra_virtual_log_k_chunk;
         let ra_committed_log_k_chunk = one_hot_params.log_k_chunk;
-
-        // 计算每个虚拟多项式包含多少个已提交的多项式块
         let n_committed_per_virtual = ra_virtual_log_k_chunk / ra_committed_log_k_chunk;
 
-        // 计算总共需要多少个虚拟多项式来覆盖整个 LOG_K 地址空间
         let n_virtual_ra_polys = LOG_K / ra_virtual_log_k_chunk;
         let n_committed_ra_polys = LOG_K / ra_committed_log_k_chunk;
 
-        // 遍历所有虚拟多项式，提取地址片段
         for i in 0..n_virtual_ra_polys {
-            // 从累加器中获取第 i 个 InstructionRa 多项式的 Opening Point (点 r)
             let (r, _) = opening_accumulator.get_virtual_polynomial_opening(
                 VirtualPolynomial::InstructionRa(i),
                 SumcheckId::InstructionReadRaf,
             );
 
-            // r 的结构是 [address_chunk_randomness, cycle_randomness]
-            // split_at_r 将其切分，我们只需要前半部分 (地址片段)
             let (r_address_chunk, _) = r.split_at_r(ra_virtual_log_k_chunk);
-
-            // 将片段拼接到总向量中
             r_address.extend_from_slice(r_address_chunk);
         }
 
-        // 提取 r_cycle (所有 chunk 共享同一个 cycle 随机点，取第 0 个即可)
         let (r, _) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::InstructionRa(0),
             SumcheckId::InstructionReadRaf,
         );
-        // split_at 将 r 切分为 [地址部分 (len=chunk), 周期部分 (其余)]
         let (_, r_cycle) = r.split_at(ra_virtual_log_k_chunk);
 
-        // 生成 gamma 的幂次，用于后续在此上下文中线性组合多个多项式项
         let gamma_powers = transcript.challenge_scalar_powers(n_virtual_ra_polys);
-
         Self {
             r_cycle,
             one_hot_params: one_hot_params.clone(),
@@ -162,6 +128,59 @@ impl<F: JoltField> SumcheckInstanceParams<F> for InstructionRaSumcheckParams<F> 
     ) -> OpeningPoint<BIG_ENDIAN, F> {
         OpeningPoint::<LITTLE_ENDIAN, F>::new(challenges.to_vec()).match_endianness()
     }
+
+    #[cfg(feature = "zk")]
+    fn input_claim_constraint(&self) -> InputClaimConstraint {
+        let openings: Vec<OpeningId> = (0..self.n_virtual_ra_polys)
+            .map(|i| {
+                OpeningId::virt(
+                    VirtualPolynomial::InstructionRa(i),
+                    SumcheckId::InstructionReadRaf,
+                )
+            })
+            .collect();
+        InputClaimConstraint::all_weighted_openings(&openings)
+    }
+
+    #[cfg(feature = "zk")]
+    fn input_constraint_challenge_values(&self, _: &dyn OpeningAccumulator<F>) -> Vec<F> {
+        self.gamma_powers.clone()
+    }
+
+    #[cfg(feature = "zk")]
+    fn output_claim_constraint(&self) -> Option<OutputClaimConstraint> {
+        let m = self.n_committed_per_virtual;
+        let n = self.n_virtual_ra_polys;
+
+        let terms: Vec<ProductTerm> = (0..n)
+            .map(|i| {
+                let factors: Vec<ValueSource> = (0..m)
+                    .map(|j| {
+                        let opening = OpeningId::committed(
+                            CommittedPolynomial::InstructionRa(i * m + j),
+                            SumcheckId::InstructionRaVirtualization,
+                        );
+                        ValueSource::Opening(opening)
+                    })
+                    .collect();
+
+                ProductTerm::scaled(ValueSource::Challenge(i), factors)
+            })
+            .collect();
+
+        Some(OutputClaimConstraint::sum_of_products(terms))
+    }
+
+    #[cfg(feature = "zk")]
+    fn output_constraint_challenge_values(&self, sumcheck_challenges: &[F::Challenge]) -> Vec<F> {
+        let r = self.normalize_opening_point(sumcheck_challenges);
+        let eq_eval: F = EqPolynomial::mle_endian(&self.r_cycle, &r);
+
+        self.gamma_powers
+            .iter()
+            .map(|gamma_i| eq_eval * *gamma_i)
+            .collect()
+    }
 }
 
 #[derive(Allocative)]
@@ -174,75 +193,54 @@ pub struct InstructionRaSumcheckProver<F: JoltField> {
 impl<F: JoltField> InstructionRaSumcheckProver<F> {
     #[tracing::instrument(skip_all, name = "InstructionRaSumcheckProver::initialize")]
     pub fn initialize(params: InstructionRaSumcheckParams<F>, trace: &[Cycle]) -> Self {
-        // =========================================================
-        // 1. 计算拆分后的 r_address
-        // Verifier 发来一个针对整个查表空间的随机挑战点 r_address。
-        // 将其拆分为对应每个 chunk 维度的小随机点数组 r_address_chunks。
-        // =========================================================
+        // Compute r_address_chunks with proper padding
         let r_address_chunks = params
             .one_hot_params
             .compute_r_address_chunks::<F>(&params.r_address.r);
 
-        // =========================================================
-        // 2. 提取 Trace 中的切片 (Indices)
-        // 遍历整个执行痕迹，把操作数大整数转化为查表用的 chunk 数组。
-        // H_indices[i][t] 表示：在维度 i，时刻 t 的 chunk 值 (如 0~255)。
-        // =========================================================
         let H_indices: Vec<Vec<Option<u8>>> = (0..params.one_hot_params.instruction_d)
             .map(|i| {
                 trace
                     .par_iter()
                     .map(|cycle| {
-                        // to_lookup_index: 取出 rs1, rs2 等组合成大整数
                         let lookup_index = LookupQuery::<XLEN>::to_lookup_index(cycle);
-                        // 提取出第 i 个 byte 切片
                         Some(params.one_hot_params.lookup_index_chunk(lookup_index, i))
                     })
                     .collect()
             })
             .collect();
 
-        // c: 每个虚拟查找(比如一次 ADD)需要多少个物理多项式切片组合
         let n_committed_per_virtual = params.n_committed_per_virtual;
-        // gamma 幂次数组: [1, gamma, gamma^2, ...]
         let gamma_powers = &params.gamma_powers;
 
-        // =========================================================
-        // 3. 构建惰性查表多项式 (RaPolynomials) 及 Gamma 预缩放优化
-        // =========================================================
         let ra_i_polys = H_indices
-            .into_par_iter() // 并行处理每一列
+            .into_par_iter()
             .enumerate()
             .map(|(i, lookup_indices)| {
-                // 核心优化：预缩放。
-                // 如果当前维度 i 是一组切片 (batch) 的第一个 (i % c == 0)
+                // Pre-scale the first committed polynomial in each virtual batch by γ^batch.
+                //
+                // This pushes the γ weight *inside* the product term so we can form
+                // (Σ γ^i · ∏ ra_{i,*}) before multiplying by split-eq's inner weights e_in,
+                // allowing a single split-eq fold for the whole sumcheck message.
                 let scaling_factor = if i % n_committed_per_virtual == 0 {
-                    let batch = i / n_committed_per_virtual; // 计算属于第几个 batch
-                    let gamma = gamma_powers[batch];         // 取出对应的权重 gamma^b
+                    let batch = i / n_committed_per_virtual;
+                    let gamma = gamma_powers[batch];
                     if gamma != F::one() {
                         Some(gamma)
                     } else {
                         None
                     }
                 } else {
-                    None // 组内的其他切片不缩放
+                    None
                 };
-
-                // evals_with_scaling: 计算 eq(r, x) 的查表字典 (大小 256)。
-                // 如果 scaling_factor 存在，字典里的每个值预先乘以 gamma。
                 let eq_evals =
                     EqPolynomial::evals_with_scaling(&r_address_chunks[i], scaling_factor);
-
-                // RaPolynomial 不存具体的域元素，只存索引 `lookup_indices` 和字典 `eq_evals`。
-                // 每次需要求值时，执行：eq_evals[ lookup_indices[t] ]
                 RaPolynomial::new(Arc::new(lookup_indices), eq_evals)
             })
             .collect();
 
-        // 4. 返回初始化好的 Prover 实例
         Self {
             ra_i_polys,
-            // 绑定到时间维度的快速 Eq 多项式 (Gruen 优化)，用于 O(N) 验证
             eq_poly: GruenSplitEqPolynomial::new(&params.r_cycle.r, BindingOrder::LowToHigh),
             params,
         }
@@ -294,7 +292,6 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for InstructionRa
     fn cache_openings(
         &self,
         accumulator: &mut ProverOpeningAccumulator<F>,
-        transcript: &mut T,
         sumcheck_challenges: &[F::Challenge],
     ) {
         let r_cycle = self.params.normalize_opening_point(sumcheck_challenges);
@@ -317,7 +314,6 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for InstructionRa
                 }
             }
             accumulator.append_sparse(
-                transcript,
                 vec![CommittedPolynomial::InstructionRa(i)],
                 SumcheckId::InstructionRaVirtualization,
                 r_address,
@@ -404,7 +400,6 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T> for RaSumcheckV
     fn cache_openings(
         &self,
         accumulator: &mut VerifierOpeningAccumulator<F>,
-        transcript: &mut T,
         sumcheck_challenges: &[F::Challenge],
     ) {
         let r_cycle = self.params.normalize_opening_point(sumcheck_challenges);
@@ -419,7 +414,6 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T> for RaSumcheckV
             let opening_point = [r_address.as_slice(), r_cycle.r.as_slice()].concat();
 
             accumulator.append_sparse(
-                transcript,
                 vec![CommittedPolynomial::InstructionRa(i)],
                 SumcheckId::InstructionRaVirtualization,
                 opening_point,

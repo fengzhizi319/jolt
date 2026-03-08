@@ -29,7 +29,7 @@ declare_riscv_instr!(
 
 impl LB {
     fn exec(&self, cpu: &mut Cpu, ram_access: &mut <LB as RISCVInstruction>::RAMAccess) {
-        cpu.x[self.operands.rd as usize] = match cpu
+        let value = match cpu
             .mmu
             .load(cpu.x[self.operands.rs1 as usize].wrapping_add(self.operands.imm) as u64)
         {
@@ -39,6 +39,7 @@ impl LB {
             }
             Err(_) => panic!("MMU load error"),
         };
+        cpu.write_register(self.operands.rd as usize, value);
     }
 }
 
@@ -81,20 +82,18 @@ impl LB {
     /// 5. Shift byte to MSB position
     /// 6. Arithmetic right shift by 24 to sign-extend to 32 bits
     fn inline_sequence_32(&self, allocator: &VirtualRegisterAllocator) -> Vec<Instruction> {
-        let v_address = allocator.allocate();
-        let v_word_address = allocator.allocate();
-        let v_word = allocator.allocate();
-        let v_shift = allocator.allocate();
+        let v0 = allocator.allocate();
+        let v1 = allocator.allocate();
 
         let mut asm = InstrAssembler::new(self.address, self.is_compressed, Xlen::Bit32, allocator);
 
-        asm.emit_i::<ADDI>(*v_address, self.operands.rs1, self.operands.imm as u64);
-        asm.emit_i::<ANDI>(*v_word_address, *v_address, -4i64 as u64);
-        asm.emit_i::<VirtualLW>(*v_word, *v_word_address, 0);
-        asm.emit_i::<XORI>(*v_shift, *v_address, 3);
-        asm.emit_i::<SLLI>(*v_shift, *v_shift, 3);
-        asm.emit_r::<SLL>(self.operands.rd, *v_word, *v_shift);
-        asm.emit_i::<SRAI>(self.operands.rd, self.operands.rd, 24);
+        asm.emit_i::<ADDI>(*v0, self.operands.rs1, self.operands.imm as u64);
+        asm.emit_i::<ANDI>(*v1, *v0, -4i64 as u64);
+        asm.emit_i::<VirtualLW>(*v1, *v1, 0);
+        asm.emit_i::<XORI>(*v0, *v0, 3);
+        asm.emit_i::<SLLI>(*v0, *v0, 3);
+        asm.emit_r::<SLL>(*v1, *v1, *v0);
+        asm.emit_i::<SRAI>(self.operands.rd, *v1, 24);
 
         asm.finalize()
     }
@@ -109,20 +108,18 @@ impl LB {
     /// 5. Shift byte to MSB position
     /// 6. Arithmetic right shift by 56 to sign-extend to 64 bits
     fn inline_sequence_64(&self, allocator: &VirtualRegisterAllocator) -> Vec<Instruction> {
-        let v_address = allocator.allocate();
-        let v_dword_address = allocator.allocate();
-        let v_dword = allocator.allocate();
-        let v_shift = allocator.allocate();
+        let v0 = allocator.allocate();
+        let v1 = allocator.allocate();
 
         let mut asm = InstrAssembler::new(self.address, self.is_compressed, Xlen::Bit64, allocator);
 
-        asm.emit_i::<ADDI>(*v_address, self.operands.rs1, self.operands.imm as u64);
-        asm.emit_i::<ANDI>(*v_dword_address, *v_address, -8i64 as u64);
-        asm.emit_ld::<LD>(*v_dword, *v_dword_address, 0);
-        asm.emit_i::<XORI>(*v_shift, *v_address, 7);
-        asm.emit_i::<SLLI>(*v_shift, *v_shift, 3);
-        asm.emit_r::<SLL>(self.operands.rd, *v_dword, *v_shift);
-        asm.emit_i::<SRAI>(self.operands.rd, self.operands.rd, 56);
+        asm.emit_i::<ADDI>(*v0, self.operands.rs1, self.operands.imm as u64);
+        asm.emit_i::<ANDI>(*v1, *v0, -8i64 as u64);
+        asm.emit_ld::<LD>(*v1, *v1, 0);
+        asm.emit_i::<XORI>(*v0, *v0, 7);
+        asm.emit_i::<SLLI>(*v0, *v0, 3);
+        asm.emit_r::<SLL>(*v1, *v1, *v0);
+        asm.emit_i::<SRAI>(self.operands.rd, *v1, 56);
 
         asm.finalize()
     }

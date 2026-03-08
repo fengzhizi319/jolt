@@ -82,6 +82,8 @@ use rayon::prelude::*;
 use tracer::instruction::Cycle;
 
 use crate::field::JoltField;
+#[cfg(feature = "zk")]
+use crate::poly::opening_proof::OpeningId;
 use crate::poly::{
     eq_poly::EqPolynomial,
     multilinear_polynomial::{BindingOrder, MultilinearPolynomial, PolynomialBinding},
@@ -91,6 +93,10 @@ use crate::poly::{
     },
     shared_ra_polys::compute_all_G,
     unipoly::UniPoly,
+};
+#[cfg(feature = "zk")]
+use crate::subprotocols::blindfold::{
+    InputClaimConstraint, OutputClaimConstraint, ProductTerm, ValueSource,
 };
 use crate::subprotocols::{
     sumcheck_prover::SumcheckInstanceProver,
@@ -147,63 +153,18 @@ impl<F: JoltField> HammingWeightClaimReductionParams<F> {
     /// - HammingWeight claims (from HammingBooleanity virtual polynomial)
     /// - Booleanity claims (r_addr shared across all families from Booleanity sumcheck)
     /// - Virtualization claims (r_addr different per ra_i)
-
-    /// Create params by fetching claims from Stage 6 and sampling batching challenge.
-    ///
-    /// # 目的 / Purpose
-    /// 构造融合 Sumcheck 所需的参数。该 Sumcheck 旨在同时证明关于 $N$ 个多项式 $ra_i$ 的三组 Claim（共 $3N$ 个）：
-    ///
-    /// 1. **Hamming Weight (HW)**: 证明 $ra_i$ 在所有地址上的总和等于预期值 $H_i$。
-    ///    $$ \sum_{k \in \{0,1\}^{log\_k\_chunk}} G_i(k) = H_i $$
-    ///    - 对于指令/字节码，$H_i = 1$ (One-Hot)。
-    ///    - 对于 RAM，$H_i$ 是动态计算的汉明重量因子。
-    ///
-    /// 2. **Booleanity (Bool)**: 证明 $ra_i$ 在布尔性检查点的求值正确。
-    ///    这实际上是将 $\text{claim\_bool}_i$ 归约到 $G_i$ 上：
-    ///    $$ \sum_{k} eq(r_{\text{addr,bool}}, k) \cdot G_i(k) = \text{claim\_bool}_i $$
-    ///
-    /// 3. **Virtualization (Virt)**: 证明 $ra_i$ 在虚拟化检查点的求值正确。
-    ///    $$ \sum_{k} eq(r_{\text{addr,virt}, i}, k) \cdot G_i(k) = \text{claim\_virt}_i $$
-    ///
-    /// # 融合算法 / Fused Algorithm
-    /// 通过引入随机挑战值 $\gamma$，我们将这 $3N$ 个等式线性组合成一个单一的 Sumcheck 实例：
-    ///
-    /// $$
-    /// \sum_{k} \sum_{i=0}^{N-1} G_i(k) \cdot \left[
-    ///     \gamma^{3i} \cdot 1 +
-    ///     \gamma^{3i+1} \cdot eq(r_{\text{addr,bool}}, k) +
-    ///     \gamma^{3i+2} \cdot eq(r_{\text{addr,virt}, i}, k)
-    /// \right]
-    /// = \sum_{i=0}^{N-1} \left[
-    ///     \gamma^{3i} H_i +
-    ///     \gamma^{3i+1} \cdot \text{claim\_bool}_i +
-    ///     \gamma^{3i+2} \cdot \text{claim\_virt}_i
-    /// \right]
-    /// $$
-    ///
-    /// 其中：
-    /// - $G_i(k)$ 是 $ra_i$ 在 Cycle 维度上被折叠后的多项式: $G_i(k) = \sum_j eq(r_{cycle}, j) \cdot ra_i(k, j)$。
-    ///
     pub fn new(
         one_hot_params: &OneHotParams,
         accumulator: &dyn OpeningAccumulator<F>,
         transcript: &mut impl Transcript,
     ) -> Self {
-        // 获取指令、字节码和 RAM 多项式的数量，如32，3，4，总共 N=39 个 ra_i 多项式需要被归约
         let instruction_d = one_hot_params.instruction_d;
         let bytecode_d = one_hot_params.bytecode_d;
         let ram_d = one_hot_params.ram_d;
-
-        // N 是所有需要被归约的 Read Access (RA) 多项式的总数，如果 instruction_d=32, bytecode_d=3, ram_d=4，则 N=39。
         let N = instruction_d + bytecode_d + ram_d;
-        // log_k_chunk 是地址空间的维度大小（决定了多项式在地址维度的变量个数），如果 k_chunk=16，则 log_k_chunk=4。
         let log_k_chunk = one_hot_params.log_k_chunk;
 
-        // ------------------------------------------------------------------------
-        // 步骤 1: 构建多项式类型列表
-        // 按照固定的顺序收集所有的多项式标识：先指令，再字节码，最后 RAM。
-        // 这保证了 Prover 和 Verifier 在应用随机数 gamma 时顺序严格一致。
-        // ------------------------------------------------------------------------
+        // Build polynomial types list
         let mut polynomial_types = Vec::with_capacity(N);
         for i in 0..instruction_d {
             polynomial_types.push(CommittedPolynomial::InstructionRa(i));
@@ -215,43 +176,38 @@ impl<F: JoltField> HammingWeightClaimReductionParams<F> {
             polynomial_types.push(CommittedPolynomial::RamRa(i));
         }
 
-        // ------------------------------------------------------------------------
-        // 步骤 2: 生成随机挑战 γ (Gamma) 及其幂次
-        // 从 Transcript 采样以保证 Fiat-Shamir 安全性。
-        // 因为有 N 个多项式，每个多项式有 3 个需要证明的 Claim (HW, Bool, Virt)，
-        // 所以我们需要 3N 个线性组合系数。
-        // ------------------------------------------------------------------------
+        // Sample batching challenge γ and compute powers (3 claims per ra_i)
         let gamma: F = transcript.challenge_scalar();
         let mut gamma_powers = Vec::with_capacity(3 * N);
         let mut power = F::one();
         for _ in 0..(3 * N) {
-            gamma_powers.push(power); // 序列: 1, γ, γ^2, ..., γ^{3N-1}
+            gamma_powers.push(power);
             power *= gamma;
         }
 
-        // ------------------------------------------------------------------------
-        // 步骤 3: 提取时间维度和布尔性检查的随机点
-        // 从 Stage 6 的累加器中拿出 Booleanity Check 用的公共点。
-        // Jolt 将多项式的变量分成了两半：前面是地址变量，后面是时间（Cycle）变量。
-        // unified_bool_point.r 是一个长向量 [r_addr, r_cycle]
-        // ------------------------------------------------------------------------
+        // Fetch r_addr_bool and r_cycle from Booleanity opening point.
+        // The claims from Booleanity are at (ρ_addr, ρ_cycle) where both are sumcheck challenges.
+        //
+        // For HammingWeight's G to satisfy: Σ_k G_i(k) * eq(ρ_addr, k) = claims_bool[i] = ra_i(ρ_addr, ρ_cycle)
+        // We need: G_i(k) = Σ_j eq(ρ_cycle, j) * ra_i(k, j)
+        //
+        // The opening point is stored in BE format (after normalize_opening_point reversed it).
         let (unified_bool_point, _) = accumulator.get_committed_polynomial_opening(
-            CommittedPolynomial::InstructionRa(0), // 取第 0 个因为所有的 bool point 都是共享的
+            CommittedPolynomial::InstructionRa(0),
             SumcheckId::Booleanity,
         );
-
-        // 将长向量切片，前 log_k_chunk 个变量属于空间地址，剩下的属于时间 Cycle。
+        // Keep both segments in BE: this matches the convention expected by `EqPolynomial::evals`
+        // and `GruenSplitEqPolynomial` when used with `BindingOrder::LowToHigh` (LSB bound first).
         let r_addr_bool = unified_bool_point.r[..log_k_chunk].to_vec();
         let r_cycle: Vec<F::Challenge> = unified_bool_point.r[log_k_chunk..].to_vec();
 
-        // 初始化四个数组，用于分别存放这 3 类 Claim 的目标值，以及 Virt 特有的地址点。
+        // Fetch claims for each ra_i
         let mut r_addr_virt = Vec::with_capacity(N);
         let mut claims_hw = Vec::with_capacity(N);
         let mut claims_bool = Vec::with_capacity(N);
         let mut claims_virt = Vec::with_capacity(N);
 
-        // RAM 的汉明重量不是 1。在 Stage 6 的 RAM 检查中，它被折叠成了一个特定的因子。
-        // 我们需要把它提出来作为 RAM 多项式 HW 检查的预期目标值。
+        // RAM HammingWeight factor: now in Stage 6, so shares r_cycle_stage6
         let ram_hw_factor = accumulator
             .get_virtual_polynomial_opening(
                 VirtualPolynomial::RamHammingWeight,
@@ -259,39 +215,31 @@ impl<F: JoltField> HammingWeightClaimReductionParams<F> {
             )
             .1;
 
-        // ------------------------------------------------------------------------
-        // 步骤 4: 遍历所有多项式，提取它们的 Claims
-        // ------------------------------------------------------------------------
         for poly_type in polynomial_types.iter() {
-            // 4a. 确定汉明重量 (HW) 的预期总和：
-            // 指令和字节码要求严格的 One-Hot，所以总和等于 1 (F::one())。
-            // RAM 的总和等于上面获取的 ram_hw_factor。
+            // Get virtualization sumcheck ID and HW claim based on polynomial type
             let (virt_sumcheck_id, hw_claim) = match poly_type {
                 CommittedPolynomial::InstructionRa(_) => {
                     (SumcheckId::InstructionRaVirtualization, F::one())
                 }
                 CommittedPolynomial::BytecodeRa(_) => (SumcheckId::BytecodeReadRaf, F::one()),
+                // For Ram: H_i = ram_hw_factor (shared across all RAM chunks)
                 CommittedPolynomial::RamRa(_) => (SumcheckId::RamRaVirtualization, ram_hw_factor),
                 _ => unreachable!(),
             };
             claims_hw.push(hw_claim);
 
-            // 4b. 提取布尔性检查的目标值 claim_bool_i
-            // 这是 Stage 6 结束时多项式在 r_addr_bool 和 r_cycle 处的求值结果。
+            // Booleanity claim (from booleanity sumcheck)
             let (_, bool_claim) =
                 accumulator.get_committed_polynomial_opening(*poly_type, SumcheckId::Booleanity);
             claims_bool.push(bool_claim);
 
-            // 4c. 提取虚拟化检查的目标值 claim_virt_i 及其专属地址点
-            // 注意：与 bool 点不同，virt 检查在每个 chunk/多项式上使用的地址点可能都不一样，
-            // 所以我们必须把点 `virt_point.r[..log_k_chunk]` 也存入 `r_addr_virt` 数组中。
+            // Virtualization claim (with per-polynomial r_addr)
             let (virt_point, virt_claim) =
                 accumulator.get_committed_polynomial_opening(*poly_type, virt_sumcheck_id);
             r_addr_virt.push(virt_point.r[..log_k_chunk].to_vec());
             claims_virt.push(virt_claim);
         }
 
-        // 将收集好的所有参数组装成结构体返回，供后续的批量 Sumcheck Prover 使用
         Self {
             gamma_powers,
             r_cycle,
@@ -304,7 +252,6 @@ impl<F: JoltField> HammingWeightClaimReductionParams<F> {
             polynomial_types,
         }
     }
-
 }
 
 impl<F: JoltField> SumcheckInstanceParams<F> for HammingWeightClaimReductionParams<F> {
@@ -338,11 +285,120 @@ impl<F: JoltField> SumcheckInstanceParams<F> for HammingWeightClaimReductionPara
         let full_point = [r_addr.r.as_slice(), self.r_cycle.as_slice()].concat();
         OpeningPoint::<BIG_ENDIAN, F>::new(full_point)
     }
-}
 
-// ============================================================================
-// PROVER
-// ============================================================================
+    #[cfg(feature = "zk")]
+    fn input_claim_constraint(&self) -> InputClaimConstraint {
+        let n = self.polynomial_types.len();
+        let mut terms = Vec::new();
+        let mut challenge_idx = 0;
+
+        for i in 0..n {
+            let poly_type = self.polynomial_types[i];
+
+            let virt_sumcheck_id = match poly_type {
+                CommittedPolynomial::InstructionRa(_) => SumcheckId::InstructionRaVirtualization,
+                CommittedPolynomial::BytecodeRa(_) => SumcheckId::BytecodeReadRaf,
+                CommittedPolynomial::RamRa(_) => SumcheckId::RamRaVirtualization,
+                _ => unreachable!(),
+            };
+
+            // HW claim term: γ^{3i} * hw_claim_i
+            // For RAM, hw_claim is RamHammingWeight opening; for others, it's F::one()
+            match poly_type {
+                CommittedPolynomial::RamRa(_) => {
+                    let hw_opening = OpeningId::virt(
+                        VirtualPolynomial::RamHammingWeight,
+                        SumcheckId::RamHammingBooleanity,
+                    );
+                    terms.push(ProductTerm::scaled(
+                        ValueSource::Challenge(challenge_idx),
+                        vec![ValueSource::Opening(hw_opening)],
+                    ));
+                }
+                _ => {
+                    // For instruction/bytecode, hw_claim = 1, so term is just γ^{3i}
+                    terms.push(ProductTerm::single(ValueSource::Challenge(challenge_idx)));
+                }
+            }
+            challenge_idx += 1;
+
+            // Bool claim term: γ^{3i+1} * bool_opening_i
+            let bool_opening = OpeningId::committed(poly_type, SumcheckId::Booleanity);
+            terms.push(ProductTerm::scaled(
+                ValueSource::Challenge(challenge_idx),
+                vec![ValueSource::Opening(bool_opening)],
+            ));
+            challenge_idx += 1;
+
+            // Virt claim term: γ^{3i+2} * virt_opening_i
+            let virt_opening = OpeningId::committed(poly_type, virt_sumcheck_id);
+            terms.push(ProductTerm::scaled(
+                ValueSource::Challenge(challenge_idx),
+                vec![ValueSource::Opening(virt_opening)],
+            ));
+            challenge_idx += 1;
+        }
+
+        InputClaimConstraint::sum_of_products(terms)
+    }
+
+    #[cfg(feature = "zk")]
+    fn input_constraint_challenge_values(&self, _: &dyn OpeningAccumulator<F>) -> Vec<F> {
+        let n = self.polynomial_types.len();
+        let mut values = Vec::with_capacity(3 * n);
+
+        for i in 0..n {
+            // γ^{3i} for hw term
+            values.push(self.gamma_powers[3 * i]);
+            // γ^{3i+1} for bool term
+            values.push(self.gamma_powers[3 * i + 1]);
+            // γ^{3i+2} for virt term
+            values.push(self.gamma_powers[3 * i + 2]);
+        }
+
+        values
+    }
+
+    #[cfg(feature = "zk")]
+    fn output_claim_constraint(&self) -> Option<OutputClaimConstraint> {
+        let N = self.polynomial_types.len();
+
+        let terms: Vec<ProductTerm> = (0..N)
+            .map(|i| {
+                let opening = OpeningId::committed(
+                    self.polynomial_types[i],
+                    SumcheckId::HammingWeightClaimReduction,
+                );
+                ProductTerm::scaled(
+                    ValueSource::Challenge(i),
+                    vec![ValueSource::Opening(opening)],
+                )
+            })
+            .collect();
+
+        Some(OutputClaimConstraint::sum_of_products(terms))
+    }
+
+    #[cfg(feature = "zk")]
+    fn output_constraint_challenge_values(&self, sumcheck_challenges: &[F::Challenge]) -> Vec<F> {
+        let N = self.polynomial_types.len();
+
+        let rho_rev: Vec<F::Challenge> = sumcheck_challenges.iter().cloned().rev().collect();
+        let eq_bool_eval: F = EqPolynomial::mle(&rho_rev, &self.r_addr_bool);
+
+        (0..N)
+            .map(|i| {
+                let eq_virt_eval: F = EqPolynomial::mle(&rho_rev, &self.r_addr_virt[i]);
+
+                let gamma_hw = self.gamma_powers[3 * i];
+                let gamma_bool = self.gamma_powers[3 * i + 1];
+                let gamma_virt = self.gamma_powers[3 * i + 2];
+
+                gamma_hw + gamma_bool * eq_bool_eval + gamma_virt * eq_virt_eval
+            })
+            .collect()
+    }
+}
 
 /// Prover for the fused HammingWeight + Address Reduction sumcheck.
 ///
@@ -355,109 +411,58 @@ impl<F: JoltField> SumcheckInstanceParams<F> for HammingWeightClaimReductionPara
 pub struct HammingWeightClaimReductionProver<F: JoltField> {
     /// G_i polynomials (pushforward of ra_i over r_cycle)
     /// G_i(k) = Σ_j eq(r_cycle, j) · ra_i(k, j)
-    ///
-    /// # 中文说明
-    /// $N$ 个在时间维度（Cycle）上被折叠/归约后的多项式列表。
-    ///
-    /// 原始的读取访问多项式 $ra_i(addr, cycle)$ 是二维的。在 Stage 6 结束后，Verifier 提供了时间维度的随机点 $r_{cycle}$。
-    /// Prover 必须先计算 $ra_i$ 在 $r_{cycle}$ 上的部分求值，生成只关于地址 $k$ 的新多项式 $G_i(k)$。
-    ///
-    /// 数学公式：
-    /// $$ G_i(k) := \sum_{j \in \{0, 1\}^{log\_M}} eq(r_{cycle}, j) \cdot ra_i(k, j) $$
-    ///
-    /// 这些 $G_i$ 多项式是本次 Sumcheck 协议的主要输入，后续所有的 Claim (HW, Bool, Virt) 都是关于 $G_i$ 的性质证明。
     G: Vec<MultilinearPolynomial<F>>,
-
     /// eq(r_addr_bool, ·) shared across all families (single polynomial)
-    ///
-    /// # 中文说明
-    /// 对应布尔性检查（Booleanity Check）的相等性多项式（Eq Polynomial）。
-    ///
-    /// 在 Booleanity 检查中，所有的内存多项式（指令、字节码、RAM）都共享同一个地址随机挑战点 $r_{addr,bool}$。
-    /// 为了在 Sumcheck 协议中证明 $G_i(r_{addr,bool}) = v$，我们需要将其转化为求和形式：
-    /// $$ \sum_k G_i(k) \cdot eq(r_{addr,bool}, k) $$
-    ///
-    /// 因为地址点是共享的，所以这里只需要存储**一个** $eq$ 多项式即可供所有 $G_i$ 复用，节省了大量内存。
     eq_bool: MultilinearPolynomial<F>,
-
     /// eq(r_addr_virt_i, ·) for each ra polynomial (N total)
-    ///
-    /// # 中文说明
-    /// 对应虚拟化检查（Virtualization Check）的相等性多项式列表。
-    ///
-    /// 与 Booleanity 不同，Virtualization 检查通常涉及具体的内存 Chunk 读取。每个 $ra_i$（对应不同的 Chunk 或段）
-    /// 可能会在不同的虚拟地址 $r_{addr,virt,i}$ 处被查询。
-    ///
-    /// 因此，我们无法像上面那样共享，必须为每一个 $ra_i$ 存储一个对应的 $eq(r_{addr,virt,i}, \cdot)$ 多项式。
-    /// 列表长度为 $N$，与 `G` 的长度一致。
     eq_virt: Vec<MultilinearPolynomial<F>>,
-
     #[allocative(skip)]
     pub params: HammingWeightClaimReductionParams<F>,
 }
+
 impl<F: JoltField> HammingWeightClaimReductionProver<F> {
-    /// 初始化证明器，计算所有的 G_i 多项式以及用于点求值的相等性多项式 (eq polynomials)。
-    /// 这里的性能非常关键，因为会涉及到巨大的内存分配和有限域运算。
+    /// Initialize the prover by computing all G_i polynomials.
+    /// Returns (prover, ram_hw_claims) where ram_hw_claims contains the computed H_i for RAM polynomials.
     #[tracing::instrument(skip_all, name = "HammingWeightClaimReductionProver::initialize")]
     pub fn initialize(
-        params: HammingWeightClaimReductionParams<F>, // 包含 gamma 幂次、预期 Claims 和各种随机点
-        trace: &[Cycle],                              // CPU 执行轨迹 (二维：时间 x 空间)
-        preprocessing: &JoltSharedPreprocessing,      // 预处理数据 (如字节码布局)
+        params: HammingWeightClaimReductionParams<F>,
+        trace: &[Cycle],
+        preprocessing: &JoltSharedPreprocessing,
         one_hot_params: &OneHotParams,
     ) -> Self {
-
-        // ========================================================================
-        // 步骤 1: 计算所有 G_i 多项式 (时间维度的部分求值/折叠)
-        // ========================================================================
-        // 原始的读取访问 (RA) 多项式是二维的：RA(time, space_address)。
-        // 但是在前一个阶段 (Stage 6)，Verifier 已经给出了时间维度的随机挑战点 `r_cycle`。
-        // 这里，`compute_all_G` 函数在底层流式遍历执行轨迹，将二维多项式在时间维度上
-        // 坍缩（折叠）成一维多项式： G_i(space) = RA_i(r_cycle, space)。
-        // 这样，G_i 就变成了一个只与地址空间 (log_k_chunk 个变量) 相关的多线性多项式。
+        // Compute all G_i polynomials via streaming.
+        // `params.r_cycle` is in BIG_ENDIAN (OpeningPoint) convention.
         let G_vecs = compute_all_G::<F>(
             trace,
             &preprocessing.bytecode,
             &preprocessing.memory_layout,
             one_hot_params,
-            &params.r_cycle, // 使用大端序的随机点
+            &params.r_cycle,
         );
-
-        // 将计算出的向量包装成正式的 MultilinearPolynomial 数据结构
         let G: Vec<MultilinearPolynomial<F>> = G_vecs
             .into_iter()
             .map(MultilinearPolynomial::from)
             .collect();
 
-        // ========================================================================
-        // 步骤 2: 计算单一的 eq_bool 查表 (用于布尔性声明的归约)
-        // ========================================================================
-        // 目标：我们需要通过 Sumcheck 证明 G_i(r_addr_bool) = claim_bool。
-        // 根据多线性多项式的性质，点求值可以转化为超立方体上的求和：
-        // G_i(r) = \sum_{x \in {0,1}^v} G_i(x) * eq(r, x)
-        // 因此，Prover 需要在内存中完整地展开 eq(r_addr_bool, x) 这个多项式的所有求值点。
+        // Compute single eq_bool table (shared across all families).
         //
-        // 注意端序问题：`EqPolynomial::evals` 假设 `r[0]` 是最高有效位 (MSB)，
-        // 这与 Jolt 采用的 `BindingOrder::LowToHigh` 绑定顺序相匹配。
-        // 因为所有的多项式共享同一个布尔性检查点 r_addr_bool，所以我们只需要算一次。
+        // NOTE: `EqPolynomial::evals` uses the convention that `r[0]` corresponds to the MSB,
+        // and `r[n-1]` corresponds to the LSB (matching `BindingOrder::LowToHigh` binding the LSB first).
+        // Since opening points are stored in BIG_ENDIAN order, we can use them directly here.
         let eq_bool = MultilinearPolynomial::from(EqPolynomial::evals(&params.r_addr_bool));
 
-        // ========================================================================
-        // 步骤 3: 计算 N 个 eq_virt 查表 (用于虚拟化声明的归约)
-        // ========================================================================
-        // 与 bool 检查同理，但由于虚拟化检查中，每一个 RA 多项式 (指令、字节码、不同 RAM 块)
-        // 所对应的地址点 `r_addr_virt[i]` 都可能不同。
-        // 因此，我们必须循环 N 次，为每一个 G_i 多项式计算它专属的相等性多项式 eq_virt_i。
+        // Compute N eq_virt tables (one per ra polynomial).
+        // Same endianness convention as eq_bool.
         let N = params.polynomial_types.len();
         let eq_virt: Vec<MultilinearPolynomial<F>> = (0..N)
             .map(|i| MultilinearPolynomial::from(EqPolynomial::evals(&params.r_addr_virt[i])))
             .collect();
 
-        // 组装所有生成的大型多项式数据并返回，供后续的 prove 循环 (按比特位折叠) 使用。
         Self {
-            G,        // N 个折叠后的一维数据多项式
-            eq_bool,  // 1 个共享的布尔性相等多项式
-            eq_virt,  // N 个专属的虚拟化相等多项式
-            params,   // 包含 gamma 等标量参数
+            G,
+            eq_bool,
+            eq_virt,
+            params,
         }
     }
 }
@@ -531,7 +536,6 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
     fn cache_openings(
         &self,
         accumulator: &mut ProverOpeningAccumulator<F>,
-        transcript: &mut T,
         sumcheck_challenges: &[F::Challenge],
     ) {
         let N = self.params.polynomial_types.len();
@@ -547,7 +551,6 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
 
             // All three claim types (HW, Bool, Virt) collapse to this single opening
             accumulator.append_sparse(
-                transcript,
                 vec![self.params.polynomial_types[i]],
                 SumcheckId::HammingWeightClaimReduction,
                 r_address.clone(),
@@ -562,10 +565,6 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
         flamegraph.visit_root(self);
     }
 }
-
-// ============================================================================
-// VERIFIER
-// ============================================================================
 
 pub struct HammingWeightClaimReductionVerifier<F: JoltField> {
     params: HammingWeightClaimReductionParams<F>,
@@ -634,7 +633,6 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
     fn cache_openings(
         &self,
         accumulator: &mut VerifierOpeningAccumulator<F>,
-        transcript: &mut T,
         sumcheck_challenges: &[F::Challenge],
     ) {
         let N = self.params.polynomial_types.len();
@@ -647,7 +645,6 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
 
         for i in 0..N {
             accumulator.append_sparse(
-                transcript,
                 vec![self.params.polynomial_types[i]],
                 SumcheckId::HammingWeightClaimReduction,
                 full_point.clone(),

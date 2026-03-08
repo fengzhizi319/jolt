@@ -27,6 +27,12 @@ use std::iter::zip;
 use common::jolt_device::MemoryLayout;
 use tracer::instruction::Cycle;
 
+#[cfg(feature = "zk")]
+use crate::poly::opening_proof::OpeningId;
+#[cfg(feature = "zk")]
+use crate::subprotocols::blindfold::{
+    InputClaimConstraint, OutputClaimConstraint, ProductTerm, ValueSource,
+};
 use crate::{
     field::JoltField,
     poly::{
@@ -99,6 +105,58 @@ impl<F: JoltField> SumcheckInstanceParams<F> for BooleanitySumcheckParams<F> {
         opening_point[..self.log_k_chunk].reverse();
         opening_point[self.log_k_chunk..].reverse();
         opening_point.into()
+    }
+
+    #[cfg(feature = "zk")]
+    fn input_claim_constraint(&self) -> InputClaimConstraint {
+        InputClaimConstraint::default()
+    }
+
+    #[cfg(feature = "zk")]
+    fn input_constraint_challenge_values(&self, _: &dyn OpeningAccumulator<F>) -> Vec<F> {
+        Vec::new()
+    }
+
+    #[cfg(feature = "zk")]
+    fn output_claim_constraint(&self) -> Option<OutputClaimConstraint> {
+        let n = self.polynomial_types.len();
+
+        let mut terms = Vec::with_capacity(2 * n);
+        for (i, poly_type) in self.polynomial_types.iter().enumerate() {
+            let opening = OpeningId::committed(*poly_type, SumcheckId::Booleanity);
+
+            terms.push(ProductTerm::scaled(
+                ValueSource::Challenge(2 * i),
+                vec![ValueSource::Opening(opening), ValueSource::Opening(opening)],
+            ));
+            terms.push(ProductTerm::scaled(
+                ValueSource::Challenge(2 * i + 1),
+                vec![ValueSource::Opening(opening)],
+            ));
+        }
+
+        Some(OutputClaimConstraint::sum_of_products(terms))
+    }
+
+    #[cfg(feature = "zk")]
+    fn output_constraint_challenge_values(&self, sumcheck_challenges: &[F::Challenge]) -> Vec<F> {
+        let combined_r: Vec<F::Challenge> = self
+            .r_address
+            .iter()
+            .cloned()
+            .rev()
+            .chain(self.r_cycle.iter().cloned().rev())
+            .collect();
+
+        let eq_eval: F = EqPolynomial::<F>::mle(sumcheck_challenges, &combined_r);
+
+        let mut challenges = Vec::with_capacity(2 * self.polynomial_types.len());
+        for gamma_2i in &self.gamma_powers_square {
+            let coeff = eq_eval * *gamma_2i;
+            challenges.push(coeff);
+            challenges.push(-coeff);
+        }
+        challenges
     }
 }
 
@@ -238,19 +296,6 @@ impl<F: JoltField> BooleanitySumcheckProver<F> {
     /// - Compute G polynomials and RA indices in a single pass over the trace
     /// - Initialize split-eq polynomials for address (B) and cycle (D) variables
     /// - Initialize expanding table for phase 1
-
-    /// 初始化 BooleanitySumcheckProver (布尔性校验证明者)
-    ///
-    /// 主要解决的问题：
-    /// 1. **全量数据预处理**：将原始的 CPU 执行 Trace、字节码和内存布局转换为多项式形式，
-    ///    这是后续进行 Sumcheck 证明的基础。
-    /// 2. **跨维度预计算 (Optimization)**：
-    ///    本 Sumcheck 分为两个阶段（Phase 1: Address 维度, Phase 2: Cycle 维度）。
-    ///    为了在 Phase 1 高效计算，我们需要预先对 Cycle 维度进行求和（计算 G 数组），
-    ///    避免在每一轮 Phase 1 中都遍历整个 Cycle 维度，从而极大提升证明性能。
-    /// 3. **批处理权重设置**：
-    ///    我们需要同时证明几十个不同的 RA 多项式都是布尔值。为了在一个 Sumcheck 中完成，
-    ///    我们需要计算随机权重 gamma 的幂次，用于将这些多项式的约束线性组合在一起。
     #[tracing::instrument(skip_all, name = "BooleanitySumcheckProver::initialize")]
     pub fn initialize(
         params: BooleanitySumcheckParams<F>,
@@ -258,22 +303,7 @@ impl<F: JoltField> BooleanitySumcheckProver<F> {
         bytecode: &BytecodePreprocessing,
         memory_layout: &MemoryLayout,
     ) -> Self {
-        // =========================================================
-        // 1. 预计算核心多项式 G 和 Trace 索引
-        // ---------------------------------------------------------
-        // [功能]
-        // 这是 "Time-to-Space" 的降维打击。
-        // 输入：长度为 T 的 Trace（按时间排序）。
-        // 输出：长度为 K 的 G 表（按数值 k 聚合）。
-        // G[i][k] 存储了：在整个 Trace 执行过程中，第 i 个检查项的值等于 k 的所有时刻，
-        //                 Verifier 给出的随机权重 eq(r_cycle, t) 的总和。
-        // G[i][k] 是一个预聚合的数组。
-        // 原理：Sumcheck 公式中包含 eq(r_cycle, j)。在 Phase 1 (遍历地址 k) 时，
-        // j 相关的项是常数。我们可以预先计算 G_i(k) = sum_j (eq(r_cycle, j) * ra_i(k, j))。
-        // 这样在 Phase 1 对 k 进行 Sumcheck 时，就不需要再关心 j 维度了。
-        //
-        // ra_indices 则保存了压缩后的 Trace 信息，用于 Phase 2 恢复 ra 值。
-        // =========================================================
+        // Compute G and RA indices in a single pass over the trace
         let (G, ra_indices) = compute_all_G_and_ra_indices::<F>(
             trace,
             bytecode,
@@ -282,65 +312,16 @@ impl<F: JoltField> BooleanitySumcheckProver<F> {
             &params.r_cycle,
         );
 
-        // =========================================================
-        // 2. 初始化 Split-Eq 多项式
-        // ---------------------------------------------------------
-        // B: 对应地址维度 (Address) 的 eq(r_address, k)，用于 Phase 1。
-        // D: 对应时间维度 (Cycle) 的 eq(r_cycle, j)，用于 Phase 2。
-        // 使用 GruenSplitEqPolynomial 是为了通过动态规划实现 O(N) 的线性时间证明生成。
-        // =========================================================
-        // [功能]
-        // 初始化用于快速求值的 Eq 多项式结构。
-        // Jolt 使用 Gruen 算法，能在 O(N) 时间内完成 Sumcheck 的一轮，而不是 O(N log N)。
-        //
-        // B (Bound to Address): 用于 Phase 1。 Sumcheck 是对地址 k (0..255) 进行折叠。
-        // D (Bound to Cycle):   用于 Phase 2。 Sumcheck 是对时间 t 进行折叠。
-        // =========================================================
+        // Initialize split-eq polynomials for address and cycle variables
         let B = GruenSplitEqPolynomial::new(&params.r_address, BindingOrder::LowToHigh);
         let D = GruenSplitEqPolynomial::new(&params.r_cycle, BindingOrder::LowToHigh);
 
-        // =========================================================
-        // 3. 初始化动态规划表 (Phase 1)
-        // ---------------------------------------------------------
-        // F_table 用于在 Phase 1 过程中存储和更新中间计算结果，
-        // 配合 GruenSplitEqPolynomial 使用。
-        // [功能]
-        // 这是一个用于存储 Sumcheck 中间状态的 DP 表。
-        // 在 Phase 1，我们是对多项式 G(k) 进行 Sumcheck。
-        // F_table[k] 初始设为 1，随着 Sumcheck 轮次推进，它会存储已经被绑定的变量的部分求值结果。
-        // 这种做法避免了每次重新分配内存。
-        // =========================================================
+        // Initialize expanding table for phase 1
         let k_chunk = 1 << params.log_k_chunk;
         let mut F_table = ExpandingTable::new(k_chunk, BindingOrder::LowToHigh);
         F_table.reset(F::one());
 
-        // =========================================================
-        // 4. 计算批处理系数 (Batching Coefficients)
-        // ---------------------------------------------------------
-        // 目标是证明 sum( gamma^2i * (x^2 - x) ) == 0。
-        // 这里我们预计算 gamma^i 和 gamma^(-i)。
-        //
-        // 技巧：
-        // 在 Phase 2，我们会把多项式 H_i 预先缩放为 rho_i * H_i (其中 rho_i = gamma^i)。
-        // 此时计算 (rho*H) * (rho*H - rho) = rho^2 * (H^2 - H) = gamma^2i * (H^2 - H)。
-        // 这样就把权重 gamma^2i 巧妙地融入到了多项式乘法中。
-        //
-        // [功能]
-        // 准备随机线性组合 (RLC) 的系数。
-        // 我们有几十个列要检查 (num_polys)。
-        // Verifier 给了一个随机数 gamma。
-        // 我们生成 powers: [1, gamma, gamma^2, gamma^3 ...]
-        //
-        // [数学技巧]
-        // 我们不直接计算 gamma^i * (x^2 - x)。
-        // 而是定义新变量 y = gamma^i * x。
-        // 那么 y * (y - gamma^i) = gamma^2i * x^2 - gamma^2i * x = gamma^2i * (x^2 - x)。
-        // 这使得加权求和变得更容易处理。
-        //
-        // gamma_powers: 用于正向计算。
-        // gamma_powers_inv: 用于逆向恢复原始值 (如果需要 debug 或特殊处理)。
-        // =========================================================
-        // =========================================================
+        // Compute prover-only fields: gamma_powers (γ^i) and gamma_powers_inv (γ^{-i})
         let num_polys = params.polynomial_types.len();
         let gamma_f: F = params.gamma.into();
         let mut gamma_powers = Vec::with_capacity(num_polys);
@@ -353,11 +334,9 @@ impl<F: JoltField> BooleanitySumcheckProver<F> {
                     .inverse()
                     .expect("gamma_powers[i] is nonzero (gamma != 0)"),
             );
-            rho_i *= gamma_f;// rho_{i+1} = rho_i * gamma
+            rho_i *= gamma_f;
         }
-        // [返回]
-        // H 被设为 None：这是为了省内存。H 是原始 Trace 数据的多项式形式。
-        // 在 Phase 1 我们只需要 G 表。等 Phase 1 结束了，我们再根据 ra_indices 生成 H。
+
         Self {
             gamma_powers,
             gamma_powers_inv,
@@ -365,7 +344,7 @@ impl<F: JoltField> BooleanitySumcheckProver<F> {
             D,
             G,
             ra_indices,
-            H: None, // H 将在 Phase 1 结束进入 Phase 2 时才初始化 (为了节省内存)
+            H: None,
             F: F_table,
             eq_r_r: F::zero(),
             params,
@@ -379,7 +358,7 @@ impl<F: JoltField> BooleanitySumcheckProver<F> {
 
         // Compute quadratic coefficients via generic split-eq fold
         let quadratic_coeffs: [F; DEGREE_BOUND - 1] = B
-            .par_fold_out_in_unreduced::<9, { DEGREE_BOUND - 1 }>(&|k_prime| {
+            .par_fold_out_in_unreduced::<{ DEGREE_BOUND - 1 }>(&|k_prime| {
                 let coeffs = (0..N)
                     .into_par_iter()
                     .map(|i| {
@@ -401,23 +380,23 @@ impl<F: JoltField> BooleanitySumcheckProver<F> {
                                 [eval_0, eval_infty]
                             })
                             .fold_with(
-                                [F::Unreduced::<5>::zero(); DEGREE_BOUND - 1],
+                                [F::UnreducedMulU64::zero(); DEGREE_BOUND - 1],
                                 |running, new| {
                                     [
-                                        running[0] + new[0].as_unreduced_ref(),
-                                        running[1] + new[1].as_unreduced_ref(),
+                                        running[0] + new[0].to_unreduced(),
+                                        running[1] + new[1].to_unreduced(),
                                     ]
                                 },
                             )
                             .reduce(
-                                || [F::Unreduced::zero(); DEGREE_BOUND - 1],
+                                || [F::UnreducedMulU64::zero(); DEGREE_BOUND - 1],
                                 |running, new| [running[0] + new[0], running[1] + new[1]],
                             );
 
                         let gamma_2i = self.params.gamma_powers_square[i];
                         [
-                            gamma_2i * F::from_barrett_reduce(inner_sum[0]),
-                            gamma_2i * F::from_barrett_reduce(inner_sum[1]),
+                            gamma_2i * F::reduce_mul_u64(inner_sum[0]),
+                            gamma_2i * F::reduce_mul_u64(inner_sum[1]),
                         ]
                     })
                     .reduce(
@@ -437,10 +416,10 @@ impl<F: JoltField> BooleanitySumcheckProver<F> {
 
         // Compute quadratic coefficients via generic split-eq fold (handles both E_in cases).
         let quadratic_coeffs: [F; DEGREE_BOUND - 1] = D
-            .par_fold_out_in_unreduced::<9, { DEGREE_BOUND - 1 }>(&|j_prime| {
+            .par_fold_out_in_unreduced::<{ DEGREE_BOUND - 1 }>(&|j_prime| {
                 // Accumulate in unreduced form to minimize per-term reductions
-                let mut acc_c = F::Unreduced::<9>::zero();
-                let mut acc_e = F::Unreduced::<9>::zero();
+                let mut acc_c = F::UnreducedProductAccum::zero();
+                let mut acc_e = F::UnreducedProductAccum::zero();
                 for i in 0..num_polys {
                     let h_0 = H.get_bound_coeff(i, 2 * j_prime);
                     let h_1 = H.get_bound_coeff(i, 2 * j_prime + 1);
@@ -451,12 +430,12 @@ impl<F: JoltField> BooleanitySumcheckProver<F> {
                     //   gamma^{2i}*h0*(h0-1) = (rho*h0) * (rho*h0 - rho)
                     //   gamma^{2i}*b*b       = (rho*b) * (rho*b)
                     let rho = self.gamma_powers[i];
-                    acc_c += h_0.mul_unreduced::<9>(h_0 - rho);
-                    acc_e += b.mul_unreduced::<9>(b);
+                    acc_c += h_0.mul_to_product_accum(h_0 - rho);
+                    acc_e += b.mul_to_product_accum(b);
                 }
                 [
-                    F::from_montgomery_reduce::<9>(acc_c),
-                    F::from_montgomery_reduce::<9>(acc_e),
+                    F::reduce_product_accum(acc_c),
+                    F::reduce_product_accum(acc_e),
                 ]
             });
 
@@ -534,7 +513,6 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for BooleanitySum
     fn cache_openings(
         &self,
         accumulator: &mut ProverOpeningAccumulator<F>,
-        transcript: &mut T,
         sumcheck_challenges: &[F::Challenge],
     ) {
         let opening_point = self.params.normalize_opening_point(sumcheck_challenges);
@@ -547,7 +525,6 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for BooleanitySum
         // All polynomials share the same opening point (r_address, r_cycle)
         // Use a single SumcheckId for all
         accumulator.append_sparse(
-            transcript,
             self.params.polynomial_types.clone(),
             SumcheckId::Booleanity,
             opening_point.r[..self.params.log_k_chunk].to_vec(),
@@ -605,19 +582,17 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T> for BooleanityS
 
         EqPolynomial::<F>::mle(sumcheck_challenges, &combined_r)
             * zip(&self.params.gamma_powers_square, ra_claims)
-            .map(|(gamma_2i, ra)| (ra.square() - ra) * gamma_2i)
-            .sum::<F>()
+                .map(|(gamma_2i, ra)| (ra.square() - ra) * gamma_2i)
+                .sum::<F>()
     }
 
     fn cache_openings(
         &self,
         accumulator: &mut VerifierOpeningAccumulator<F>,
-        transcript: &mut T,
         sumcheck_challenges: &[F::Challenge],
     ) {
         let opening_point = self.params.normalize_opening_point(sumcheck_challenges);
         accumulator.append_sparse(
-            transcript,
             self.params.polynomial_types.clone(),
             SumcheckId::Booleanity,
             opening_point.r,

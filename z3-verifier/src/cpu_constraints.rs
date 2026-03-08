@@ -29,7 +29,7 @@ use tracer::instruction::{
     ecall::ECALL,
     fence::FENCE,
     format::{
-        format_assert_align::AssertAlignFormat, format_b::FormatB, format_fence::FormatFence,
+        format_assert_align::FormatAssert, format_b::FormatB, format_fence::FormatFence,
         format_i::FormatI, format_j::FormatJ, format_load::FormatLoad, format_r::FormatR,
         format_s::FormatS, format_u::FormatU,
         format_virtual_right_shift_i::FormatVirtualRightShiftI,
@@ -102,10 +102,9 @@ struct JoltState<T = Int> {
     next_is_noop: T,
     should_jump: T,
     should_branch: T,
-    write_lookup_output_to_rd: T,
-    write_pc_to_rd: T,
     next_is_virtual: T,
     next_is_first_in_sequence: T,
+    virtual_sequence_active: T,
 }
 
 impl JoltState {
@@ -135,14 +134,11 @@ impl JoltState {
             next_is_noop: Int::new_const(format!("{prefix}_next_is_noop")),
             should_jump: Int::new_const(format!("{prefix}_should_jump")),
             should_branch: Int::new_const(format!("{prefix}_should_branch")),
-            write_lookup_output_to_rd: Int::new_const(format!(
-                "{prefix}_write_lookup_output_to_rd_addr"
-            )),
-            write_pc_to_rd: Int::new_const(format!("{prefix}_write_pc_to_rd_addr")),
             next_is_virtual: Int::new_const(format!("{prefix}_next_is_virtual")),
             next_is_first_in_sequence: Int::new_const(format!(
                 "{prefix}_next_is_first_in_sequence"
             )),
+            virtual_sequence_active: Int::new_const(format!("{prefix}_virtual_sequence_active")),
         }
     }
 
@@ -151,8 +147,6 @@ impl JoltState {
             &self.left_input,
             &self.right_input,
             &self.product,
-            &self.write_lookup_output_to_rd,
-            &self.write_pc_to_rd,
             &self.should_branch,
             &self.pc,
             &self.unexpanded_pc,
@@ -184,6 +178,7 @@ impl JoltState {
             &self.flags[CircuitFlags::Advice as usize],
             &self.flags[CircuitFlags::IsCompressed as usize],
             &self.flags[CircuitFlags::IsFirstInSequence as usize],
+            &self.flags[CircuitFlags::IsLastInSequence as usize],
         ]
     }
 
@@ -211,17 +206,12 @@ impl JoltState {
             VirtualPolynomial::LeftInstructionInput => &self.left_input,
             VirtualPolynomial::RightInstructionInput => &self.right_input,
             VirtualPolynomial::Product => &self.product,
-            VirtualPolynomial::InstructionFlags(InstructionFlags::IsRdNotZero) => {
-                &self.instruction_flags[InstructionFlags::IsRdNotZero as usize]
-            }
             VirtualPolynomial::OpFlags(CircuitFlags::WriteLookupOutputToRD) => {
                 &self.flags[CircuitFlags::WriteLookupOutputToRD as usize]
             }
-            VirtualPolynomial::WriteLookupOutputToRD => &self.write_lookup_output_to_rd,
             VirtualPolynomial::OpFlags(CircuitFlags::Jump) => {
                 &self.flags[CircuitFlags::Jump as usize]
             }
-            VirtualPolynomial::WritePCtoRD => &self.write_pc_to_rd,
             VirtualPolynomial::LookupOutput => &self.lookup_output,
             VirtualPolynomial::InstructionFlags(InstructionFlags::Branch) => {
                 &self.instruction_flags[InstructionFlags::Branch as usize]
@@ -272,10 +262,7 @@ impl JoltState {
             //(&self.next_pc).ne(&other.next_pc),
             self.next_unexpanded_pc.ne(&other.next_unexpanded_pc),
             // write to rd differs
-            self.instruction_flags[InstructionFlags::IsRdNotZero as usize]
-                .ne(&other.instruction_flags[InstructionFlags::IsRdNotZero as usize]),
-            &self.instruction_flags[InstructionFlags::IsRdNotZero as usize].eq(Int::from(1))
-                & (self.rd_write_value.ne(&other.rd_write_value)),
+            self.rd_write_value.ne(&other.rd_write_value),
             // lookup inputs differ
             self.left_lookup.ne(&other.left_lookup),
             self.right_lookup.ne(&other.right_lookup),
@@ -370,10 +357,9 @@ impl JoltState {
             next_is_noop: eval(&self.next_is_noop)?,
             should_jump: eval(&self.should_jump)?,
             should_branch: eval(&self.should_branch)?,
-            write_lookup_output_to_rd: eval(&self.write_lookup_output_to_rd)?,
-            write_pc_to_rd: eval(&self.write_pc_to_rd)?,
             next_is_virtual: eval(&self.next_is_virtual)?,
             next_is_first_in_sequence: eval(&self.next_is_first_in_sequence)?,
+            virtual_sequence_active: eval(&self.virtual_sequence_active)?,
         })
     }
 }
@@ -512,12 +498,12 @@ test_instruction_constraints!(SLTU, FormatR);
 test_instruction_constraints!(SUB, FormatR);
 test_instruction_constraints!(VirtualAdvice, FormatJ, advice: 0);
 test_instruction_constraints!(VirtualAssertEQ, FormatB);
-test_instruction_constraints!(VirtualAssertHalfwordAlignment, AssertAlignFormat);
+test_instruction_constraints!(VirtualAssertHalfwordAlignment, FormatAssert);
 test_instruction_constraints!(VirtualAssertLTE, FormatB);
 test_instruction_constraints!(VirtualAssertMulUNoOverflow, FormatB);
 test_instruction_constraints!(VirtualAssertValidDiv0, FormatB);
 test_instruction_constraints!(VirtualAssertValidUnsignedRemainder, FormatB);
-test_instruction_constraints!(VirtualAssertWordAlignment, AssertAlignFormat);
+test_instruction_constraints!(VirtualAssertWordAlignment, FormatAssert);
 test_instruction_constraints!(VirtualChangeDivisor, FormatR);
 test_instruction_constraints!(VirtualMovsign, FormatI);
 test_instruction_constraints!(VirtualMULI, FormatI);

@@ -44,12 +44,11 @@ impl ReadWriteConfig {
     /// This is the default configuration for the prover; other configurations are possible
     /// (as long as they satisfy the validation constraints).
     pub fn new(log_T: usize, ram_log_K: usize) -> Self {
-        let log_register_count = REGISTER_COUNT.ilog2() as usize;
         let config = Self {
             ram_rw_phase1_num_rounds: log_T as u8,
             ram_rw_phase2_num_rounds: ram_log_K as u8,
             registers_rw_phase1_num_rounds: log_T as u8,
-            registers_rw_phase2_num_rounds: log_register_count as u8,
+            registers_rw_phase2_num_rounds: REGISTER_COUNT.ilog2() as u8,
         };
 
         // Validate the configuration
@@ -95,8 +94,8 @@ impl ReadWriteConfig {
 
     /// Returns true if all cycle variables are bound in phase 1.
     ///
-    /// When this returns true, the advice opening points for `RamValEvaluation` and
-    /// `RamValFinalEvaluation` are identical, so we only need one advice opening.
+    /// When this returns true, the advice opening points for `RamValCheck` and
+    /// `RamValCheck` are identical, so we only need one advice opening.
     #[inline]
     pub fn needs_single_advice_opening(&self, log_T: usize) -> bool {
         self.ram_rw_phase1_num_rounds as usize == log_T
@@ -181,14 +180,14 @@ impl OneHotConfig {
         }
 
         // lookups_ra_virtual_log_k_chunk must be a multiple of log_k_chunk
-        if lookups_chunk % log_k_chunk != 0 {
+        if !lookups_chunk.is_multiple_of(log_k_chunk) {
             return Err(format!(
                 "lookups_ra_virtual_log_k_chunk ({lookups_chunk}) must be a multiple of log_k_chunk ({log_k_chunk})"
             ));
         }
 
         // LOG_K must be divisible by lookups_ra_virtual_log_k_chunk
-        if LOG_K % lookups_chunk != 0 {
+        if !LOG_K.is_multiple_of(lookups_chunk) {
             return Err(format!(
                 "LOG_K ({LOG_K}) must be divisible by lookups_ra_virtual_log_k_chunk ({lookups_chunk})"
             ));
@@ -201,56 +200,22 @@ impl OneHotConfig {
 /// Full one-hot parameters with cached derived values.
 ///
 /// This struct is NOT serialized in the proof. It is constructed by the prover
-/// and verifier from `OneHotConfig` plus the proof parameters (bytecode_K, ram_K).
+/// and verifier from `OneHotConfig`, `bytecode_K` (from preprocessing), and `ram_K` (from proof).
 #[derive(Allocative, Clone, Debug, Default)]
 pub struct OneHotParams {
-    /// One-Hot 编码块的位宽（对数形式）。
-    /// 例如：如果为 8，则每个块处理 8 bit 数据，对应 256 大小的查找表。
-    /// 这决定了基础承诺多项式的“宽度”。
     pub log_k_chunk: usize,
-
-    /// 指令查找中虚拟 RA（Read-Access）多项式的位宽。
-    /// Jolt 为了优化性能，将多个基础块（log_k_chunk）在逻辑上组合成一个更大的虚拟块。
-    /// 这个值必须是 log_k_chunk 的倍数。
     pub lookups_ra_virtual_log_k_chunk: usize,
-
-    /// One-Hot 编码块的实际大小，即 2^log_k_chunk。
-    /// 用于位掩码（bitmask）计算，例如 `val & (k_chunk - 1)`。
     pub k_chunk: usize,
 
-    /// 字节码（Bytecode）地址空间的大小。
-    /// 通常是程序长度向上取整到 2 的幂次。
     pub bytecode_k: usize,
-
-    /// RAM 读写内存地址空间的大小。
-    /// 包含所有被访问过的内存地址的最大范围，向上取整到 2 的幂次。
     pub ram_k: usize,
 
-    // --- 分解深度 (Decomposition Depth / Dimension) ---
-    // 表示将一个大整数拆分为多少个小块 (Chunks)
-
-    /// 指令查找键（通常 128 位）被拆分的块数。
-    /// 计算方式：ceil(128 / log_k_chunk)。
     pub instruction_d: usize,
-
-    /// 程序计数器（PC）地址被拆分的块数。
-    /// 计算方式：ceil(log2(bytecode_k) / log_k_chunk)。
     pub bytecode_d: usize,
-
-    /// RAM 地址被拆分的块数。
-    /// 计算方式：ceil(log2(ram_k) / log_k_chunk)。
     pub ram_d: usize,
 
-    // --- 预计算位移量 (Pre-computed Shifts) ---
-    // 用于快速提取第 i 个 chunk 的值： (val >> shifts[i]) & mask
-
-    /// 用于提取指令查找键各个 chunk 的右移位数列表。
     instruction_shifts: Vec<usize>,
-
-    /// 用于提取 RAM 地址各个 chunk 的右移位数列表。
     ram_shifts: Vec<usize>,
-
-    /// 用于提取 Bytecode PC 各个 chunk 的右移位数列表。
     bytecode_shifts: Vec<usize>,
 }
 
@@ -293,20 +258,12 @@ impl OneHotParams {
     /// Create OneHotParams for the given trace parameters using default config.
     ///
     /// This is a convenience constructor for the prover.
-    /// 为给定的执行轨迹参数创建一个 `OneHotParams` 实例。
-    ///
-    /// 这是一个针对证明者（Prover）的便捷构造函数。它会根据轨迹长度 `log_T` 自动计算出
-    /// 默认的 `OneHotConfig`，然后利用字节码和 RAM 的参数生成完整的 One-Hot 参数。
     pub fn new(log_T: usize, bytecode_k: usize, ram_k: usize) -> Self {
         let config = OneHotConfig::new(log_T);
         Self::from_config(&config, bytecode_k, ram_k)
     }
 
-    /// 提取用于在证明（Proof）中序列化的最小配置。
-    ///
-    /// `OneHotParams` 包含很多预计算的字段（如 shifts 数组），这些不需要传输。
-    /// 验证者（Verifier）只需要这个迷你的 `OneHotConfig` 加上公开输入，
-    /// 就可以重建出完全相同的 `OneHotParams`。
+    /// Extract the minimal config for serialization in the proof.
     pub fn to_config(&self) -> OneHotConfig {
         OneHotConfig {
             log_k_chunk: self.log_k_chunk as u8,
@@ -314,55 +271,25 @@ impl OneHotParams {
         }
     }
 
-    /// 从 64 位 RAM 地址中提取第 `idx` 个 One-Hot 块的值。
-    ///
-    /// # 参数
-    /// * `address`: 原始的内存地址。
-    /// * `idx`: 块的索引（通常从高位到低位或者相反，取决于 `ram_shifts` 的构建顺序）。
-    ///
-    /// # 逻辑
-    /// `(address >> shift) & mask`：先右移将目标块对齐到最低位，然后通过掩码提取。
     pub fn ram_address_chunk(&self, address: u64, idx: usize) -> u8 {
         ((address >> self.ram_shifts[idx]) & (self.k_chunk - 1) as u64) as u8
     }
 
-    /// 从程序计数器（PC）中提取第 `idx` 个 One-Hot 块的值。
-    ///
-    /// 逻辑同 `ram_address_chunk`，但操作对象是 PC。
     pub fn bytecode_pc_chunk(&self, pc: usize, idx: usize) -> u8 {
         ((pc >> self.bytecode_shifts[idx]) & (self.k_chunk - 1)) as u8
     }
 
-    /// 从 128 位指令查找索引中提取第 `idx` 个 One-Hot 块的值。
-    ///
-    /// 这是 Jolt 核心查找表机制的一部分。由于指令查找键很宽（128位），
-    /// 需要将其切割成多个小块（chunk）分别进行查表。
     pub fn lookup_index_chunk(&self, index: u128, idx: usize) -> u8 {
         ((index >> self.instruction_shifts[idx]) & (self.k_chunk - 1) as u128) as u8
     }
 
-    /// 将 Sumcheck 求和协议中的随机挑战点向量（r_address）分割成块。
-    ///
-    /// # 背景
-    /// 在 Sumcheck 协议中，验证者提供的随机点 `r` 对应于多项式的变量。
-    /// 如果多项式是基于 chunk 定义的，我们需要将这些随机变量按照 chunk 大小（`log_k_chunk`）分组。
-    ///
-    /// # 逻辑
-    /// 1. **填充（Padding）**：如果输入的 `r_address` 长度不是 `log_k_chunk` 的倍数，
-    ///    说明高位缺失，需要在**向量头部**填充 0（相当于高位补零）。
-    /// 2. **分块（Chunking）**：将填充后的向量每 `log_k_chunk` 个元素切成一组。
-    ///
-    /// 返回值 `Vec<Vec<F::Challenge>>` 即为每个 chunk 对应的一组随机挑战点。
     pub fn compute_r_address_chunks<F: JoltField>(
         &self,
         r_address: &[F::Challenge],
     ) -> Vec<Vec<F::Challenge>> {
-        // 1. 检查长度并进行前置零填充
         let r_address = if r_address.len().is_multiple_of(self.log_k_chunk) {
             r_address.to_vec()
         } else {
-            // pad_len calculation: log_k_chunk - (len % log_k_chunk)
-            // 使用位运算优化取模：len & (log_k_chunk - 1) 假设 log_k_chunk 是 2 的幂
             [
                 &vec![
                     F::Challenge::from(0_u128);
@@ -370,10 +297,9 @@ impl OneHotParams {
                 ],
                 r_address,
             ]
-                .concat()
+            .concat()
         };
 
-        // 2. 将对齐后的向量切片成块
         let r_address_chunks: Vec<Vec<F::Challenge>> = r_address
             .chunks(self.log_k_chunk)
             .map(|chunk| chunk.to_vec())
